@@ -12,7 +12,7 @@ import uuid
 from tqdm import tqdm
 
 import matplotlib.pyplot as plt
-from plotters import plot_soil_maps
+from helpers.plotters import plot_soil_maps
 
 
 def remove_outliers(df, columns, method='iqr', multiplier=1.5, z_threshold=3):
