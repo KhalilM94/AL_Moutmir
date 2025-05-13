@@ -6,12 +6,10 @@ import logging
 from sklearn.model_selection import (
     GridSearchCV,
     KFold, 
-    GroupKFold, 
-    GroupShuffleSplit, 
+    GroupKFold,
     cross_validate,
     StratifiedShuffleSplit,
-    StratifiedKFold,
-    train_test_split
+    StratifiedKFold
 )
 from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin
