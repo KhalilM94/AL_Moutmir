@@ -14,6 +14,28 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from helpers.plotters import plot_soil_maps
 
+def load_dict_from_file(file_path):
+    # Create an empty dictionary
+    result_dict = {}
+
+    # Open the file
+    with open(file_path, 'r') as f:
+        # Loop through each line in the file
+        for line in f:
+            # Strip leading/trailing whitespace
+            line = line.strip()
+            
+            # Skip empty lines or lines that don't contain a colon
+            if not line or ':' not in line:
+                continue
+            
+            # Split the line into key and value
+            key, value = line.split(":", 1)
+            
+            # Strip any extra whitespace and add to dictionary
+            result_dict[key.strip()] = value.strip()
+
+    return result_dict
 
 def remove_outliers(df, columns, method='iqr', multiplier=1.5, z_threshold=3):
     """
