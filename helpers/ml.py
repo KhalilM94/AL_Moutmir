@@ -8,20 +8,22 @@ from sklearn.model_selection import (
     KFold, 
     GroupKFold,
     cross_validate,
-    cross_val_score,
     StratifiedShuffleSplit,
     StratifiedKFold
 )
 from sklearn.pipeline import Pipeline
 from sklearn.svm import SVR
 from sklearn.cross_decomposition import PLSRegression
-from sklearn.feature_selection import RFE
+from sklearn.feature_selection import RFECV
 from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin
 from sklearn.preprocessing import FunctionTransformer, RobustScaler
 from sklearn.cluster import KMeans
 from skopt import BayesSearchCV
 from sklearn.metrics import (
-    mean_squared_error, mean_absolute_error, r2_score, explained_variance_score
+    mean_squared_error, 
+    mean_absolute_error, 
+    r2_score, 
+    explained_variance_score
 )
 import joblib
 
@@ -241,7 +243,7 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
                             seed = 42,
                             split_strategy='kfold', 
                             enable_hyperparameter_tuning=False, 
-                            use_bayes_opt=False, use_rfe=False, logger = None):
+                            use_bayes_opt=False, enable_rfe=False, logger = None):
     results = []    
     # ---------------------------
     # Filter out NaNs in y_train
@@ -285,6 +287,7 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
         model = config["model"]
 
         # Skip RFE for unsupported models
+        use_rfe = enable_rfe
         if isinstance(model, PLSRegression):
             logger.info(f"Skipping RFE for {model_name} (PLSRegression handles its own dimensionality reduction).")
             use_rfe = False
@@ -299,51 +302,15 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
             y_train_transformed = y_train
 
         # Standard pipeline for other models
-        pipeline = build_pipeline(model = config["model"], scaler= RobustScaler)
-        
-        # -------------------------------
-        # Auto RFE block
-        # -------------------------------
+        steps = [('scaler', RobustScaler())]
+
         if use_rfe:
-            best_rfe_score = np.inf
-            best_rfe_n = None
-            best_selector = None
-            best_X_train_rfe = None
-            best_X_test_rfe = None
+            # Use RFECV for automatic feature selection based on cross-validation performance
+            rfecv = RFECV(estimator=clone(model), step=1, cv=5, scoring='neg_mean_squared_error')
+            steps.append(('feature_selection', rfecv))
 
-            min_features = max(5, int(0.1 * X_train.shape[1]))
-            max_features = X_train.shape[1]
-
-            for n_features in range(min_features, max_features + 1, 1):
-                try:
-                    selector = RFE(estimator=config["model"], n_features_to_select=n_features, step=1)
-                    selector = selector.fit(X_train, y_train_transformed)
-
-                    X_train_rfe = selector.transform(X_train)
-                    score = -np.mean(cross_val_score(config["model"], X_train_rfe, y_train_transformed, 
-                                                     scoring='neg_mean_squared_error', cv=3))
-
-                    if score < best_rfe_score:
-                        best_rfe_score = score
-                        best_rfe_n = n_features
-                        best_selector = selector
-                        best_X_train_rfe = X_train_rfe
-                        best_X_test_rfe = selector.transform(X_test)
-
-                except Exception as e:
-                    logger.warning(f"RFE failed for {model_name} with {n_features} features: {e}")
-                    continue
-
-            if best_selector is None:
-                logger.warning(f"RFE failed completely for {model_name} — skipping model.")
-                continue
-
-            logger.info(f"Best RFE n_features for {model_name}: {best_rfe_n}, CV RMSE: {np.sqrt(best_rfe_score):.4f}")
-            X_train = best_X_train_rfe
-            X_test = best_X_test_rfe
-            feature_selector = best_selector
-        else:
-            feature_selector = None
+        steps.append(('model', model))
+        pipeline = Pipeline(steps)
 
         if split_strategy in ['groupkfold', 'stratifiedshuffle', 'kfold']:
             splits, fold_info_df = create_cv_splits(
@@ -399,6 +366,9 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
             best_model = pipeline
             best_params = "Default (no tuning)"
 
+        # -------------------------------
+        # Prediction and Metrics
+        # -------------------------------        
         y_pred_transformed = best_model.predict(X_test)
 
         if is_log_target:
@@ -437,21 +407,15 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
 
         results.append(test_metrics)
 
+        model_path = os.path.join("final_models", f"{target.replace('/', '_')}_{model_name}.pkl")
+        joblib.dump(best_model, model_path)
+        logger.info(f"Saved model to {model_path} and metrics to {metrics_path}")
+
         if enable_hyperparameter_tuning:
             pd.DataFrame(search.cv_results_).assign(
                 target=target,
                 model=model_name,
                 best_params=str(best_params)
             ).to_csv(metrics_path, index=False)
-
-        model_path = os.path.join("final_models", f"{target.replace('/', '_')}_{model_name}.pkl")
-        joblib.dump(best_model, model_path)
-        logger.info(f"Saved model to {model_path} and metrics to {metrics_path}")
-
-
-        if use_rfe:
-            selector_path = os.path.join("final_models", f"{target.replace('/', '_')}_{model_name}_rfe.pkl")
-            joblib.dump(feature_selector, selector_path)
-            logger.info(f"Saved RFE selector to {selector_path}")
     
     return results
