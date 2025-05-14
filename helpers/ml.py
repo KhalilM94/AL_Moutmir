@@ -13,6 +13,8 @@ from sklearn.model_selection import (
     StratifiedKFold
 )
 from sklearn.pipeline import Pipeline
+from sklearn.svm import SVR
+from sklearn.cross_decomposition import PLSRegression
 from sklearn.feature_selection import RFE
 from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin
 from sklearn.preprocessing import FunctionTransformer, RobustScaler
@@ -279,6 +281,16 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
 
     for model_name, config in model_pipelines.items():
         logger.info(f"Training {model_name} for {target}")
+
+        model = config["model"]
+
+        # Skip RFE for unsupported models
+        if isinstance(model, PLSRegression):
+            logger.info(f"Skipping RFE for {model_name} (PLSRegression handles its own dimensionality reduction).")
+            use_rfe = False
+        elif isinstance(model, SVR) and getattr(model, 'kernel', None) != "linear":
+            logger.info(f"Skipping RFE for {model_name} (SVR with non-linear kernel not supported by RFE).")
+            use_rfe = False
 
         # Apply log transform to target if needed
         if is_log_target:
