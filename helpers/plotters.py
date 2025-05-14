@@ -8,7 +8,6 @@ from matplotlib.cm import ScalarMappable
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import seaborn as sns
-from helpers.preprocessors import load_dict_from_file
 
 def plot_density_heatmap(
     df,
