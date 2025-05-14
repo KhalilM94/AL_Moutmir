@@ -8,10 +8,12 @@ from sklearn.model_selection import (
     KFold, 
     GroupKFold,
     cross_validate,
+    cross_val_score,
     StratifiedShuffleSplit,
     StratifiedKFold
 )
 from sklearn.pipeline import Pipeline
+from sklearn.feature_selection import RFE
 from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin
 from sklearn.preprocessing import FunctionTransformer, RobustScaler
 from sklearn.cluster import KMeans
@@ -20,6 +22,7 @@ from sklearn.metrics import (
     mean_squared_error, mean_absolute_error, r2_score, explained_variance_score
 )
 import joblib
+
 
 def get_training_logger(name='ML', log_file='metrics/model_training.log'):
     """
@@ -236,7 +239,7 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
                             seed = 42,
                             split_strategy='kfold', 
                             enable_hyperparameter_tuning=False, 
-                            use_bayes_opt=False, logger = None):
+                            use_bayes_opt=False, use_rfe=False, logger = None):
     results = []    
     # ---------------------------
     # Filter out NaNs in y_train
@@ -285,14 +288,50 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
 
         # Standard pipeline for other models
         pipeline = build_pipeline(model = config["model"], scaler= RobustScaler)
-        try:
-            pipeline.fit(X_train, y_train_transformed)
-            y_pred_transformed = pipeline.predict(X_test)
-            best_model = pipeline
-            best_params = "Default (no tuning)"
-        except Exception as e:
-            logger.warning(f"Training failed for {model_name} on {target}: {str(e)}")
-            continue
+        
+        # -------------------------------
+        # Auto RFE block
+        # -------------------------------
+        if use_rfe:
+            best_rfe_score = np.inf
+            best_rfe_n = None
+            best_selector = None
+            best_X_train_rfe = None
+            best_X_test_rfe = None
+
+            min_features = max(5, int(0.1 * X_train.shape[1]))
+            max_features = X_train.shape[1]
+
+            for n_features in range(min_features, max_features + 1, 1):
+                try:
+                    selector = RFE(estimator=config["model"], n_features_to_select=n_features, step=1)
+                    selector = selector.fit(X_train, y_train_transformed)
+
+                    X_train_rfe = selector.transform(X_train)
+                    score = -np.mean(cross_val_score(config["model"], X_train_rfe, y_train_transformed, 
+                                                     scoring='neg_mean_squared_error', cv=3))
+
+                    if score < best_rfe_score:
+                        best_rfe_score = score
+                        best_rfe_n = n_features
+                        best_selector = selector
+                        best_X_train_rfe = X_train_rfe
+                        best_X_test_rfe = selector.transform(X_test)
+
+                except Exception as e:
+                    logger.warning(f"RFE failed for {model_name} with {n_features} features: {e}")
+                    continue
+
+            if best_selector is None:
+                logger.warning(f"RFE failed completely for {model_name} — skipping model.")
+                continue
+
+            logger.info(f"Best RFE n_features for {model_name}: {best_rfe_n}, CV RMSE: {np.sqrt(best_rfe_score):.4f}")
+            X_train = best_X_train_rfe
+            X_test = best_X_test_rfe
+            feature_selector = best_selector
+        else:
+            feature_selector = None
 
         if split_strategy in ['groupkfold', 'stratifiedshuffle', 'kfold']:
             splits, fold_info_df = create_cv_splits(
@@ -306,6 +345,9 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
 
         metrics_path = os.path.join("metrics", f"{target.replace('/', '_')}_{model_name}_metrics.csv")
 
+        # -------------------------------
+        # Hyperparameter Tuning
+        # -------------------------------
         if enable_hyperparameter_tuning:
             search_class = BayesSearchCV if use_bayes_opt else GridSearchCV
             search_kwargs = {
@@ -393,5 +435,11 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
         model_path = os.path.join("final_models", f"{target.replace('/', '_')}_{model_name}.pkl")
         joblib.dump(best_model, model_path)
         logger.info(f"Saved model to {model_path} and metrics to {metrics_path}")
+
+
+        if use_rfe:
+            selector_path = os.path.join("final_models", f"{target.replace('/', '_')}_{model_name}_rfe.pkl")
+            joblib.dump(feature_selector, selector_path)
+            logger.info(f"Saved RFE selector to {selector_path}")
     
     return results
