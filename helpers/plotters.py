@@ -8,6 +8,7 @@ from matplotlib.cm import ScalarMappable
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import seaborn as sns
+from helpers.preprocessors import load_dict_from_file
 
 def plot_density_heatmap(
     df,
@@ -405,4 +406,145 @@ def plot_spectra(x_values, y_values, titles=None, xlabel='Wavelength (nm)', ylab
         fig.delaxes(axes[j])
 
     plt.tight_layout()
+    plt.show()
+
+    # Function to map suffix to human-readable labels
+def fuzzy_map_suffix(suffix, label_map):
+    """Match suffix to human label by substring matching any key."""
+    for key, label in label_map.items():
+        if key in suffix:
+            return label
+    return suffix  # fallback to raw suffix if no match
+
+# Function to prepare group labels from dummy-coded columns
+def prepare_group_labels(X, valid_mask, prefix, label_map):
+    """Extract dummy-encoded group labels and map to human-readable values."""
+    dummy_cols = [col for col in X.columns if col.startswith(prefix)]
+    if not dummy_cols:
+        return None, None, None
+
+    group_dummies = X.loc[valid_mask, dummy_cols]
+    suffixes = group_dummies.idxmax(axis=1).str.replace(prefix, '', regex=False)
+    labels = suffixes.map(lambda s: fuzzy_map_suffix(s, label_map))
+    cat = pd.Categorical(labels)
+    
+    # Use get_cmap properly and avoid deprecated usage
+    cmap = plt.cm.viridis  # directly use the colormap (viridis is a default colormap in matplotlib)
+    discrete_colors = cmap(np.linspace(0, 1, len(cat.categories)))  # Generate discrete colors
+    color_map = ListedColormap(discrete_colors)
+    
+    return cat.codes, cat.categories, color_map
+
+def prepare_numeric_groups(X, valid_mask, numeric_column, n_bins=5, cmap_name="viridis"):
+    """Discretize a numeric column and return group codes, labels, and colormap."""
+    values = X.loc[valid_mask, numeric_column]
+    bins = pd.qcut(values, q=n_bins, duplicates='drop')  # quantile-based bins
+    labels = bins.astype(str)
+    cat = pd.Categorical(labels)
+
+    cmap = plt.colormaps[cmap_name]
+    discrete_colors = cmap(np.linspace(0, 1, len(cat.categories)))
+    color_map = ListedColormap(discrete_colors)
+
+    return cat.codes, cat.categories, color_map
+
+    # Main function for plotting observed vs predicted values
+def plot_observed_vs_predicted(
+    X_test,
+    y_test_dict,
+    model_pipelines,
+    target_columns,
+    columns_to_transform,
+    model_dir="final_models",
+    group_prefix=None,
+    group_label_map=None,
+    group_numeric_column=None,
+    log_transformer=None
+):
+
+    model_names = list(model_pipelines.keys())
+    n_targets = len(target_columns)
+    n_models = len(model_names)
+
+    # Create the plot grid
+    fig, axes = plt.subplots(n_targets, n_models, figsize=(5 * n_models, 5 * n_targets))
+    fig.suptitle("Test set Observed vs Predicted", fontsize=18)
+    axes = np.atleast_2d(axes)
+
+    # Loop through targets and models to generate the scatter plots
+    for i, target in enumerate(target_columns):
+        y_test_full = y_test_dict[target]
+        is_log = target in columns_to_transform
+
+        for j, model_name in enumerate(model_names):
+            ax = axes[i, j]
+            model_file = os.path.join(model_dir, f"{target.replace('/', '_')}_{model_name}.pkl")
+
+            # Skip missing models
+            if not os.path.exists(model_file):
+                ax.set_title(f"{target} - {model_name} (Missing)")
+                ax.axis("off")
+                continue
+
+            model = joblib.load(model_file)
+            y_pred_raw = model.predict(X_test)
+
+            # Align actual and predicted values
+            y_test = pd.Series(y_test_full, index=X_test.index)
+            y_pred = pd.Series(y_pred_raw, index=X_test.index)
+
+            # Inverse transform for log-transformed targets
+            if is_log and log_transformer:
+                y_pred = log_transformer.inverse_transform(y_pred)
+
+            # Filter out NaNs
+            valid_mask = y_test.notna() & y_pred.notna()
+            y_test_clean = y_test.loc[valid_mask]
+            y_pred_clean = y_pred.loc[valid_mask]
+
+            # Group label coloring (optional)
+            group_codes, group_labels, cmap = None, None, None
+            if group_prefix and group_label_map:
+                group_codes, group_labels, cmap = prepare_group_labels(X_test, valid_mask, group_prefix, group_label_map)
+            elif group_numeric_column:
+                group_codes, group_labels, cmap = prepare_numeric_groups(X_test, valid_mask, group_numeric_column)
+            
+            if group_codes is not None:
+                ax.scatter(y_test_clean, y_pred_clean, c=group_codes, cmap=cmap,
+                                     alpha=0.7, edgecolor='k', s=40)
+                handles = [
+                    plt.Line2D([0], [0], marker='o', color='w',
+                               label=label,
+                               markerfacecolor=cmap(i),
+                               markeredgecolor='k',
+                               markersize=6)
+                    for i, label in enumerate(group_labels)
+                ]
+                ax.legend(handles=handles, title="Group", loc="lower right", fontsize=8)
+            else:
+                ax.scatter(y_test_clean, y_pred_clean, alpha=0.5, s=40)
+
+            # Identity line (1:1 line) and formatting
+            min_val = min(y_test_clean.min(), y_pred_clean.min())
+            max_val = max(y_test_clean.max(), y_pred_clean.max())
+            ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=1)
+            ax.set_title(f"{target} - {model_name}")
+            ax.set_xlabel("Observed")
+            ax.set_ylabel("Predicted")
+            ax.set_aspect('equal', 'box')
+
+            # Annotate metrics
+            r2 = r2_score(y_test_clean, y_pred_clean)
+            rmse = np.sqrt(mean_squared_error(y_test_clean, y_pred_clean))
+            bias = np.mean(y_pred_clean - y_test_clean)
+
+            ax.text(0.05, 0.95,
+                    f"R²: {r2:.2f}\nRMSE: {rmse:.2f}\nBias: {bias:.2f}",
+                    transform=ax.transAxes,
+                    fontsize=9,
+                    verticalalignment='top',
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
+
+    # Tighten layout and display plot
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()

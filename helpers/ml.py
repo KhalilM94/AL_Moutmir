@@ -12,8 +12,10 @@ from sklearn.model_selection import (
     StratifiedKFold
 )
 from sklearn.pipeline import Pipeline
+from sklearn.base import clone
 from sklearn.svm import SVR
 from sklearn.cross_decomposition import PLSRegression
+from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.feature_selection import RFECV
 from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin
 from sklearn.preprocessing import FunctionTransformer, RobustScaler
@@ -288,8 +290,8 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
 
         # Skip RFE for unsupported models
         use_rfe = enable_rfe
-        if isinstance(model, PLSRegression):
-            logger.info(f"Skipping RFE for {model_name} (PLSRegression handles its own dimensionality reduction).")
+        if isinstance(model, PLSRegression) or isinstance(model, GradientBoostingRegressor):
+            logger.info(f"Skipping RFE for {model_name}.")
             use_rfe = False
         elif isinstance(model, SVR) and getattr(model, 'kernel', None) != "linear":
             logger.info(f"Skipping RFE for {model_name} (SVR with non-linear kernel not supported by RFE).")
