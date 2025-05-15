@@ -290,10 +290,10 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
 
         # Skip RFE for unsupported models
         use_rfe = enable_rfe
-        if isinstance(model, PLSRegression) or isinstance(model, GradientBoostingRegressor):
+        if isinstance(model, PLSRegression) or isinstance(model, GradientBoostingRegressor) and use_rfe:
             logger.info(f"Skipping RFE for {model_name}.")
             use_rfe = False
-        elif isinstance(model, SVR) and getattr(model, 'kernel', None) != "linear":
+        elif isinstance(model, SVR) and getattr(model, 'kernel', None) != "linear" and use_rfe:
             logger.info(f"Skipping RFE for {model_name} (SVR with non-linear kernel not supported by RFE).")
             use_rfe = False
 
