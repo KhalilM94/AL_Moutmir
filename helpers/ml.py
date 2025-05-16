@@ -3,6 +3,7 @@ import numpy as np
 import os
 import sys
 import logging
+from datetime import datetime
 from sklearn.model_selection import (
     GridSearchCV,
     KFold, 
@@ -17,7 +18,7 @@ from sklearn.svm import SVR
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.feature_selection import RFECV
-from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import FunctionTransformer, RobustScaler
 from sklearn.cluster import KMeans
 from skopt import BayesSearchCV
@@ -30,7 +31,7 @@ from sklearn.metrics import (
 import joblib
 
 
-def get_training_logger(name='ML', log_file='metrics/model_training.log'):
+def get_training_logger(name='ML', log_dir=None):
     """
     Creates and returns a logger configured for model training.
 
@@ -41,6 +42,12 @@ def get_training_logger(name='ML', log_file='metrics/model_training.log'):
     Returns:
     - logger (logging.Logger): Configured logger instance.
     """
+
+    if log_dir is None:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_dir = os.getenv('TRAINING_LOG_DIR', 'logs')
+        log_file = os.path.join(log_dir, f"{name}_training_{timestamp}.log")
+
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
     logger.propagate = False
