@@ -1,0 +1,96 @@
+DATA_FOLDER: "doukkala_ssl_datasets"
+TEST_SIZE: 0.2
+USE_GROUP_SPLIT: True
+SPLIT_STRATEGY: "groupkfold"
+ENABLE_TUNING: False
+USE_BAYES_OPT: true
+ENABLE_RFE: false
+RANDOM_SEED: 42
+
+COLUMNS_TO_TRANSFORM:
+  - "Clay%"
+  - "Coarse element %"
+  - "C.E.C (meq / 100g)"
+  - "Na2O ppm"
+  - "Cl- ppm"
+  - "Organic matter%"
+  - "Exchangeable K2O ppm"
+  - "P2O5 ehangable Olsen ppm"
+  - "MgO ppm"
+  - "Iron ppm DTPA"
+  - "Mn ppm DTPA"
+
+TARGET_COLUMNS:
+  - "Sand%"
+  - "Clay%"
+  - "Total_Silt%"
+  - "pH_water"
+  - "CE_ext1 / 5 ms / cm"
+  - "C / N ratio"
+  - "Organic matter%"
+  - "Exchangeable K2O ppm"
+  - "P2O5 ehangable Olsen ppm"
+  #- Fine silt%
+  #- Coarse silt%
+  #- CaCo3%_Total
+  #- CaO ppm
+  #- Coarse element %
+  #- CaCo3 active%
+  #- C.E.C (meq / 100g)
+  #- Na2O ppm
+  #- Cl- ppm
+  #- Na meq / 100g
+  #- MgO ppm
+  #- Iron ppm DTPA
+  #- Mn ppm DTPA
+  #- Cu ppm DTPA
+  #- Zn ppm DTPA
+  #- B ppm Hot water
+
+ELIMINATED_FEATURES:
+  - uuid
+  - Latitude_Y
+  - Longitude_X
+  - Month
+  - Fine silt%
+  - Coarse silt%
+  - CaCo3%_Total
+  - CaO ppm
+  - Coarse element %
+  - CaCo3 active%
+  - C.E.C (meq / 100g)
+  - Na2O ppm
+  - Cl- ppm
+  - Na meq / 100g
+  - MgO ppm
+  - Iron ppm DTPA
+  - Mn ppm DTPA
+  - Cu ppm DTPA
+  - Zn ppm DTPA
+  - B ppm Hot water
+  # - Elevation
+  # - GPP
+  # - ET
+  # - LST
+  # - NDVI
+  # - SU_WRB1_PH
+  - Slope
+  # - bio01
+  # - bio02
+  # - bio03
+  # - bio04
+  # - bio05
+  # - bio06
+  # - bio07
+  # - bio08
+  # - bio09
+  # - bio10
+  # - bio11
+  # - bio12
+  # - bio13
+  # - bio14
+  # - bio15
+  # - bio16
+  # - bio17
+  # - bio18
+  # - bio19

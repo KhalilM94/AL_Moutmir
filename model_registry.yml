@@ -1,0 +1,23 @@
+PLSRegression:
+  enabled: true
+  import_path: sklearn.cross_decomposition.PLSRegression
+  params:
+    model__n_components: [2, 4, 6, 8, 10, 12, 14, 16, 18]
+
+ElasticNet:
+  enabled: true
+  import_path: sklearn.linear_model.ElasticNet
+  init_args:
+    max_iter: 10000
+  params:
+    model__alpha: [0.0001, 0.001, 0.01, 0.1, 1.0, 3.16]
+    model__l1_ratio: [0.1, 0.325, 0.55, 0.775, 1.0]
+
+KerasRegressor:
+  enabled: true
+  import_path: tensorflow.keras.wrappers.scikit_learn.KerasRegressor
+  custom_model_builder: helpers.models.build_keras_model
+  params:
+    model__epochs: [50, 100]
+    model__batch_size: [16, 32]
+    model__dropout_rate: [0.1, 0.2, 0.3]
