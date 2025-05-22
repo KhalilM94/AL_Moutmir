@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import os
 import joblib
 from typing import Union, List, Dict, Tuple
+from pathlib import Path
 
 class LogTransformer(BaseEstimator, TransformerMixin):
     def transform(self, y):
@@ -145,6 +146,7 @@ class Tuner:
     use_bayes: bool
     seed: int = 42
     verbose: int = 0
+    enable_tuning: bool = True  # Add this
 
     def tune(self, 
              pipeline, 
@@ -152,10 +154,10 @@ class Tuner:
              X_train, 
              y_train, 
              splits) -> Tuple[BaseEstimator, Union[str, Dict]]:
-        if not model_config.get("params"):
+        # Only tune if enabled and params exist
+        if not self.enable_tuning or not model_config.get("params"):
             pipeline.fit(X_train, y_train)
             return pipeline, "Default (no tuning)"
-
         if self.use_bayes:
             search = BayesSearchCV(
                 estimator=pipeline,
@@ -178,7 +180,7 @@ class Tuner:
             )
 
         search.fit(X_train, y_train)
-        return search.best_estimator_, search.best_params_ # type: ignore[attr-defined]
+        return search.best_estimator_ # type: ignore[attr-defined]
 
 class ModelEvaluator:
     def __init__(self, logger, columns_to_transform):
@@ -224,15 +226,17 @@ class ModelSaver:
 
     def save_metrics(self, metrics: Dict, model_name: str, target: str):
         safe_target = self._safe_filename(target)
-        metrics_path = os.path.join(self.output_dir, "metrics", f"{safe_target}_{model_name}_metrics.csv")
+        metrics_path = Path(self.output_dir) / "metrics" / f"{safe_target}_{model_name}_metrics.csv"
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame([metrics]).to_csv(metrics_path, index=False)
-        return metrics_path
+        return str(metrics_path)
 
     def save_model(self, model: BaseEstimator, model_name: str, target: str):
         safe_target = self._safe_filename(target)
-        model_path = os.path.join(self.output_dir, "final_models", f"{safe_target}_{model_name}.pkl")
+        model_path = Path(self.output_dir) / "final_models" / f"{safe_target}_{model_name}.pkl"
+        model_path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(model, model_path)
-        return model_path
+        return str(model_path)
 
     def save_cv_results(self, search_obj, model_name: str, target: str):
         if hasattr(search_obj, "cv_results_"):
@@ -240,7 +244,8 @@ class ModelSaver:
             results_df = pd.DataFrame(search_obj.cv_results_)
             results_df["target"] = target
             results_df["model"] = model_name
-            path = os.path.join(self.output_dir, "metrics", f"{safe_target}_{model_name}_cv_results.csv")
+            path = Path(self.output_dir) / "metrics" / f"{safe_target}_{model_name}_cv_results.csv"
+            path.parent.mkdir(parents=True, exist_ok=True)
             results_df.to_csv(path, index=False)
-            return path
+            return str(path)
         return None

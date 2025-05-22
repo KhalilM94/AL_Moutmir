@@ -1,7 +1,7 @@
 from helpers.model_trainer import ModelTrainer
-from helpers.logging import TrainingLogger
+from helpers.training_logger import TrainingLogger
 from helpers.utils import SpatialClusterSplitter
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from helpers.data_manager import DataManager
 import pandas as pd
 import os
 import datetime
@@ -31,6 +31,7 @@ class SoilModelTraining:
         self.logger.info(f"  RANDOM_SEED: {self.config.RANDOM_SEED}")
         self.logger.info(f"  TARGET_COLUMNS: {self.config.TARGET_COLUMNS}")
 
+        self.data_manager = DataManager(self.config, self.logger)
         # Spatial clustering splitter
         self.cluster_splitter = SpatialClusterSplitter(random_state= self.config.RANDOM_SEED)
 
@@ -91,77 +92,6 @@ class SoilModelTraining:
             }
 
         return model_configs
-
-    def load_data(self) -> pd.DataFrame:
-        """Load and return the initial dataset."""
-        csv_files = [f for f in os.listdir(self.config.DATA_FOLDER) if f.endswith('.csv')]
-        self.logger.info(f"Found data files: {csv_files}")
-        
-        if not csv_files:
-            raise FileNotFoundError(f"No CSV files found in {self.config.DATA_FOLDER}")
-            
-        return pd.read_csv(os.path.join(self.config.DATA_FOLDER, csv_files[0]))
-        
-    def preprocess_data(self, data: pd.DataFrame) -> Dict:
-        """Preprocess the data and return prepared datasets."""
-        self.logger.info("Clustering dataset based on spatial location (KMeans)...")
-        clustered_data = self.cluster_splitter.cluster(data)
-        self.logger.info(f"Cluster value counts:\n{clustered_data['cluster'].value_counts().to_string()}")
-        
-        # Get feature columns
-        feature_columns = [col for col in clustered_data.columns 
-                          if col not in self.config.TARGET_COLUMNS + self.config.ELIMINATED_FEATURES]
-        
-        # Prepare feature matrix
-        valid_feature_columns = clustered_data[feature_columns].dropna(axis=1, how='all').columns.tolist()
-        X = clustered_data[valid_feature_columns]
-        
-        # One-hot encoding if needed
-        if 'SU_WRB1_PH' in X.columns:
-            self.logger.info("One-hot encoding 'SU_WRB1_PH' column...")
-            X = pd.get_dummies(X, columns=['SU_WRB1_PH'])
-            
-        # Fill remaining NaNs with column means
-        X = X.apply(lambda row: row.fillna(row.mean()), axis=1)
-        clustered_cleaned = clustered_data.loc[X.index]
-        
-        return {
-            'X': X,
-            'y': clustered_cleaned[self.config.TARGET_COLUMNS],
-            'groups': clustered_cleaned['cluster']
-        }
-        
-    def split_data(self, X: pd.DataFrame, y: pd.DataFrame, groups: pd.Series) -> Dict:
-        """Split data into training and test sets."""
-        if self.config.USE_GROUP_SPLIT:
-            self.logger.info("Splitting dataset into train and test groups using GroupShuffleSplit...")
-            
-            gss = GroupShuffleSplit(n_splits=1, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_SEED)
-            train_idx, test_idx = next(gss.split(X, y, groups=groups))
-            
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-            groups_train, groups_test = groups.iloc[train_idx], groups.iloc[test_idx]
-            
-            self.logger.info(f"Train group distribution:\n{groups_train.value_counts().sort_index().to_string()}")
-            self.logger.info(f"Test group distribution:\n{groups_test.value_counts().sort_index().to_string()}")
-        else:
-            self.logger.info("Splitting dataset using simple train-test split...")
-            
-            X_train, X_test, y_train, y_test, groups_train, groups_test = train_test_split(
-                X, y, groups, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_SEED
-            )
-            
-        self.logger.info(f"Train: {len(X_train)} rows | Test: {len(X_test)} rows")
-        
-        return {
-            'X_train': X_train,
-            'X_test': X_test,
-            'y_train': y_train,
-            'y_test': y_test,
-            'groups_train': groups_train,
-            'groups_test': groups_test
-        }
         
     def train_models(self, X_train: pd.DataFrame, y_train: pd.DataFrame, 
                     X_test: pd.DataFrame, y_test: pd.DataFrame, 
@@ -198,14 +128,17 @@ class SoilModelTraining:
 
     def save_results(self, metrics_df: pd.DataFrame, test_data: Dict):
         """Save training results and test sets."""
-        # Define output paths
         metrics_dir = os.path.join(self.output_dir, "metrics")
         models_dir = os.path.join(self.output_dir, "final_models")
 
+        if metrics_df.empty or "target" not in metrics_df.columns:
+            self.logger.error("No valid metrics to save. Skipping result saving.")
+            print("No valid metrics to save. Check logs for errors.")
+            return
+
         # Save metrics
-        top_models = metrics_df.groupby("target").apply(
-            lambda df: df.sort_values("Test_R2", ascending=False).head(1)
-        ).reset_index(drop=True)
+        idx = metrics_df.groupby("target")["Test_R2"].idxmax()
+        top_models = metrics_df.loc[idx].reset_index(drop=True)
 
         top_models.to_csv(os.path.join(metrics_dir, "best_models_summary.csv"), index=False)
         metrics_df.to_csv(os.path.join(metrics_dir, "all_models_metrics.csv"), index=False)
@@ -228,11 +161,11 @@ def main():
     
     try:
         # Load and preprocess data
-        raw_data = trainer.load_data()
-        processed_data = trainer.preprocess_data(raw_data)
+        raw_data = trainer.data_manager.load_data()
+        processed_data = trainer.data_manager.preprocess_data(raw_data)
         
         # Split data
-        split_data = trainer.split_data(
+        split_data = trainer.data_manager.split_data(
             processed_data['X'],
             processed_data['y'],
             processed_data['groups']
