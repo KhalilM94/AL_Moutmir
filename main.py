@@ -15,8 +15,7 @@ from sklearn.preprocessing import StandardScaler
 class SoilModelTraining:
     def __init__(self):
 
-        # Setup directories
-        self.output_dir = self._setup_directories()
+        
         # Initialize components
         self.config = Config()
         self.logger = TrainingLogger(name='AlMoutmir Soil Models Training', 
@@ -31,28 +30,31 @@ class SoilModelTraining:
         self.logger.info(f"  RANDOM_SEED: {self.config.RANDOM_SEED}")
         self.logger.info(f"  TARGET_COLUMNS: {self.config.TARGET_COLUMNS}")
 
+        # Setup directories
+        self.output_dir = self._setup_directories(self.config.OUTPUT_FOLDER)
         self.data_manager = DataManager(self.config, self.logger)
         # Spatial clustering splitter
         self.cluster_splitter = SpatialClusterSplitter(random_state= self.config.RANDOM_SEED)
 
     @staticmethod    
     def _setup_directories(output_dir: str = "output") -> str:
-        """Ensure required directories exist."""
-        # Create base output directory
-        """Create a unique output directory with subdirectories for final models and metrics."""
-        # Create a unique directory name using timestamp
+        """Create a unique output directory inside the given parent directory, with subdirectories for final models and metrics."""
+        # Ensure the parent output directory exists
+        parent_dir = os.path.abspath(output_dir)
+        os.makedirs(parent_dir, exist_ok=True)
+
+        # Create a unique directory name using timestamp inside the parent directory
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_output_dir = f"{output_dir}_{timestamp}"
-        output_path = os.path.abspath(unique_output_dir)
+        unique_output_dir = os.path.join(parent_dir, f"run_{timestamp}")
 
         # Create subdirectories
-        final_models_path = os.path.join(output_path, "final_models")
-        metrics_path = os.path.join(output_path, "metrics")
+        final_models_path = os.path.join(unique_output_dir, "final_models")
+        metrics_path = os.path.join(unique_output_dir, "metrics")
 
         os.makedirs(final_models_path, exist_ok=True)
         os.makedirs(metrics_path, exist_ok=True)
 
-        return output_path
+        return unique_output_dir
         
     @staticmethod
     def _dynamic_import(import_path):

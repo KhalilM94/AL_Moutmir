@@ -1,4 +1,5 @@
-DATA_FOLDER: "doukkala_ssl_datasets"
+DATA_FOLDER: "../doukkala_ssl_datasets"
+OUTPUT_FOLDER: "../outputs"
 TEST_SIZE: 0.2
 USE_GROUP_SPLIT: True
 SPLIT_STRATEGY: "groupkfold"
