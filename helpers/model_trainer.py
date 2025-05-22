@@ -37,11 +37,10 @@ class ModelTrainer:
 
         self._validate_model_pipelines()
 
-        self.pipeline_builder = PipelineBuilder(enable_rfe, seed)
-        self.tuner = Tuner(use_bayes_opt, seed, tuning_verbose)
-        self.evaluator = ModelEvaluator(self.logger, columns_to_transform)
-        self.saver = ModelSaver(output_dir)
-
+        self.pipeline_builder = PipelineBuilder(self.enable_rfe, self.seed)
+        self.tuner = Tuner(self.use_bayes_opt, self.seed, self.tuning_verbose)
+        self.evaluator = ModelEvaluator(self.logger, self.columns_to_transform)
+        self.saver = ModelSaver(self.output_dir)
 
     def _validate_model_pipelines(self):
         for model_name, config in self.model_pipelines.items():

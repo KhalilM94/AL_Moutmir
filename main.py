@@ -21,6 +21,17 @@ class SoilModelTraining:
         self.config = Config()
         self.logger = TrainingLogger(name='AlMoutmir Soil Models Training', 
                                      log_dir= os.path.join(self.output_dir, "logs")).get_logger()
+        # Log configuration options
+        self.logger.info("Configuration Options:")
+        self.logger.info(f"  COLUMNS_TO_TRANSFORM: {self.config.COLUMNS_TO_TRANSFORM}")
+        self.logger.info(f"  SPLIT_STRATEGY: {self.config.SPLIT_STRATEGY}")
+        self.logger.info(f"  ENABLE_TUNING: {self.config.ENABLE_TUNING}")
+        self.logger.info(f"  USE_BAYES_OPT: {self.config.USE_BAYES_OPT}")
+        self.logger.info(f"  ENABLE_RFE: {self.config.ENABLE_RFE}")
+        self.logger.info(f"  RANDOM_SEED: {self.config.RANDOM_SEED}")
+        self.logger.info(f"  TARGET_COLUMNS: {self.config.TARGET_COLUMNS}")
+
+        # Spatial clustering splitter
         self.cluster_splitter = SpatialClusterSplitter(random_state= self.config.RANDOM_SEED)
 
     @staticmethod    
@@ -157,7 +168,6 @@ class SoilModelTraining:
                     groups_train: pd.Series) -> pd.DataFrame:
         """Train models for all targets and return results."""
         self.logger.info("Starting full training process for all targets...")
-        
         trainer = ModelTrainer(
             model_pipelines = self._get_model_configurations(num_features=X_train.shape[1]),
             columns_to_transform=self.config.COLUMNS_TO_TRANSFORM,
