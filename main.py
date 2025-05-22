@@ -18,6 +18,8 @@ class SoilModelTraining:
         
         # Initialize components
         self.config = Config()
+        # Setup directories
+        self.output_dir = self._setup_directories(self.config.OUTPUT_FOLDER)
         self.logger = TrainingLogger(name='AlMoutmir Soil Models Training', 
                                      log_dir= os.path.join(self.output_dir, "logs")).get_logger()
         # Log configuration options
@@ -30,8 +32,7 @@ class SoilModelTraining:
         self.logger.info(f"  RANDOM_SEED: {self.config.RANDOM_SEED}")
         self.logger.info(f"  TARGET_COLUMNS: {self.config.TARGET_COLUMNS}")
 
-        # Setup directories
-        self.output_dir = self._setup_directories(self.config.OUTPUT_FOLDER)
+
         self.data_manager = DataManager(self.config, self.logger)
         # Spatial clustering splitter
         self.cluster_splitter = SpatialClusterSplitter(random_state= self.config.RANDOM_SEED)
