@@ -1,6 +1,7 @@
 from helpers.model_trainer import ModelTrainer
 from helpers.training_logger import TrainingLogger
 from helpers.utils import SpatialClusterSplitter
+from helpers.model_config_factory import ModelConfigFactory
 from helpers.data_manager import DataManager
 import pandas as pd
 import os
@@ -34,10 +35,12 @@ class SoilModelTraining:
         self.data_manager = DataManager(self.config, self.logger)
         # Spatial clustering splitter
         self.cluster_splitter = SpatialClusterSplitter(random_state= self.config.RANDOM_SEED)
-
+        self.model_configs = ModelConfigFactory(self.config.MODEL_REGISTRY)
+    
     @staticmethod    
     def _setup_directories(output_dir: str = "output") -> str:
-        """Create a unique output directory inside the given parent directory, with subdirectories for final models and metrics."""
+        """Create a unique output directory inside the given parent directory,
+            with subdirectories for final models and metrics."""
         # Ensure the parent output directory exists
         parent_dir = os.path.abspath(output_dir)
         os.makedirs(parent_dir, exist_ok=True)
@@ -55,49 +58,13 @@ class SoilModelTraining:
 
         return unique_output_dir
         
-    @staticmethod
-    def _dynamic_import(import_path):
-        module_path, class_name = import_path.rsplit(".", 1)
-        module = importlib.import_module(module_path)
-        return getattr(module, class_name)
-
-    def _get_model_configurations(self, num_features: int):
-        """Build dynamic model configurations from self.config.MODEL_REGISTRY."""
-        model_configs = {}
-
-        for name, spec in self.config.MODEL_REGISTRY.items():
-            if not spec.get("enabled", False):
-                continue
-            try:
-                ModelClass = self._dynamic_import(spec["import_path"])
-            except Exception as e:
-                print(f"[Warning] Failed to import {name}: {e}")
-                continue
-
-            init_args = spec.get("init_args", {})
-            custom_model_builder = spec.get("custom_model_builder", None)
-
-            # Handle Keras or other wrappers with custom model builders
-            if custom_model_builder:
-                builder_func = self._dynamic_import(custom_model_builder)
-                model_instance = ModelClass(build_fn=lambda: builder_func(num_features))
-            else:
-                model_instance = ModelClass(**init_args)
-
-            model_configs[name] = {
-                "model": model_instance,
-                "params": spec.get("params", {})
-            }
-
-        return model_configs
-        
     def train_models(self, X_train: pd.DataFrame, y_train: pd.DataFrame, 
                     X_test: pd.DataFrame, y_test: pd.DataFrame, 
                     groups_train: pd.Series) -> pd.DataFrame:
         """Train models for all targets and return results."""
         self.logger.info("Starting full training process for all targets...")
         trainer = ModelTrainer(
-            model_pipelines = self._get_model_configurations(num_features=X_train.shape[1]),
+            model_pipelines = self.model_configs.build_model_configs(num_features=X_train.shape[1]),
             columns_to_transform=self.config.COLUMNS_TO_TRANSFORM,
             split_strategy=self.config.SPLIT_STRATEGY,
             enable_hyperparameter_tuning=self.config.ENABLE_TUNING,
