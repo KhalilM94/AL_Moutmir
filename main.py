@@ -1,12 +1,10 @@
 from helpers.model_trainer import ModelTrainer
 from helpers.training_logger import TrainingLogger
-from helpers.utils import SpatialClusterSplitter
 from helpers.model_config_factory import ModelConfigFactory
-from helpers.data_manager import DataManager
+from helpers.data_manager import DataManager, SpatialClusterSplitter
 from helpers.io_utils import setup_directories
 import pandas as pd
 import os
-import datetime
 import joblib
 from typing import Dict
 from config import Config
@@ -14,7 +12,6 @@ from config import Config
 class SoilModelTraining:
     def __init__(self):
 
-        
         # Initialize components
         self.config = Config()
         # Setup directories
@@ -90,8 +87,7 @@ class SoilModelTraining:
 
         # Save test sets
         joblib.dump({
-            "X_test": test_data['X_test'],
-            "y_test": test_data['y_test']
+            "X_test": test_data['X_test'], "y_test": test_data['y_test']
         }, os.path.join(models_dir, "test_sets.pkl"))
         self.logger.info(f"Test sets saved to {models_dir}/test_sets.pkl")
 
@@ -109,26 +105,17 @@ def main():
         processed_data = trainer.data_manager.preprocess_data(raw_data)
         
         # Split data
-        split_data = trainer.data_manager.split_data(
-            processed_data['X'],
-            processed_data['y'],
-            processed_data['groups']
-        )
+        split_data = trainer.data_manager.split_data(processed_data['X'],processed_data['y'],
+                                                     processed_data['groups'])
         
         # Train models
-        metrics = trainer.train_models(
-            split_data['X_train'],
-            split_data['y_train'],
-            split_data['X_test'],
-            split_data['y_test'],
-            split_data['groups_train']
-        )
+        metrics = trainer.train_models(split_data['X_train'], split_data['y_train'],
+                                       split_data['X_test'], split_data['y_test'],
+                                       split_data['groups_train'])
         
         # Save results
-        trainer.save_results(metrics, {
-            'X_test': split_data['X_test'],
-            'y_test': split_data['y_test']
-        })
+        trainer.save_results(metrics, {'X_test': split_data['X_test'],
+                                       'y_test': split_data['y_test']})
         
     except Exception as e:
         trainer.logger.error(f"An error occurred during training: {e}")

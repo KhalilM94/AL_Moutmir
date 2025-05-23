@@ -1,8 +1,9 @@
 import pandas as pd
-from typing import Dict
-from helpers.utils import SpatialClusterSplitter
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.cluster import KMeans
 import os
+from typing import Dict
+from dataclasses import dataclass
 
 class DataManager:
     def __init__(self, config, logger):
@@ -80,3 +81,39 @@ class DataManager:
             'groups_train': groups_train,
             'groups_test': groups_test
         }
+
+@dataclass
+class SpatialClusterSplitter:
+    """
+    Clusters geographic points into spatial groups using KMeans.
+
+    Parameters:
+    -----------
+    n_clusters : int, default=12
+        Number of spatial clusters to form.
+    lat_col : str, default='Latitude_Y'
+        Name of the latitude column in the DataFrame.
+    lon_col : str, default='Longitude_X'
+        Name of the longitude column in the DataFrame.
+    random_state : int, default=42
+        Random seed for reproducibility of clustering.
+
+    Methods:
+    --------
+    cluster(df: pd.DataFrame) -> pd.DataFrame
+        Adds a 'cluster' column to the DataFrame with cluster labels (1-indexed).
+        Rows with missing coordinates are dropped from the result.
+    """
+    n_clusters: int = 12
+    lat_col: str = 'Latitude_Y'
+    lon_col: str = 'Longitude_X'
+    random_state: int = 42
+
+    def cluster(self, df: pd.DataFrame) -> pd.DataFrame:
+        coords = df[[self.lat_col, self.lon_col]].dropna()
+        kmeans = KMeans(n_clusters=self.n_clusters, random_state=self.random_state)
+        labels = kmeans.fit_predict(coords) + 1
+
+        df = df.copy()
+        df.loc[coords.index, 'cluster'] = labels.astype(int)
+        return df.dropna(subset=['cluster'])

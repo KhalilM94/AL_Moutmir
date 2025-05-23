@@ -3,12 +3,9 @@ import pandas as pd
 from typing import Optional, List, Dict, Tuple
 
 from .training_logger import TrainingLogger
-from .utils import (CVSplitter, 
-                    LogTransformer, 
-                    PipelineBuilder, 
-                    Tuner,
-                    ModelEvaluator,
-                    ModelSaver)
+from .trainer_utils import (CVSplitter, PipelineBuilder, Tuner, 
+                            ModelEvaluator, ModelSaver)
+from .utils import LogTransformer
 
 class ModelTrainer:
     def __init__(
