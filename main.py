@@ -3,12 +3,12 @@ from helpers.training_logger import TrainingLogger
 from helpers.utils import SpatialClusterSplitter
 from helpers.model_config_factory import ModelConfigFactory
 from helpers.data_manager import DataManager
+from helpers.io_utils import setup_directories
 import pandas as pd
 import os
 import datetime
 import joblib
 from typing import Dict
-import importlib
 from config import Config
 
 class SoilModelTraining:
@@ -18,7 +18,7 @@ class SoilModelTraining:
         # Initialize components
         self.config = Config()
         # Setup directories
-        self.output_dir = self._setup_directories(self.config.OUTPUT_FOLDER)
+        self.output_dir = setup_directories(self.config.OUTPUT_FOLDER)
         self.logger = TrainingLogger(name='AlMoutmir Soil Models Training', 
                                      log_dir= os.path.join(self.output_dir, "logs")).get_logger()
         # Log configuration options
@@ -36,27 +36,6 @@ class SoilModelTraining:
         # Spatial clustering splitter
         self.cluster_splitter = SpatialClusterSplitter(random_state= self.config.RANDOM_SEED)
         self.model_configs = ModelConfigFactory(self.config.MODEL_REGISTRY)
-    
-    @staticmethod    
-    def _setup_directories(output_dir: str = "output") -> str:
-        """Create a unique output directory inside the given parent directory,
-            with subdirectories for final models and metrics."""
-        # Ensure the parent output directory exists
-        parent_dir = os.path.abspath(output_dir)
-        os.makedirs(parent_dir, exist_ok=True)
-
-        # Create a unique directory name using timestamp inside the parent directory
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_output_dir = os.path.join(parent_dir, f"run_{timestamp}")
-
-        # Create subdirectories
-        final_models_path = os.path.join(unique_output_dir, "final_models")
-        metrics_path = os.path.join(unique_output_dir, "metrics")
-
-        os.makedirs(final_models_path, exist_ok=True)
-        os.makedirs(metrics_path, exist_ok=True)
-
-        return unique_output_dir
         
     def train_models(self, X_train: pd.DataFrame, y_train: pd.DataFrame, 
                     X_test: pd.DataFrame, y_test: pd.DataFrame, 
