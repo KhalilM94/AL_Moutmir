@@ -5,7 +5,7 @@ from sklearn.feature_selection import RFECV
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.svm import SVR
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin
 from sklearn.model_selection import KFold, GroupKFold, StratifiedShuffleSplit
 from sklearn.cluster import KMeans
 from sklearn.model_selection import GridSearchCV, cross_validate
@@ -153,7 +153,8 @@ class Tuner:
              model_config, 
              X_train, 
              y_train, 
-             splits) -> Tuple[BaseEstimator, Union[str, Dict]]:
+             splits):
+        
         # Only tune if enabled and params exist
         if not self.enable_tuning or not model_config.get("params"):
             pipeline.fit(X_train, y_train)
@@ -180,7 +181,7 @@ class Tuner:
             )
 
         search.fit(X_train, y_train)
-        return search.best_estimator_ # type: ignore[attr-defined]
+        return search.best_estimator_, search.best_params_ # type: ignore[attr-defined]
 
 class ModelEvaluator:
     def __init__(self, logger, columns_to_transform):

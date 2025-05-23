@@ -9,8 +9,6 @@ import joblib
 from typing import Dict
 import importlib
 from config import Config
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
 class SoilModelTraining:
     def __init__(self):
@@ -82,10 +80,7 @@ class SoilModelTraining:
             # Handle Keras or other wrappers with custom model builders
             if custom_model_builder:
                 builder_func = self._dynamic_import(custom_model_builder)
-                model_instance = Pipeline([
-                    ("scaler", StandardScaler()),
-                    ("model", ModelClass(build_fn=lambda: builder_func(num_features)))
-                ])
+                model_instance = ModelClass(build_fn=lambda: builder_func(num_features))
             else:
                 model_instance = ModelClass(**init_args)
 

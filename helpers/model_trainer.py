@@ -107,16 +107,17 @@ class ModelTrainer:
     ) -> Optional[Dict]:
         self.logger.info(f"Training {model_name} for {target}")
         model = config["model"]
-        use_rfe = self.enable_rfe and self.pipeline_builder.is_rfe_compatible(model)
-        if self.enable_rfe and not use_rfe:
+        is_rfe_compatible = self.pipeline_builder.is_rfe_compatible(model)
+        if self.enable_rfe and not is_rfe_compatible:
             self.logger.info(f"Skipping RFE for {model_name} (not supported).")
         y_train_transformed = self._prepare_transformed_target(y_train, is_log_target)
-        pipeline, splits, best_params = self._run_training_pipeline(
+        best_model, splits, best_params = self._run_training_pipeline(
             model, config, model_name, target,
-            X_train, y_train_transformed, groups_train, use_rfe
+            X_train, y_train_transformed, groups_train, is_rfe_compatible
         )
+        
         return self._evaluate_and_save(
-            pipeline, config, model_name, target,
+            best_model, model_name, target,
             X_train, y_train_transformed, X_test, y_test, splits, best_params
         )
 
@@ -145,7 +146,6 @@ class ModelTrainer:
     def _evaluate_and_save(
         self,
         model,
-        config: Dict,
         model_name: str,
         target: str,
         X_train: pd.DataFrame,

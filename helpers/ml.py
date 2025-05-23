@@ -307,7 +307,7 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
             y_train_transformed = y_train
 
         # Standard pipeline for other models
-        steps = [('scaler', RobustScaler())]
+        steps: list[tuple[str, BaseEstimator]] = [('scaler', RobustScaler())]
 
         if use_rfe:
             # Use RFECV for automatic feature selection based on cross-validation performance
@@ -358,8 +358,8 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
                 logger.warning(f"Training failed for {model_name} on {target}: {e}")
                 continue
             
-            best_model = search.best_estimator_
-            best_params = search.best_params_
+            best_model = search.best_estimator_ # type: ignore[attr-defined]
+            best_params = search.best_params_ # type: ignore[attr-defined]
 
         else:
             try:

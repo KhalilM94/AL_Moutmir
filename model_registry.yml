@@ -5,7 +5,7 @@ PLSRegression:
     model__n_components: [2, 4, 6, 8, 10, 12, 14, 16, 18]
 
 ElasticNet:
-  enabled: true
+  enabled: false
   import_path: sklearn.linear_model.ElasticNet
   init_args:
     max_iter: 10000
@@ -14,7 +14,7 @@ ElasticNet:
     model__l1_ratio: [0.1, 0.325, 0.55, 0.775, 1.0]
 
 KerasRegressor:
-  enabled: true
+  enabled: false
   import_path: tensorflow.keras.wrappers.scikit_learn.KerasRegressor
   custom_model_builder: helpers.models.build_keras_model
   params:

@@ -2,7 +2,7 @@ DATA_FOLDER: "../doukkala_ssl_datasets"
 OUTPUT_FOLDER: "../outputs"
 TEST_SIZE: 0.2
 USE_GROUP_SPLIT: True
-SPLIT_STRATEGY: "groupkfold"
+SPLIT_STRATEGY: "groupkfold" # "groupkfold" or "kfold" or "stratifiedshuffle"
 ENABLE_TUNING: False
 USE_BAYES_OPT: False
 ENABLE_RFE: False
