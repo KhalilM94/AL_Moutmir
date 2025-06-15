@@ -1,4 +1,4 @@
-DATA_FOLDER: "../doukkala_ssl_datasets"
+DATA_FOLDER: "../doukkala_ssl_datasets_apriori"
 OUTPUT_FOLDER: "../outputs"
 TEST_SIZE: 0.2
 USE_GROUP_SPLIT: True
@@ -22,15 +22,15 @@ COLUMNS_TO_TRANSFORM:
   - "Mn ppm DTPA"
 
 TARGET_COLUMNS:
-  - "Sand%"
-  - "Clay%"
-  - "Total_Silt%"
-  - "pH_water"
-  - "CE_ext1 / 5 ms / cm"
-  - "C / N ratio"
+  #- "Sand%"
+  #- "Clay%"
+  #- "Total_Silt%"
+  #- "pH_water"
+  #- "CE_ext1 / 5 ms / cm"
+  #- "C / N ratio"
   - "Organic matter%"
-  - "Exchangeable K2O ppm"
-  - "P2O5 ehangable Olsen ppm"
+  #- "Exchangeable K2O ppm"
+  #- "P2O5 ehangable Olsen ppm"
   #- Fine silt%
   #- Coarse silt%
   #- CaCo3%_Total
@@ -50,9 +50,20 @@ TARGET_COLUMNS:
 
 ELIMINATED_FEATURES:
   - uuid
+  - cluster
   - Latitude_Y
   - Longitude_X
   - Month
+  - "Sand%"
+  - "Clay%"
+  - "Total_Silt%"
+  - "pH_water"
+  - "CE_ext1 / 5 ms / cm"
+  - "C / N ratio"
+  - "OM_prior_kriging"
+  #- "Organic matter%"
+  - "Exchangeable K2O ppm"
+  - "P2O5 ehangable Olsen ppm"
   - Fine silt%
   - Coarse silt%
   - CaCo3%_Total
@@ -69,13 +80,15 @@ ELIMINATED_FEATURES:
   - Cu ppm DTPA
   - Zn ppm DTPA
   - B ppm Hot water
-  # - Elevation
+  - Elevation
   # - GPP
   # - ET
   # - LST
   # - NDVI
   # - SU_WRB1_PH
-  - Slope
+  # - Slope
+  # - Aridity_Index
+  # - TWI
   # - bio01
   # - bio02
   # - bio03
