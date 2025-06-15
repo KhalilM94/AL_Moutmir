@@ -458,6 +458,7 @@ def plot_observed_vs_predicted(
     target_columns,
     columns_to_transform,
     model_dir="final_models",
+    sup_title="Test set Observed vs Predicted",
     group_prefix=None,
     group_label_map=None,
     group_numeric_column=None,
@@ -470,7 +471,7 @@ def plot_observed_vs_predicted(
 
     # Create the plot grid
     fig, axes = plt.subplots(n_targets, n_models, figsize=(5 * n_models, 5 * n_targets))
-    fig.suptitle("Test set Observed vs Predicted", fontsize=18)
+    fig.suptitle(sup_title, fontsize=18)
     axes = np.atleast_2d(axes)
 
     # Loop through targets and models to generate the scatter plots

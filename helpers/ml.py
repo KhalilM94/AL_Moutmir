@@ -30,6 +30,9 @@ from sklearn.metrics import (
 )
 import joblib
 
+# ---------------------------
+# Logger setter for model training
+# ---------------------------
 
 def get_training_logger(name='ML', log_dir=None):
     """
@@ -77,6 +80,7 @@ def get_training_logger(name='ML', log_dir=None):
 # ---------------------------
 # Log Transformer Definition
 # ---------------------------
+
 class LogTransformer(BaseEstimator, TransformerMixin):
     def __init__(self):
         pass
@@ -90,16 +94,7 @@ class LogTransformer(BaseEstimator, TransformerMixin):
 # ---------------------------
 # KMeans Clustering for Spatial Segmentation
 # ---------------------------   
-""" 
-def cluster_and_split(merged_df, lat_col='Latitude_Y', lon_col='Longitude_X', n_clusters=12, seed = 42):
-    logger.info("Starting KMeans clustering for spatial segmentation.")
-    coords = merged_df[[lat_col, lon_col]].dropna()
-    kmeans = KMeans(n_clusters=n_clusters, random_state=seed)
-    labels = kmeans.fit_predict(coords) + 1
-    merged_df = merged_df.copy()
-    merged_df.loc[coords.index, 'cluster'] = labels.astype(int)
-    return merged_df.dropna(subset=['cluster'])
-"""
+
 def cluster_and_split(merged_df, lat_col='Latitude_Y', lon_col='Longitude_X',
     n_clusters=12, seed=42, logger=None):
     # Set up a default logger if none is provided
@@ -132,6 +127,7 @@ def cluster_and_split(merged_df, lat_col='Latitude_Y', lon_col='Longitude_X',
 # ---------------------------
 # Pipeline Builder
 # ---------------------------   
+
 def build_pipeline(model, scaler=None):
     """
     model: estimator (e.g., RandomForestClassifier)
@@ -311,7 +307,7 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
             y_train_transformed = y_train
 
         # Standard pipeline for other models
-        steps = [('scaler', RobustScaler())]
+        steps: list[tuple[str, BaseEstimator]] = [('scaler', RobustScaler())]
 
         if use_rfe:
             # Use RFECV for automatic feature selection based on cross-validation performance
@@ -362,8 +358,8 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
                 logger.warning(f"Training failed for {model_name} on {target}: {e}")
                 continue
             
-            best_model = search.best_estimator_
-            best_params = search.best_params_
+            best_model = search.best_estimator_ # type: ignore[attr-defined]
+            best_params = search.best_params_ # type: ignore[attr-defined]
 
         else:
             try:
@@ -395,7 +391,6 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
             return_train_score=False
             )
 
-
         test_metrics = {
             "target": target,
             "model": model_name,
@@ -412,7 +407,6 @@ def train_models_for_target(target, X_train, y_train, X_test, y_test, groups_tra
             f"🏁 {model_name} | {target} — CV RMSE: {test_metrics['CV_RMSE_Mean']:.4f}, "
             f"Test RMSE: {test_metrics['Test_RMSE']:.4f}, R²: {test_metrics['Test_R2']:.4f}"
             )
-
 
         results.append(test_metrics)
 

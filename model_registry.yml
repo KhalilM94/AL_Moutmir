@@ -1,0 +1,35 @@
+PLSRegression:
+  enabled: false
+  import_path: sklearn.cross_decomposition.PLSRegression
+  params:
+    model__n_components: [2, 4, 6, 8, 10, 12, 14, 16, 18]
+
+GradientBoosting:
+  enabled: true
+  import_path: sklearn.ensemble.GradientBoostingRegressor
+  init_args:
+    random_state: 42
+  params:
+    model__n_estimators: [100, 150, 200, 250, 300, 350]
+    model__learning_rate: [0.01, 0.05, 0.1, 0.2]
+    model__max_depth: [3, 5, 7, 9, 11, 13, 15, 17, 19]
+    model__subsample: [0.6, 0.8, 1.0]
+    model__min_samples_split: [2, 5, 10]
+
+ElasticNet:
+  enabled: false
+  import_path: sklearn.linear_model.ElasticNet
+  init_args:
+    max_iter: 10000
+  params:
+    model__alpha: [0.0001, 0.001, 0.01, 0.1, 1.0, 3.16]
+    model__l1_ratio: [0.1, 0.325, 0.55, 0.775, 1.0]
+
+KerasRegressor:
+  enabled: false
+  import_path: tensorflow.keras.wrappers.scikit_learn.KerasRegressor
+  custom_model_builder: helpers.models.build_keras_model
+  params:
+    model__epochs: [50, 100]
+    model__batch_size: [16, 32]
+    model__dropout_rate: [0.1, 0.2, 0.3]
