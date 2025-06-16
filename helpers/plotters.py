@@ -556,4 +556,4 @@ def plot_observed_vs_predicted(
 
     # Tighten layout and display plot
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.show()
+    return plt

@@ -5,7 +5,6 @@ from helpers.data_manager import DataManager, SpatialClusterSplitter
 from helpers.io_utils import setup_directories
 from helpers.plotters import plot_observed_vs_predicted
 from helpers.utils import LogTransformer
-import matplotlib.pyplot as plt
 import pandas as pd
 import os
 import joblib
@@ -96,8 +95,7 @@ class SoilModelTraining:
         self.logger.info(f"Test sets saved to {models_dir}/test_sets.pkl")
 
          # --- Add plot_observed_vs_predicted and save the plot ---
-        fig = plt.figure(figsize=(10, 8))
-        plot_observed_vs_predicted(
+        fig = plot_observed_vs_predicted(
             test_data['X_test'],
             test_data['y_test'],
             self.model_configs.build_model_configs(num_features=test_data['X_test'].shape[1]),
@@ -107,8 +105,7 @@ class SoilModelTraining:
             sup_title="Test set Observed vs Predicted",
             log_transformer=self.log_transformer
         )
-        plt.savefig(os.path.join(models_dir, "observed_vs_predicted.png"))
-        plt.close(fig)       
+        fig.savefig(os.path.join(models_dir, "observed_vs_predicted.png"))   
 
         # Display results
         print("\nFinal Metrics DataFrame:")
