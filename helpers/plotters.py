@@ -536,6 +536,12 @@ def plot_observed_vs_predicted(
             ax.set_ylabel("Predicted")
             ax.set_aspect('equal', 'box')
 
+            # Plot regression line
+            coef = np.polyfit(y_test_clean, y_pred_clean, 1)
+            reg_line = np.poly1d(coef)
+            x_vals = np.linspace(min_val, max_val, 100)
+            ax.plot(x_vals, reg_line(x_vals), 'k--', lw=1)
+
             # Annotate metrics
             r2 = r2_score(y_test_clean, y_pred_clean)
             rmse = np.sqrt(mean_squared_error(y_test_clean, y_pred_clean))
