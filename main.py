@@ -106,6 +106,7 @@ class SoilModelTraining:
             sup_title="Test set Observed vs Predicted",
             log_transformer=self.log_transformer
         )
+        os.makedirs(plots_dir, exist_ok=True)
         fig.savefig(os.path.join(plots_dir, "observed_vs_predicted.png"))   
         self.logger.info(f"Obs_vs_Pred Plot saved to {plots_dir}/observed_vs_predicted.png")
 
