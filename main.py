@@ -74,6 +74,7 @@ class SoilModelTraining:
         """Save training results and test sets."""
         metrics_dir = os.path.join(self.output_dir, "metrics")
         models_dir = os.path.join(self.output_dir, "final_models")
+        plots_dir = os.path.join(self.output_dir, "plots")
 
         if metrics_df.empty or "target" not in metrics_df.columns:
             self.logger.error("No valid metrics to save. Skipping result saving.")
@@ -105,7 +106,8 @@ class SoilModelTraining:
             sup_title="Test set Observed vs Predicted",
             log_transformer=self.log_transformer
         )
-        fig.savefig(os.path.join(models_dir, "observed_vs_predicted.png"))   
+        fig.savefig(os.path.join(plots_dir, "observed_vs_predicted.png"))   
+        self.logger.info(f"Obs_vs_Pred Plot saved to {plots_dir}/observed_vs_predicted.png")
 
         # Display results
         print("\nFinal Metrics DataFrame:")
