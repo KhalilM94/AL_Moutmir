@@ -3,6 +3,9 @@ from helpers.training_logger import TrainingLogger
 from helpers.model_config_factory import ModelConfigFactory
 from helpers.data_manager import DataManager, SpatialClusterSplitter
 from helpers.io_utils import setup_directories
+from helpers.plotters import plot_observed_vs_predicted
+from helpers.utils import LogTransformer
+import matplotlib.pyplot as plt
 import pandas as pd
 import os
 import joblib
@@ -16,6 +19,7 @@ class SoilModelTraining:
         self.config = Config()
         # Setup directories
         self.output_dir = setup_directories(self.config.OUTPUT_FOLDER)
+        self.log_transformer = LogTransformer()
         self.logger = TrainingLogger(name='AlMoutmir Soil Models Training', 
                                      log_dir= os.path.join(self.output_dir, "logs")).get_logger()
         # Log configuration options
@@ -90,6 +94,21 @@ class SoilModelTraining:
             "X_test": test_data['X_test'], "y_test": test_data['y_test']
         }, os.path.join(models_dir, "test_sets.pkl"))
         self.logger.info(f"Test sets saved to {models_dir}/test_sets.pkl")
+
+         # --- Add plot_observed_vs_predicted and save the plot ---
+        fig = plt.figure(figsize=(10, 8))
+        plot_observed_vs_predicted(
+            test_data['X_test'],
+            test_data['y_test'],
+            self.model_configs.build_model_configs(num_features=test_data['X_test'].shape[1]),
+            self.config.TARGET_COLUMNS,
+            self.config.COLUMNS_TO_TRANSFORM,
+            model_dir=models_dir,
+            sup_title="Test set Observed vs Predicted",
+            log_transformer=self.log_transformer
+        )
+        plt.savefig(os.path.join(models_dir, "observed_vs_predicted.png"))
+        plt.close(fig)       
 
         # Display results
         print("\nFinal Metrics DataFrame:")
