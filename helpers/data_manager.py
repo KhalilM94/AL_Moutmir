@@ -4,12 +4,13 @@ from sklearn.cluster import KMeans
 import os
 from typing import Dict
 from dataclasses import dataclass
+from abc import ABC, abstractmethod
 
 class DataManager:
     def __init__(self, config, logger):
         self.config = config
         self.logger = logger
-        self.cluster_splitter = SpatialClusterSplitter(random_state=config.RANDOM_SEED)
+        self.cluster_splitter = KMeansClusterSplitter(random_state=config.RANDOM_SEED)
 
     def load_data(self) -> pd.DataFrame:
         """Load and return the initial dataset."""
@@ -82,10 +83,22 @@ class DataManager:
             'groups_test': groups_test
         }
 
-@dataclass
-class SpatialClusterSplitter:
+class BaseSpatialClusterSplitter(ABC):
     """
-    Clusters geographic points into spatial groups using KMeans.
+    Abstract base class for spatial clustering strategies.
+    """
+
+    @abstractmethod
+    def cluster(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Clusters the input DataFrame spatially and adds a 'cluster' column.
+        """
+        pass
+
+@dataclass
+class KMeansClusterSplitter(BaseSpatialClusterSplitter):
+    """
+    KMeans-based spatial clustering.
 
     Parameters:
     -----------
@@ -97,12 +110,6 @@ class SpatialClusterSplitter:
         Name of the longitude column in the DataFrame.
     random_state : int, default=42
         Random seed for reproducibility of clustering.
-
-    Methods:
-    --------
-    cluster(df: pd.DataFrame) -> pd.DataFrame
-        Adds a 'cluster' column to the DataFrame with cluster labels (1-indexed).
-        Rows with missing coordinates are dropped from the result.
     """
     n_clusters: int = 12
     lat_col: str = 'Latitude_Y'
@@ -112,8 +119,30 @@ class SpatialClusterSplitter:
     def cluster(self, df: pd.DataFrame) -> pd.DataFrame:
         coords = df[[self.lat_col, self.lon_col]].dropna()
         kmeans = KMeans(n_clusters=self.n_clusters, random_state=self.random_state)
-        labels = kmeans.fit_predict(coords) + 1
+        labels = kmeans.fit_predict(coords) + 1  # 1-indexed
 
         df = df.copy()
         df.loc[coords.index, 'cluster'] = labels.astype(int)
+        return df.dropna(subset=['cluster'])
+
+@dataclass
+class GridClusterSplitter(BaseSpatialClusterSplitter):
+    """
+    Grid-based spatial clustering using a regular grid of fixed size (in degrees).
+    """
+    grid_size: float = 0.1  # e.g., 0.1 degrees
+    lat_col: str = 'Latitude_Y'
+    lon_col: str = 'Longitude_X'
+
+    def cluster(self, df: pd.DataFrame) -> pd.DataFrame:
+        coords = df[[self.lat_col, self.lon_col]].dropna()
+
+        lat_grid = (coords[self.lat_col] // self.grid_size).astype(int)
+        lon_grid = (coords[self.lon_col] // self.grid_size).astype(int)
+
+        # Create combined grid cell label and encode it as numeric cluster ID
+        labels = (lat_grid.astype(str) + "_" + lon_grid.astype(str)).astype('category').cat.codes + 1
+
+        df = df.copy()
+        df.loc[coords.index, 'cluster'] = labels
         return df.dropna(subset=['cluster'])
