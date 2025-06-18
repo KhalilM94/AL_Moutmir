@@ -1,9 +1,13 @@
+from data_manager import BaseSpatialClusterStrategy
 import importlib
+from dataclasses import dataclass
+from typing import Optional
 
+@dataclass
 class ModelConfigFactory:
     """Factory class to build model configurations dynamically based on a registry."""
-    def __init__(self, model_registry):
-        self.model_registry = model_registry
+    registry:dict
+    random_state:int = 42
     
     @staticmethod
     def _dynamic_import(import_path):
@@ -16,7 +20,7 @@ class ModelConfigFactory:
         """Build dynamic model configurations from self.config.MODEL_REGISTRY."""
         model_configs = {}
 
-        for name, spec in self.model_registry.items():
+        for name, spec in self.registry.items():
             if not spec.get("enabled", False):
                 continue
             try:
@@ -41,3 +45,17 @@ class ModelConfigFactory:
             }
 
         return model_configs
+    
+    def load_splitter_from_config(self) -> Optional[BaseSpatialClusterStrategy]:
+        """Load and return the splitter configuration from the registry."""
+        if self.registry.get("enabled", True) is True and "splitter" in self.registry:
+            splitter_cfg = self.registry["splitter"]
+            class_path = splitter_cfg["class_path"]
+            params = splitter_cfg.get("params", {})
+            params.setdefault("random_state", self.random_state)
+
+            SplitterClass = self._dynamic_import(class_path)
+            return SplitterClass(**params)
+        else:
+            print("[Warning] Splitter configuration not found or disabled in the registry.")
+            return None

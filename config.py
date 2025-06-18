@@ -1,6 +1,7 @@
 import os
 import random
 import yaml
+import json
 import numpy as np
 from typing import Any
 
@@ -18,7 +19,8 @@ class Config:
         self.OUTPUT_FOLDER = self._get_config('OUTPUT_FOLDER', 'outputs')
         self.RANDOM_SEED = self._get_config('RANDOM_SEED', random.randint(0, 1000000))
         self.TEST_SIZE = self._get_config('TEST_SIZE', 0.2)
-        self.USE_GROUP_SPLIT = self._get_config('USE_GROUP_SPLIT', False)
+        self.ENABLE_CLUSTERING = self._get_config('CLUSTERING_STRATEGY', None).get('enabled', False)
+        self.CLUSTERING_STRATEGY = self._get_config('CLUSTERING_STRATEGY', None)
         self.SPLIT_STRATEGY = self._get_config('SPLIT_STRATEGY', 'kfold')
 
         # Model training settings
@@ -45,6 +47,11 @@ class Config:
                 return float(val)
             elif isinstance(default, list):
                 return [x.strip() for x in val.split(',')]
+            elif isinstance(default, dict):
+                try:
+                    return json.loads(val)
+                except json.JSONDecodeError:
+                    raise ValueError(f"Invalid JSON format for environment variable {key}: {val}")
             return val
         return self.config.get(key, default)
 

@@ -5,7 +5,7 @@ from typing import Optional, List, Dict, Tuple
 from .training_logger import TrainingLogger
 from .trainer_utils import (CVSplitter, PipelineBuilder, Tuner, 
                             ModelEvaluator, ModelSaver)
-from .utils import LogTransformer
+from .misc_utils import LogTransformer
 
 class ModelTrainer:
     def __init__(

@@ -1,3 +1,4 @@
+from helpers.model_config_factory import ModelConfigFactory
 import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.cluster import KMeans
@@ -10,7 +11,7 @@ class DataManager:
     def __init__(self, config, logger):
         self.config = config
         self.logger = logger
-        self.cluster_splitter = KMeansClusterSplitter(random_state=config.RANDOM_SEED)
+        self.cluster_strategy = ModelConfigFactory(config.CLUSTERING_STRATEGY, config.RANDOM_SEED).load_splitter_from_config()
 
     def load_data(self) -> pd.DataFrame:
         """Load and return the initial dataset."""
@@ -25,7 +26,8 @@ class DataManager:
     def preprocess_data(self, data: pd.DataFrame) -> Dict:
         """Preprocess the data and return prepared datasets."""
         self.logger.info("Clustering dataset based on spatial location (KMeans)...")
-        clustered_data = self.cluster_splitter.cluster(data)
+        self.cluster_strategy = ModelConfigFactory(self.config.CLUSTERING_STRATEGY, self.config.RANDOM_SEED).load_splitter_from_config()
+        clustered_data = self.cluster_strategy.cluster(data) if isinstance(self.cluster_strategy, BaseSpatialClusterStrategy) else data
         self.logger.info(f"Cluster value counts:\n{clustered_data['cluster'].value_counts().to_string()}")
         
         # Get feature columns
@@ -53,7 +55,7 @@ class DataManager:
         
     def split_data(self, X: pd.DataFrame, y: pd.DataFrame, groups: pd.Series) -> Dict:
         """Split data into training and test sets."""
-        if self.config.USE_GROUP_SPLIT:
+        if self.config.ENABLE_CLUSTERING:
             self.logger.info("Splitting dataset into train and test groups using GroupShuffleSplit...")
             
             gss = GroupShuffleSplit(n_splits=1, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_SEED)
@@ -83,7 +85,7 @@ class DataManager:
             'groups_test': groups_test
         }
 
-class BaseSpatialClusterSplitter(ABC):
+class BaseSpatialClusterStrategy(ABC):
     """
     Abstract base class for spatial clustering strategies.
     """
@@ -96,7 +98,7 @@ class BaseSpatialClusterSplitter(ABC):
         pass
 
 @dataclass
-class KMeansClusterSplitter(BaseSpatialClusterSplitter):
+class KMeansClusterStrategy(BaseSpatialClusterStrategy):
     """
     KMeans-based spatial clustering.
 
@@ -126,7 +128,7 @@ class KMeansClusterSplitter(BaseSpatialClusterSplitter):
         return df.dropna(subset=['cluster'])
 
 @dataclass
-class GridClusterSplitter(BaseSpatialClusterSplitter):
+class GridClusterStrategy(BaseSpatialClusterStrategy):
     """
     Grid-based spatial clustering using a regular grid of fixed size (in degrees).
     """

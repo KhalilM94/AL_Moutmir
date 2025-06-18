@@ -1,10 +1,10 @@
 from helpers.model_trainer import ModelTrainer
 from helpers.training_logger import TrainingLogger
 from helpers.model_config_factory import ModelConfigFactory
-from helpers.data_manager import DataManager, SpatialClusterSplitter
+from helpers.data_manager import DataManager
 from helpers.io_utils import setup_directories
 from helpers.plotters import plot_observed_vs_predicted
-from helpers.utils import LogTransformer
+from helpers.misc_utils import LogTransformer
 import pandas as pd
 import os
 import joblib
@@ -24,6 +24,8 @@ class SoilModelTraining:
         # Log configuration options
         self.logger.info("Configuration Options:")
         self.logger.info(f"  COLUMNS_TO_TRANSFORM: {self.config.COLUMNS_TO_TRANSFORM}")
+        self.logger.info(f"  ENABLE_CLUSTERING: {self.config.ENABLE_CLUSTERING}")
+        self.logger.info(f"  CLUSTERING_STRATEGY: {self.config.CLUSTERING_STRATEGY.get('class_path').rsplit(".", 1) if self.config.ENABLE_CLUSTERING else None}")
         self.logger.info(f"  SPLIT_STRATEGY: {self.config.SPLIT_STRATEGY}")
         self.logger.info(f"  ENABLE_TUNING: {self.config.ENABLE_TUNING}")
         self.logger.info(f"  USE_BAYES_OPT: {self.config.USE_BAYES_OPT}")
@@ -34,7 +36,6 @@ class SoilModelTraining:
 
         self.data_manager = DataManager(self.config, self.logger)
         # Spatial clustering splitter
-        self.cluster_splitter = SpatialClusterSplitter(random_state= self.config.RANDOM_SEED)
         self.model_configs = ModelConfigFactory(self.config.MODEL_REGISTRY)
         
     def train_models(self, X_train: pd.DataFrame, y_train: pd.DataFrame, 
