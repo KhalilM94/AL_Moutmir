@@ -3,7 +3,7 @@ from helpers.training_logger import TrainingLogger
 from helpers.model_config_factory import ModelConfigFactory
 from helpers.data_manager import DataManager
 from helpers.io_utils import setup_directories
-from helpers.plotters import plot_observed_vs_predicted
+from helpers.plot_utils import plot_observed_vs_predicted
 from helpers.misc_utils import LogTransformer
 import pandas as pd
 import os

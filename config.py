@@ -29,9 +29,11 @@ class Config:
         self.ENABLE_RFE = self._get_config('ENABLE_RFE', False)
 
         # Target and feature configuration
-        self.COLUMNS_TO_TRANSFORM = self._get_config('COLUMNS_TO_TRANSFORM', [...])
-        self.TARGET_COLUMNS = self._get_config('TARGET_COLUMNS', [...])
-        self.ELIMINATED_FEATURES = self._get_config('ELIMINATED_FEATURES', [...])
+        self.COLUMNS_TO_TRANSFORM = self._get_config('COLUMNS_TO_TRANSFORM', [])
+        self.TARGET_COLUMNS = self._get_config('TARGET_COLUMNS', [])
+        self.CATEGORICAL_FEATURES = self._get_config('CATEGORICAL_FEATURES', [])
+        self.EXCLUDE_CATEGORICAL = self._get_config('EXCLUDE_CATEGORICAL', [])
+        self.ELIMINATED_FEATURES = self._get_config('ELIMINATED_FEATURES', [])
 
         # Model registry loaded here
         self.MODEL_REGISTRY = self._load_model_registry()
@@ -53,7 +55,10 @@ class Config:
                 except json.JSONDecodeError:
                     raise ValueError(f"Invalid JSON format for environment variable {key}: {val}")
             return val
-        return self.config.get(key, default)
+        config_val = self.config.get(key, default)
+        if isinstance(default, list) and config_val is None:
+            return []
+        return config_val
 
     def _load_model_registry(self):
         registry_path = os.getenv("MODEL_REGISTRY_PATH", "model_registry.yml")

@@ -40,9 +40,11 @@ class DataManager:
         X = clustered_data[valid_feature_columns]
         
         # One-hot encoding if needed
-        if 'SU_WRB1_PH' in X.columns:
-            self.logger.info("One-hot encoding 'SU_WRB1_PH' column...")
-            X = pd.get_dummies(X, columns=['SU_WRB1_PH'])
+        categorical_cols = [col for col in self.config.CATEGORICAL_FEATURES 
+                            if col in X.columns and col not in self.config.EXCLUDE_CATEGORICAL]
+        if categorical_cols:
+            self.logger.info(f"Applying one-hot encoding to categorical columns: {', '.join(categorical_cols)}")
+            X = pd.get_dummies(X, columns=categorical_cols)
             
         # Fill remaining NaNs with column means
         X = X.apply(lambda row: row.fillna(row.mean()), axis=1)
