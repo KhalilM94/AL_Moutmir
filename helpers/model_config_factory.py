@@ -1,7 +1,73 @@
-from data_manager import BaseSpatialClusterStrategy
+from abc import ABC, abstractmethod
 import importlib
 from dataclasses import dataclass
 from typing import Optional
+import pandas as pd
+from sklearn.cluster import KMeans
+
+class BaseSpatialClusterStrategy(ABC):
+    """
+    Abstract base class for spatial clustering strategies.
+    """
+
+    @abstractmethod
+    def cluster(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Clusters the input DataFrame spatially and adds a 'cluster' column.
+        """
+        pass
+
+@dataclass
+class KMeansClusterStrategy(BaseSpatialClusterStrategy):
+    """
+    KMeans-based spatial clustering.
+
+    Parameters:
+    -----------
+    n_clusters : int, default=12
+        Number of spatial clusters to form.
+    lat_col : str, default='Latitude_Y'
+        Name of the latitude column in the DataFrame.
+    lon_col : str, default='Longitude_X'
+        Name of the longitude column in the DataFrame.
+    random_state : int, default=42
+        Random seed for reproducibility of clustering.
+    """
+    n_clusters: int = 12
+    lat_col: str = 'Latitude_Y'
+    lon_col: str = 'Longitude_X'
+    random_state: int = 42
+
+    def cluster(self, df: pd.DataFrame) -> pd.DataFrame:
+        coords = df[[self.lat_col, self.lon_col]].dropna()
+        kmeans = KMeans(n_clusters=self.n_clusters, random_state=self.random_state)
+        labels = kmeans.fit_predict(coords) + 1  # 1-indexed
+
+        df = df.copy()
+        df.loc[coords.index, 'cluster'] = labels.astype(int)
+        return df.dropna(subset=['cluster'])
+
+@dataclass
+class GridClusterStrategy(BaseSpatialClusterStrategy):
+    """
+    Grid-based spatial clustering using a regular grid of fixed size (in degrees).
+    """
+    grid_size: float = 0.1  # e.g., 0.1 degrees
+    lat_col: str = 'Latitude_Y'
+    lon_col: str = 'Longitude_X'
+
+    def cluster(self, df: pd.DataFrame) -> pd.DataFrame:
+        coords = df[[self.lat_col, self.lon_col]].dropna()
+
+        lat_grid = (coords[self.lat_col] // self.grid_size).astype(int)
+        lon_grid = (coords[self.lon_col] // self.grid_size).astype(int)
+
+        # Create combined grid cell label and encode it as numeric cluster ID
+        labels = (lat_grid.astype(str) + "_" + lon_grid.astype(str)).astype('category').cat.codes + 1
+
+        df = df.copy()
+        df.loc[coords.index, 'cluster'] = labels
+        return df.dropna(subset=['cluster'])
 
 @dataclass
 class ModelConfigFactory:
@@ -12,7 +78,10 @@ class ModelConfigFactory:
     @staticmethod
     def _dynamic_import(import_path):
         module_path, class_name = import_path.rsplit(".", 1)
-        module = importlib.import_module(module_path)
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError as e:
+            raise ImportError(f"Failed to import module '{module_path}': {e}")
         return getattr(module, class_name)
     
 
@@ -48,10 +117,9 @@ class ModelConfigFactory:
     
     def load_splitter_from_config(self) -> Optional[BaseSpatialClusterStrategy]:
         """Load and return the splitter configuration from the registry."""
-        if self.registry.get("enabled", True) is True and "splitter" in self.registry:
-            splitter_cfg = self.registry["splitter"]
-            class_path = splitter_cfg["class_path"]
-            params = splitter_cfg.get("params", {})
+        if self.registry.get("enabled", True) is True:
+            class_path = self.registry["class_path"]
+            params = self.registry.get("params", {})
             params.setdefault("random_state", self.random_state)
 
             SplitterClass = self._dynamic_import(class_path)

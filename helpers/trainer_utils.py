@@ -30,7 +30,7 @@ class CVSplitter:
     random_state: int = 42
     shuffle: bool = True
 
-    def create_splits(self, X, y=None, groups=None, target=None, model_name=None):
+    def create_splits(self, X, y=None, groups=None):
         """
         Generate CV splits and fold info DataFrame.
 

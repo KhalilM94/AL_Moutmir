@@ -25,7 +25,7 @@ class SoilModelTraining:
         self.logger.info("Configuration Options:")
         self.logger.info(f"  COLUMNS_TO_TRANSFORM: {self.config.COLUMNS_TO_TRANSFORM}")
         self.logger.info(f"  ENABLE_CLUSTERING: {self.config.ENABLE_CLUSTERING}")
-        self.logger.info(f"  CLUSTERING_STRATEGY: {self.config.CLUSTERING_STRATEGY.get('class_path').rsplit(".", 1) if self.config.ENABLE_CLUSTERING else None}")
+        self.logger.info(f"  CLUSTERING_STRATEGY: {self.config.CLUSTERING_STRATEGY.get('class_path').rsplit(".", 1)[1] if self.config.ENABLE_CLUSTERING else None}")
         self.logger.info(f"  SPLIT_STRATEGY: {self.config.SPLIT_STRATEGY}")
         self.logger.info(f"  ENABLE_TUNING: {self.config.ENABLE_TUNING}")
         self.logger.info(f"  USE_BAYES_OPT: {self.config.USE_BAYES_OPT}")
@@ -38,14 +38,14 @@ class SoilModelTraining:
         # Spatial clustering splitter
         self.model_configs = ModelConfigFactory(self.config.MODEL_REGISTRY)
         
-    def train_models(self, X_train: pd.DataFrame, y_train: pd.DataFrame, 
-                    X_test: pd.DataFrame, y_test: pd.DataFrame, 
-                    groups_train: pd.Series) -> pd.DataFrame:
+    def train_models(self, data: Dict) -> pd.DataFrame:
+        
         """Train models for all targets and return results."""
         self.logger.info("Starting full training process for all targets...")
         trainer = ModelTrainer(
-            model_pipelines = self.model_configs.build_model_configs(num_features=X_train.shape[1]),
+            model_pipelines = self.model_configs.build_model_configs(num_features=data['X_train'].shape[1]),
             columns_to_transform=self.config.COLUMNS_TO_TRANSFORM,
+            enable_clustering =self.config.ENABLE_CLUSTERING,
             split_strategy=self.config.SPLIT_STRATEGY,
             enable_hyperparameter_tuning=self.config.ENABLE_TUNING,
             use_bayes_opt=self.config.USE_BAYES_OPT,
@@ -59,12 +59,7 @@ class SoilModelTraining:
         for target in self.config.TARGET_COLUMNS:
             results = trainer.train(
                 target=target,
-                X_train=X_train,
-                y_train=y_train[target],
-                X_test=X_test,
-                y_test=y_test[target],
-                groups_train=groups_train
-            )
+                data=data)
             if results:
                 all_results.extend(results)
                 
@@ -125,13 +120,10 @@ def main():
         processed_data = trainer.data_manager.preprocess_data(raw_data)
         
         # Split data
-        split_data = trainer.data_manager.split_data(processed_data['X'],processed_data['y'],
-                                                     processed_data['groups'])
+        split_data = trainer.data_manager.split_data(processed_data)
         
         # Train models
-        metrics = trainer.train_models(split_data['X_train'], split_data['y_train'],
-                                       split_data['X_test'], split_data['y_test'],
-                                       split_data['groups_train'])
+        metrics = trainer.train_models(split_data)
         
         # Save results
         trainer.save_results(metrics, {'X_test': split_data['X_test'],

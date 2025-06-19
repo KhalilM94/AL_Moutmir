@@ -1,16 +1,14 @@
 DATA_FOLDER: "../doukkala_ssl_datasets_apriori"
 OUTPUT_FOLDER: "../outputs"
 TEST_SIZE: 0.2
-USE_GROUP_SPLIT: True
-
 CLUSTERING_STRATEGY:
   enabled: True
-  class_path: myproject.cluster_splitters.KMeansClusterStrategy
+  class_path: helpers.model_config_factory.KMeansClusterStrategy
   params:
-    n_clusters: 5
+    n_clusters: 12
 
 SPLIT_STRATEGY: "groupkfold" # "groupkfold" or "kfold" or "stratifiedshuffle"
-ENABLE_TUNING: False
+ENABLE_TUNING: True
 USE_BAYES_OPT: False
 ENABLE_RFE: False
 RANDOM_SEED: 42

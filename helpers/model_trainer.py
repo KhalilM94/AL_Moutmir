@@ -12,6 +12,7 @@ class ModelTrainer:
         self,
         model_pipelines: Dict[str, Dict],
         columns_to_transform: Optional[List[str]] = None,
+        enable_clustering: bool = False,
         split_strategy: str = 'kfold',
         enable_hyperparameter_tuning: bool = False,
         use_bayes_opt: bool = False,
@@ -23,6 +24,7 @@ class ModelTrainer:
     ):
         self.model_pipelines = model_pipelines
         self.columns_to_transform = columns_to_transform or []
+        self.enable_clustering = enable_clustering
         self.split_strategy = split_strategy
         self.enable_hyperparameter_tuning = enable_hyperparameter_tuning
         self.use_bayes_opt = use_bayes_opt
@@ -47,12 +49,17 @@ class ModelTrainer:
     def train(
         self,
         target: str,
-        X_train: pd.DataFrame,
-        y_train: pd.Series,
-        X_test: pd.DataFrame,
-        y_test: pd.Series,
-        groups_train: Optional[pd.Series] = None
+        data: Dict,
         ) -> List[Dict]:
+
+        X_train= data['X_train']
+        y_train= data['y_train'][target]
+        X_test= data['X_test']
+        y_test= data['y_test'][target]
+        if self.enable_clustering:
+            groups_train = data['groups_train']
+        else:
+            groups_train = None
 
         results = []
 
@@ -133,7 +140,7 @@ class ModelTrainer:
         pipeline = self.pipeline_builder.build(model, use_rfe)
 
         cv_splitter = CVSplitter(cv_strategy=self.split_strategy, random_state=self.seed)
-        splits, _ = cv_splitter.create_splits(X_train, y_train, groups_train, target, model_name)
+        splits, _ = cv_splitter.create_splits(X_train, y_train, groups_train)
 
         best_model, best_params = self.tuner.tune(pipeline, config, X_train, y_train, splits)
         self.saver.save_cv_results(best_model, model_name, target)
