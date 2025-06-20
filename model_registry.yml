@@ -1,11 +1,11 @@
 PLSRegression:
-  enabled: True
+  enabled: False
   import_path: sklearn.cross_decomposition.PLSRegression
   params:
     model__n_components: [2, 4, 6, 8, 10, 12, 14, 16, 18]
 
 GradientBoosting:
-  enabled: true
+  enabled: True
   import_path: sklearn.ensemble.GradientBoostingRegressor
   init_args:
     random_state: 42

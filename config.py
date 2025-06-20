@@ -41,6 +41,8 @@ class Config:
 
         # Model registry loaded here
         self.MODEL_REGISTRY = self._load_model_registry()
+        self.BANDS_CSV_PATH = self._get_config('BANDS_CSV_PATH', None)
+        self.WORLDCLIM_CSV_PATH = self._get_config('WORLDCLIM_CSV_PATH', None)
 
     def _get_config(self, key: str, default: Any) -> Any:
         val = os.environ.get(key)

@@ -66,7 +66,13 @@ def plot_observed_vs_predicted(
     # Create the plot grid
     fig, axes = plt.subplots(n_targets, n_models, figsize=(5 * n_models, 5 * n_targets))
     fig.suptitle(sup_title, fontsize=18)
-    axes = np.atleast_2d(axes)
+    # Ensure axes is always 2D: shape (n_targets, n_models)
+    if n_targets == 1 and n_models == 1:
+        axes = np.array([[axes]])
+    elif n_targets == 1:
+        axes = axes[np.newaxis, :]
+    elif n_models == 1:
+        axes = axes[:, np.newaxis]
 
     # Loop through targets and models to generate the scatter plots
     for i, target in enumerate(target_columns):
@@ -149,7 +155,7 @@ def plot_observed_vs_predicted(
                     bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
 
     # Tighten layout and display plot
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
     return plt
 
 def plot_cv_folds_observed_vs_predicted(
@@ -264,3 +270,192 @@ def plot_cv_folds_observed_vs_predicted(
             axes[i, j].axis('off')
     plt.tight_layout(rect=(0, 0, 1, 0.96))
     return fig
+
+def plot_feature_importances(model_file, X, bands_csv_path=None, worldclim_csv_path=None, top_n=20, title=None):
+    """
+    Plot and return a matplotlib figure for feature importances for a fitted model pipeline.
+    - model_file: path to the saved model (joblib)
+    - X: DataFrame of features (columns must match those used in training)
+    - bands_csv_path: path to bandsList.csv for friendly band names (optional)
+    - worldclim_csv_path: path to worldclim_names.csv for 'bio' feature names (optional)
+    - top_n: number of top features to plot
+    - title: plot title (optional)
+    Returns: matplotlib figure
+    """
+    import joblib
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    # Load model
+    model = joblib.load(model_file)
+    # Get feature importances (works for tree-based models)
+    if hasattr(model.named_steps['model'], 'feature_importances_'):
+        importances = model.named_steps['model'].feature_importances_
+    else:
+        raise ValueError("Model does not have feature_importances_ attribute.")
+    feature_names = X.columns
+    # Load band dictionary if provided
+    bands_dict = None
+    if bands_csv_path is not None:
+        bands_df = pd.read_csv(bands_csv_path, header=None)
+        bands_dict = dict(zip(bands_df.index + 1, bands_df[1]))
+    worldclim_dict = None
+    if worldclim_csv_path is not None:
+        wc_df = pd.read_csv(worldclim_csv_path, header=None)
+        worldclim_dict = dict(zip(wc_df[0].astype(str), wc_df[1]))
+    def get_friendly_name(feature):
+        if bands_dict and feature.startswith("Band_"):
+            try:
+                band_num = int(feature.split("_")[1])
+                wavelength = bands_dict.get(band_num, f"Band_{band_num}")
+                return f"{float(wavelength):.2f} nm" if isinstance(wavelength, (int, float, np.floating)) else str(wavelength)
+            except Exception:
+                return feature
+        elif worldclim_dict and feature.startswith("bio"):
+            return worldclim_dict.get(feature, feature)
+        else:
+            return feature
+    friendly_feature_names = [get_friendly_name(f) for f in feature_names]
+    # Sort and select top N
+    sorted_idx = np.argsort(importances)[::-1]
+    top_idx = sorted_idx[:top_n]
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.barh(range(top_n), importances[top_idx][::-1], align='center')
+    ax.set_yticks(range(top_n))
+    ax.set_yticklabels([friendly_feature_names[i] for i in top_idx][::-1])
+    ax.set_xlabel("Feature Importance")
+    ax.set_title(title or f"Top {top_n} Important Features")
+    fig.tight_layout()
+    return fig
+
+def calculate_vip(plsr_model, X):
+    # Standard VIP calculation for PLSRegression
+    t = plsr_model.x_scores_
+    w = plsr_model.x_weights_
+    q = plsr_model.y_loadings_
+    p, h = w.shape
+    s = np.diag(t.T @ t @ q.T @ q).reshape(h, -1)
+    Wnorm2 = (w ** 2).sum(axis=0)
+    vip = np.zeros((p,))
+    for i in range(p):
+        weight = np.array([(w[i, j] / np.sqrt(Wnorm2[j])) ** 2 for j in range(h)]).flatten()
+        vip[i] = np.sqrt(p * (s.T @ weight) / s.sum())
+    return vip
+
+def plot_vip_bar(ax, plsr_model, X, top_n=20, friendly_names=None):
+    vip_scores = calculate_vip(plsr_model, X)
+    vip_series = pd.Series(vip_scores, index=X.columns)
+    if friendly_names is not None:
+        vip_series.index = friendly_names
+    # Sort by VIP and plot in descending order
+    top_vip = vip_series.sort_values(ascending=False).head(top_n)
+    top_vip.plot(kind="bar", color="steelblue", ax=ax)
+    ax.set_title(f"Top {top_n} PLSR Features by VIP Score")
+    ax.set_ylabel("VIP Score")
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+
+def plot_plsr_biplot(ax, plsr_model, X, top_n=20, friendly_names=None):
+    scores = plsr_model.x_scores_
+    weights = plsr_model.x_weights_
+    pc1, pc2 = 0, 1
+    feature_names = np.array(friendly_names) if friendly_names is not None else np.array(X.columns)
+    vip_scores = calculate_vip(plsr_model, X)
+    # Get indices of top N VIP features
+    top_idx = np.argsort(vip_scores)[::-1][:top_n]
+    # Normalize sample projections to [-1, 1]
+    scores_norm = (scores[:, [pc1, pc2]] - scores[:, [pc1, pc2]].min(axis=0)) / (scores[:, [pc1, pc2]].ptp(axis=0)) * 2 - 1
+    ax.scatter(scores_norm[:, 0], scores_norm[:, 1], c='lightgray', edgecolor='k', alpha=0.6, label='Samples')
+    # Normalize vectors to [-1, 1] for both PC1 and PC2, but only for top features
+    w1s = weights[top_idx, pc1]
+    w2s = weights[top_idx, pc2]
+    w1s_norm = w1s / np.max(np.abs(w1s)) if np.max(np.abs(w1s)) != 0 else w1s
+    w2s_norm = w2s / np.max(np.abs(w2s)) if np.max(np.abs(w2s)) != 0 else w2s
+    for i, idx in enumerate(top_idx):
+        ax.arrow(0, 0, w1s_norm[i], w2s_norm[i],
+                 color='crimson', alpha=0.8, head_width=0.05, length_includes_head=True)
+        ax.text(w1s_norm[i]*1.15, w2s_norm[i]*1.15,
+                feature_names[idx], color='darkred', fontsize=9, ha='center', va='center')
+    ax.set_xlabel("PLS Component 1")
+    ax.set_ylabel("PLS Component 2")
+    ax.set_title(f"PLSR Biplot with Top {top_n} Features")
+    ax.grid(True)
+    ax.axhline(0, color='gray', linewidth=0.5)
+    ax.axvline(0, color='gray', linewidth=0.5)
+    ax.set_xlim(-1.2, 1.2)
+    ax.set_ylim(-1.2, 1.2)
+
+def plot_plsr_vip_and_biplot(model_file, X, bands_csv_path=None, worldclim_csv_path=None, top_n=20, title=None):
+    import joblib
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    plsr_model = joblib.load(model_file).named_steps['model']
+    # Prepare friendly names
+    bands_dict = None
+    if bands_csv_path is not None:
+        bands_df = pd.read_csv(bands_csv_path, header=None)
+        bands_dict = dict(zip(bands_df.index + 1, bands_df[1]))
+    worldclim_dict = None
+    if worldclim_csv_path is not None:
+        wc_df = pd.read_csv(worldclim_csv_path, header=None)
+        worldclim_dict = dict(zip(wc_df[0].astype(str), wc_df[1]))
+    def get_friendly_name(feature):
+        if bands_dict and feature.startswith("Band_"):
+            try:
+                band_num = int(feature.split("_")[1])
+                wavelength = bands_dict.get(band_num, f"Band_{band_num}")
+                return f"{float(wavelength):.2f} nm" if isinstance(wavelength, (int, float, np.floating)) else str(wavelength)
+            except Exception:
+                return feature
+        elif worldclim_dict and feature.startswith("bio"):
+            return worldclim_dict.get(feature, feature)
+        else:
+            return feature
+    friendly_feature_names = [get_friendly_name(f) for f in X.columns]
+    fig, axs = plt.subplots(1, 2, figsize=(16, 6))
+    plot_vip_bar(axs[0], plsr_model, X, top_n, friendly_names=friendly_feature_names)
+    plot_plsr_biplot(axs[1], plsr_model, X, top_n, friendly_names=friendly_feature_names)
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    return fig
+
+def plot_train_test_histograms(y_train, y_test, target_columns, plots_dir, bins=30, filename=None, orientation='horizontal'):
+    """
+    Plot overlayed histograms of train and test splits for each target column in a single figure.
+    Each subplot is a target, with train and test histograms overlayed.
+    Bins are normalized between train and test. Orientation can be 'horizontal' or 'vertical'.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import os
+    n_targets = len(target_columns)
+    # Determine subplot arrangement
+    if orientation == 'vertical':
+        fig, axes = plt.subplots(n_targets, 1, figsize=(7, 4 * n_targets), squeeze=False)
+        axes = axes[:, 0]
+    else:
+        fig, axes = plt.subplots(1, n_targets, figsize=(6 * n_targets, 5), squeeze=False)
+        axes = axes[0]
+    for i, target in enumerate(target_columns):
+        ax = axes[i]
+        train_data = y_train[target].dropna()
+        test_data = y_test[target].dropna()
+        # Normalize bins between train and test
+        combined = pd.concat([train_data, test_data])
+        bin_edges = np.histogram_bin_edges(combined, bins=bins)
+        ax.hist(train_data, bins=bin_edges, color='tab:blue', alpha=0.5, label='Train', density=True)
+        ax.hist(test_data, bins=bin_edges, color='tab:orange', alpha=0.5, label='Test', density=True)
+        ax.set_title(f"Train/Test Histogram: {target}")
+        ax.set_xlabel(target)
+        ax.set_ylabel("Density")
+        ax.legend()
+    plt.tight_layout()
+    os.makedirs(plots_dir, exist_ok=True)
+    if filename:
+        out_path = os.path.join(plots_dir, filename)
+    else:
+        out_path = os.path.join(plots_dir, "train_test_histograms.png")
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path

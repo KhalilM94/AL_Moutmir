@@ -1,10 +1,12 @@
 DATA_FOLDER: "../doukkala_ssl_datasets_apriori"
 SOIL_GROUPS_FILE_PATH: "../soil_groups.txt"
+BANDS_CSV_PATH: "../bandsList.csv"
+WORLDCLIM_CSV_PATH: "../worldclim.csv"
 OUTPUT_FOLDER: "../outputs"
 TEST_SIZE: 0.2
 
 CV_ONLY_MODE: 
-  enabled: True
+  enabled: False
   n_splits: 5
   shuffle: True
 
@@ -20,7 +22,7 @@ USE_BAYES_OPT: False
 ENABLE_RFE: False
 RANDOM_SEED: 42
 
-IGNORE_BANDS: true  # or false to skip ignoring
+IGNORE_BANDS: False  # or false to skip ignoring
 N_BANDS: 234        # optional: number of bands, default to 234 in code if missing
 
 COLUMNS_TO_TRANSFORM:
@@ -37,15 +39,15 @@ COLUMNS_TO_TRANSFORM:
   #- "Mn ppm DTPA"
 
 TARGET_COLUMNS:
-  #- "Sand%"
-  #- "Clay%"
-  #- "Total_Silt%"
-  #- "pH_water"
-  #- "CE_ext1 / 5 ms / cm"
+  - "Sand%"
+  - "Clay%"
+  - "Total_Silt%"
+  - "pH_water"
+  - "CE_ext1 / 5 ms / cm"
   #- "C / N ratio"
   - "Organic matter%"
-  #- "Exchangeable K2O ppm"
-  #- "P2O5 ehangable Olsen ppm"
+  - "Exchangeable K2O ppm"
+  - "P2O5 ehangable Olsen ppm"
   #- Fine silt%
   #- Coarse silt%
   #- CaCo3%_Total
@@ -57,7 +59,7 @@ TARGET_COLUMNS:
   #- Cl- ppm
   #- Na meq / 100g
   #- MgO ppm
-  #- Iron ppm DTPA
+  - Iron ppm DTPA
   #- Mn ppm DTPA
   #- Cu ppm DTPA
   #- Zn ppm DTPA
@@ -102,30 +104,30 @@ ELIMINATED_FEATURES:
   - B ppm Hot water
   - Elevation
   
-  - GPP
-  - ET
-  - LST
-  - NDVI
-  - SU_WRB1_PH
-  - Slope
-  - Aridity_Index
-  - TWI
-  - bio01
-  - bio02
-  - bio03
-  - bio04
-  - bio05
-  - bio06
-  - bio07
-  - bio08
-  - bio09
-  - bio10
-  - bio11
-  - bio12
-  - bio13
-  - bio14
-  - bio15
-  - bio16
-  - bio17
-  - bio18
-  - bio19
+  #- GPP
+  #- ET
+  #- LST
+  #- NDVI
+  #- SU_WRB1_PH
+  #- Slope
+  #- Aridity_Index
+  #- TWI
+  #- bio01
+  #- bio02
+  #- bio03
+  #- bio04
+  #- bio05
+  #- bio06
+  #- bio07
+  #- bio08
+  #- bio09
+  #- bio10
+  #- bio11
+  #- bio12
+  #- bio13
+  #- bio14
+  #- bio15
+  #- bio16
+  #- bio17
+  #- bio18
+  #- bio19

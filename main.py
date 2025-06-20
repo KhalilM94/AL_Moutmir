@@ -108,6 +108,67 @@ class SoilModelTraining:
         fig.savefig(os.path.join(plots_dir, "observed_vs_predicted.png"))   
         self.logger.info(f"Obs_vs_Pred Plot saved to {plots_dir}/observed_vs_predicted.png")
 
+        # --- Feature Importance Plots for ALL models in final_models ---
+        from helpers.plot_utils import plot_feature_importances, plot_plsr_vip_and_biplot
+        bands_csv_path = self.config.BANDS_CSV_PATH
+        worldclim_csv_path = self.config.WORLDCLIM_CSV_PATH
+        for model_file in os.listdir(models_dir):
+            if not model_file.endswith('.pkl'):
+                continue
+            model_path = os.path.join(models_dir, model_file)
+            # Extract target and model name from filename
+            base = os.path.splitext(model_file)[0]
+            if '_' in base:
+                target, model_name = base.rsplit('_', 1)
+            else:
+                target, model_name = base, ''
+            print(f"[DEBUG] Attempting plot for model: {model_name} at {model_path}")
+            if target not in test_data['X_test'].columns and target not in test_data['y_test']:
+                print(f"[DEBUG] Skipping {model_file}: target not in test data.")
+                continue
+            try:
+                if "plsregression" in model_name.lower():
+                    print(f"[DEBUG] Detected PLSRegression model. Calling plot_plsr_vip_and_biplot...")
+                    fig = plot_plsr_vip_and_biplot(
+                        model_path,
+                        test_data['X_test'],
+                        bands_csv_path=bands_csv_path,
+                        worldclim_csv_path=worldclim_csv_path,
+                        top_n=20,
+                        title=f"PLSR VIP & Biplot: {target} - {model_name}"
+                    )
+                    fig.savefig(os.path.join(plots_dir, f"{target}_{model_name}_plsr_vip_biplot.png"))
+                    print(f"[DEBUG] Saved PLSR VIP & biplot for {model_name}")
+                    self.logger.info(f"PLSR VIP & biplot saved to {plots_dir}/{target}_{model_name}_plsr_vip_biplot.png")
+                else:
+                    print(f"[DEBUG] Detected non-PLSR model. Calling plot_feature_importances...")
+                    fig = plot_feature_importances(
+                        model_path,
+                        test_data['X_test'],
+                        bands_csv_path=bands_csv_path,
+                        worldclim_csv_path=worldclim_csv_path,
+                        top_n=20,
+                        title=f"Top 20 Features: {target} - {model_name}"
+                    )
+                    fig.savefig(os.path.join(plots_dir, f"{target}_{model_name}_feature_importance.png"))
+                    print(f"[DEBUG] Saved feature importance plot for {model_name}")
+                    self.logger.info(f"Feature importance plot saved to {plots_dir}/{target}_{model_name}_feature_importance.png")
+            except Exception as e:
+                print(f"[ERROR] Could not plot feature importances for {target} - {model_name}: {e}")
+                self.logger.warning(f"Could not plot feature importances for {target} - {model_name}: {e}")
+
+        # --- Plot train/test histograms for all targets ---
+        from helpers.plot_utils import plot_train_test_histograms
+        if 'y_train' in test_data and 'y_test' in test_data:
+            plot_train_test_histograms(
+                test_data['y_train'],
+                test_data['y_test'],
+                self.config.TARGET_COLUMNS,
+                plots_dir,
+                filename="train_test_histograms_overlayed.png",
+                orientation="vertical"
+            )
+
         # Display results
         print("\nFinal Metrics DataFrame:")
         print(metrics_df)
@@ -135,6 +196,75 @@ class SoilModelTraining:
             )
             fig.savefig(os.path.join(plots_dir, f"{target}_cv_folds.png"))
             self.logger.info(f"CV folds plot saved to {plots_dir}/{target}_cv_folds.png")
+        
+        # --- Feature Importance Plots for ALL models in final_models (CV mode) ---
+        from helpers.plot_utils import plot_feature_importances, plot_plsr_vip_and_biplot
+        bands_csv_path = self.config.BANDS_CSV_PATH
+        worldclim_csv_path = self.config.WORLDCLIM_CSV_PATH
+        models_dir = os.path.join(self.output_dir, "final_models")
+        plots_dir = os.path.join(self.output_dir, "plots")
+        X = None
+        # Try to get a representative X (features) from any fold_preds
+        for fold_preds in all_fold_preds.values():
+            for fold_pred in fold_preds:
+                if 'X_val' in fold_pred and fold_pred['X_val'] is not None:
+                    X = fold_pred['X_val'] if not isinstance(fold_pred['X_val'], list) else pd.DataFrame(fold_pred['X_val'])
+                    break
+            if X is not None:
+                break
+        if X is not None:
+            for model_file in os.listdir(models_dir):
+                if not model_file.endswith('.pkl'):
+                    continue
+                model_path = os.path.join(models_dir, model_file)
+                base = os.path.splitext(model_file)[0]
+                # Robustly parse: {target}_{model}.pkl or {target}_{model}_{fold}.pkl
+                parts = base.split('_')
+                if len(parts) >= 3 and parts[-1].isdigit():
+                    fold = parts[-1]
+                    model_name = parts[-2]
+                    target = '_'.join(parts[:-2])
+                elif len(parts) >= 2:
+                    fold = None
+                    model_name = parts[-1]
+                    target = '_'.join(parts[:-1])
+                else:
+                    fold = None
+                    model_name = base
+                    target = base
+                print(f"[DEBUG] (CV) Attempting plot for model: {model_name} at {model_path} (fold: {fold})")
+                try:
+                    if "plsregression" in model_name.lower():
+                        print(f"[DEBUG] (CV) Detected PLSRegression model. Calling plot_plsr_vip_and_biplot...")
+                        fig = plot_plsr_vip_and_biplot(
+                            model_path,
+                            X,
+                            bands_csv_path=bands_csv_path,
+                            worldclim_csv_path=worldclim_csv_path,
+                            top_n=20,
+                            title=f"PLSR VIP & Biplot: {target} - {model_name} (CV{f'-Fold {fold}' if fold else ''})"
+                        )
+                        out_name = f"{target}_{model_name}_plsr_vip_biplot_cv{f'_fold{fold}' if fold else ''}.png"
+                        fig.savefig(os.path.join(plots_dir, out_name))
+                        print(f"[DEBUG] (CV) Saved PLSR VIP & biplot for {model_name} (fold: {fold})")
+                        self.logger.info(f"PLSR VIP & biplot (CV) saved to {plots_dir}/{out_name}")
+                    else:
+                        print(f"[DEBUG] (CV) Detected non-PLSR model. Calling plot_feature_importances...")
+                        fig = plot_feature_importances(
+                            model_path,
+                            X,
+                            bands_csv_path=bands_csv_path,
+                            worldclim_csv_path=worldclim_csv_path,
+                            top_n=20,
+                            title=f"Top 20 Features: {target} - {model_name} (CV{f'-Fold {fold}' if fold else ''})"
+                        )
+                        out_name = f"{target}_{model_name}_feature_importance_cv{f'_fold{fold}' if fold else ''}.png"
+                        fig.savefig(os.path.join(plots_dir, out_name))
+                        print(f"[DEBUG] (CV) Saved feature importance plot for {model_name} (fold: {fold})")
+                        self.logger.info(f"Feature importance plot (CV) saved to {plots_dir}/{out_name}")
+                except Exception as e:
+                    print(f"[ERROR] (CV) Could not plot feature importances for {target} - {model_name} (fold: {fold}): {e}")
+                    self.logger.warning(f"Could not plot feature importances (CV) for {target} - {model_name} (fold: {fold}): {e}")
         print("\nCV Folds Metrics DataFrame:")
         print(metrics_df)
     
@@ -160,8 +290,7 @@ def main():
         
         # Save results
         if not (trainer.config.CV_ONLY_MODE and trainer.config.CV_ONLY_MODE.get("enabled", False)):
-            trainer.save_results(metrics, {'X_test': split_data['X_test'],
-                                           'y_test': split_data['y_test']})
+            trainer.save_results(metrics, split_data)
         else:
             trainer.save_cv_results_and_plots(metrics, all_fold_preds)
     
