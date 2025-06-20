@@ -17,8 +17,11 @@ class Config:
         # General settings
         self.DATA_FOLDER = self._get_config('DATA_FOLDER', 'doukkala_ssl_datasets')
         self.OUTPUT_FOLDER = self._get_config('OUTPUT_FOLDER', 'outputs')
+        self.SOIL_GROUPS_FILE_PATH = self._get_config('SOIL_GROUPS_FILE_PATH', 'soil_groups.txt')
         self.RANDOM_SEED = self._get_config('RANDOM_SEED', random.randint(0, 1000000))
-        self.TEST_SIZE = self._get_config('TEST_SIZE', 0.2)
+        self.CV_ONLY_MODE = self._get_config('CV_ONLY_MODE', {})
+        if not self.CV_ONLY_MODE.get("enabled"):
+            self.TEST_SIZE = self._get_config('TEST_SIZE', 0.2)
         self.ENABLE_CLUSTERING = self._get_config('CLUSTERING_STRATEGY', None).get('enabled', False)
         self.CLUSTERING_STRATEGY = self._get_config('CLUSTERING_STRATEGY', None)
         self.SPLIT_STRATEGY = self._get_config('SPLIT_STRATEGY', 'kfold')

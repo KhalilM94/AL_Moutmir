@@ -1,6 +1,7 @@
 from .model_config_factory import ModelConfigFactory, BaseSpatialClusterStrategy
+from .trainer_utils import CVSplitter
 import pandas as pd
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split, KFold, GroupKFold
 import os
 from typing import Dict
 
@@ -21,7 +22,7 @@ class DataManager:
         
     def preprocess_data(self, data: pd.DataFrame) -> Dict:
         """Preprocess the data and return prepared datasets."""
-        self.logger.info(f"Clustering dataset based on {self.config.CLUSTERING_STRATEGY.get('class_path').rsplit(".", 1)[1]}...")
+        self.logger.info(f"Clustering dataset based on {self.config.CLUSTERING_STRATEGY.get('class_path').rsplit('.', 1)[1]}...")
         
         self.cluster_strategy = ModelConfigFactory(self.config.CLUSTERING_STRATEGY, self.config.RANDOM_SEED).load_splitter_from_config()
         if isinstance(self.cluster_strategy, BaseSpatialClusterStrategy):
@@ -64,8 +65,7 @@ class DataManager:
         X: pd.DataFrame = processed_data['X']
         y: pd.DataFrame = processed_data['y']
         splitted_data = {}
-        
-        if self.config.ENABLE_CLUSTERING:
+        if self.config.ENABLE_CLUSTERING and not (self.config.CV_ONLY_MODE.get("enabled", True) is True):
             groups = processed_data['groups']
             """Split data into training and test sets."""
             self.logger.info("Splitting dataset into train and test groups using GroupShuffleSplit...")

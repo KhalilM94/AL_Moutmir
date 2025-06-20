@@ -99,7 +99,8 @@ class Tuner:
     use_bayes: bool
     seed: int = 42
     verbose: int = 0
-    enable_tuning: bool = True  # Add this
+    enable_tuning: bool = True
+    cv_only_mode: bool = False
 
     def tune(self, 
              pipeline, 
@@ -107,49 +108,83 @@ class Tuner:
              X_train, 
              y_train, 
              splits):
-        
-        # Only tune if enabled and params exist
-        if not self.enable_tuning or not model_config.get("params"):
-            pipeline.fit(X_train, y_train)
-            return pipeline, "Default (no tuning)"
-        if self.use_bayes:
-            search = BayesSearchCV(
-                estimator=pipeline,
-                search_spaces=model_config["params"],
-                n_iter=30,
-                cv=splits,
-                scoring="neg_mean_squared_error",
-                n_jobs=-1,
-                random_state=self.seed,
-                verbose=self.verbose
-            )
-        else:
-            search = GridSearchCV(
-                estimator=pipeline,
-                param_grid=model_config["params"],
-                cv=splits,
-                scoring="neg_mean_squared_error",
-                n_jobs=-1,
-                verbose=self.verbose
-            )
 
-        search.fit(X_train, y_train)
-        return search.best_estimator_, search.best_params_ # type: ignore[attr-defined]
+        """
+        If cv_only_mode is True, fit and return a list of models (one per fold).
+        For tuning, fit a search object on each fold and save the best estimator.
+        Otherwise, perform tuning or fit as usual.
+        """
+        models = []
+        
+        if self.enable_tuning and model_config.get("params"):
+            if self.use_bayes:
+                search = BayesSearchCV(
+                    estimator=clone(pipeline),
+                    search_spaces=model_config["params"],
+                    n_iter=30,
+                    cv=splits,
+                    scoring="neg_mean_squared_error",
+                    n_jobs=-1,
+                    random_state=self.seed,
+                    verbose=self.verbose
+                )
+            else:
+                search = GridSearchCV(
+                    estimator=clone(pipeline),
+                    param_grid=model_config["params"],
+                    cv=splits,
+                    scoring="neg_mean_squared_error",
+                    n_jobs=-1,
+                    verbose=self.verbose
+                )
+        else:
+            search = clone(pipeline)
+        if self.cv_only_mode:
+            for fold, (train_idx, val_idx) in enumerate(splits):
+                X_tr, y_tr = X_train.iloc[train_idx], y_train.iloc[train_idx]
+                if self.enable_tuning:
+                    search.fit(X_tr, y_tr)
+                    best_model = search.best_estimator_ # type: ignore[attr-defined]
+                    best_params = search.best_params_ # type: ignore[attr-defined]
+                else:
+                    best_model = search
+                    best_model.fit(X_tr, y_tr)
+                    best_params = {}
+                models.append({
+                    'model': best_model,
+                    'fold': fold,
+                    'best_params': best_params
+                })
+        else:
+            if self.enable_tuning:
+                search.fit(X_train, y_train)
+                best_model = search.best_estimator_ # type: ignore[attr-defined]
+                best_params = search.best_params_ # type: ignore[attr-defined]
+            else:
+                best_model = search.fit(X_train, y_train)
+                best_params = {}
+
+                models.append({
+                    'model': best_model,
+                    'fold': None,  # No fold in non-CV mode
+                    'best_params': best_params})
+                #return pipeline, "Default (no tuning)"
+        return models
 
 class ModelEvaluator:
     def __init__(self, logger, columns_to_transform):
         self.logger = logger
         self.columns_to_transform = columns_to_transform
 
-    def evaluate(self, model, X_train, y_train, X_test, y_test, 
-                 target, model_name, best_params, log_transformer, splits) -> Dict:
-        y_pred_transformed = model.predict(X_test)
+    def evaluate(self, model:Dict, X_train, y_train, X_test, y_test, 
+                 target, model_name, log_transformer, splits) -> Dict:
+        y_pred_transformed = model["model"].predict(X_test)
         if target in self.columns_to_transform:
             y_pred = log_transformer.inverse_transform(y_pred_transformed)
         else:
             y_pred = y_pred_transformed
 
-        cv_scores = cross_validate(model, X_train, y_train, cv=splits,
+        cv_scores = cross_validate(model["model"], X_train, y_train, cv=splits,
                                    scoring='neg_mean_squared_error')
 
         test_metrics = {
@@ -161,7 +196,7 @@ class ModelEvaluator:
             "CV_RMSE_Mean": np.mean(np.sqrt(-cv_scores["test_score"])),
             "CV_RMSE_Std": np.std(np.sqrt(-cv_scores["test_score"])),
             "Test_ExplainedVar": explained_variance_score(y_test, y_pred),
-            "Best_Params": str(best_params)
+            "Best_Params": str(model["best_params"])
         }
 
         self.logger.info(
@@ -178,26 +213,35 @@ class ModelSaver:
     def _safe_filename(self, name: str) -> str:
         return str(name).replace("/", "_").replace("\\", "_")
 
-    def save_metrics(self, metrics: Dict, model_name: str, target: str):
+    def save_metrics(self, metrics: Dict, model_name: str, fold: str, target: str):
         safe_target = self._safe_filename(target)
-        metrics_path = Path(self.output_dir) / "metrics" / f"{safe_target}_{model_name}_metrics.csv"
+        if fold is None or str(fold) == 'None':
+            metrics_path = Path(self.output_dir) / "metrics" / f"{safe_target}_{model_name}_metrics.csv"
+        else:
+            metrics_path = Path(self.output_dir) / "metrics" / f"{safe_target}_{model_name}_{fold}_metrics.csv"
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame([metrics]).to_csv(metrics_path, index=False)
         return str(metrics_path)
 
-    def save_model(self, model: BaseEstimator, model_name: str, target: str):
+    def save_model(self, model: BaseEstimator, model_name: str, fold: str, target: str):
         safe_target = self._safe_filename(target)
-        model_path = Path(self.output_dir) / "final_models" / f"{safe_target}_{model_name}.pkl"
+        if fold is None or str(fold) == 'None':
+            model_path = Path(self.output_dir) / "final_models" / f"{safe_target}_{model_name}.pkl"
+        else:
+            model_path = Path(self.output_dir) / "final_models" / f"{safe_target}_{model_name}_{fold}.pkl"
         model_path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(model, model_path)
         return str(model_path)
 
-    def save_cv_results(self, search_obj, model_name: str, target: str):
+    def save_cv_results(self, model, model_name: str, target: str):
+        search_obj = model.get('model', None)
+        fold = model.get('fold', None)    
         if hasattr(search_obj, "cv_results_"):
             safe_target = self._safe_filename(target)
             results_df = pd.DataFrame(search_obj.cv_results_)
             results_df["target"] = target
             results_df["model"] = model_name
+            results_df["fold"] = fold if fold is not None else -1
             path = Path(self.output_dir) / "metrics" / f"{safe_target}_{model_name}_cv_results.csv"
             path.parent.mkdir(parents=True, exist_ok=True)
             results_df.to_csv(path, index=False)

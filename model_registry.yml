@@ -1,11 +1,11 @@
 PLSRegression:
-  enabled: true
+  enabled: True
   import_path: sklearn.cross_decomposition.PLSRegression
   params:
     model__n_components: [2, 4, 6, 8, 10, 12, 14, 16, 18]
 
 GradientBoosting:
-  enabled: false
+  enabled: true
   import_path: sklearn.ensemble.GradientBoostingRegressor
   init_args:
     random_state: 42
@@ -33,3 +33,16 @@ KerasRegressor:
     model__epochs: [50, 100]
     model__batch_size: [16, 32]
     model__dropout_rate: [0.1, 0.2, 0.3]
+
+MLPRegressor:
+  enabled: false
+  import_path: sklearn.neural_network.MLPRegressor
+  init_args:
+    random_state: 42
+    max_iter: 500
+  params:
+    model__hidden_layer_sizes: [[100], [50, 50], [100, 50], [100, 100]]
+    model__activation: ['relu', 'tanh']
+    model__solver: ['adam']
+    model__alpha: [0.0001, 0.001, 0.01]
+    model__learning_rate_init: [0.001, 0.01]
