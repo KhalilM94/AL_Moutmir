@@ -36,7 +36,8 @@ class DataManager:
         feature_columns = [col for col in clustered_data.columns 
                           if col not in self.config.TARGET_COLUMNS + 
                           self.config.ELIMINATED_FEATURES + 
-                          self.config.EXCLUDE_CATEGORICAL]
+                          self.config.EXCLUDE_CATEGORICAL +
+                          self.config.IGNORE_BANDS]
         
         # Prepare feature matrix
         valid_feature_columns = clustered_data[feature_columns].dropna(axis=1, how='all').columns.tolist()

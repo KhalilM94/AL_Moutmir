@@ -20,6 +20,9 @@ USE_BAYES_OPT: False
 ENABLE_RFE: False
 RANDOM_SEED: 42
 
+IGNORE_BANDS: true  # or false to skip ignoring
+N_BANDS: 234        # optional: number of bands, default to 234 in code if missing
+
 COLUMNS_TO_TRANSFORM:
   #- "Clay%"
   #- "Coarse element %"

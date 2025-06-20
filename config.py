@@ -32,6 +32,7 @@ class Config:
         self.ENABLE_RFE = self._get_config('ENABLE_RFE', False)
 
         # Target and feature configuration
+        self.IGNORE_BANDS = self._get_ignore_bands([])
         self.COLUMNS_TO_TRANSFORM = self._get_config('COLUMNS_TO_TRANSFORM', [])
         self.TARGET_COLUMNS = self._get_config('TARGET_COLUMNS', [])
         self.CATEGORICAL_FEATURES = self._get_config('CATEGORICAL_FEATURES', [])
@@ -70,3 +71,9 @@ class Config:
                 return yaml.safe_load(f)
         except FileNotFoundError:
             raise FileNotFoundError(f"Model registry YAML not found at {registry_path}. Stopping execution.")
+    
+    def _get_ignore_bands(self, default: Any) -> list:
+        if self._get_config('IGNORE_BANDS', False):
+            return [f"Band_{i}" for i in range(1, self._get_config('N_BANDS', 234) + 1)]
+        else:
+            return default if isinstance(default, list) else []
