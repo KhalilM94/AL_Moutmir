@@ -26,7 +26,7 @@ def prepare_group_labels(X, valid_mask, prefix, label_map):
     cat = pd.Categorical(labels)
     
     # Use get_cmap properly and avoid deprecated usage
-    cmap = plt.cm.viridis  # directly use the colormap (viridis is a default colormap in matplotlib)
+    cmap = plt.cm.get_cmap('viridis')  # directly use the colormap (viridis is a default colormap in matplotlib)
     discrete_colors = cmap(np.linspace(0, 1, len(cat.categories)))  # Generate discrete colors
     color_map = ListedColormap(discrete_colors)
     
@@ -167,12 +167,13 @@ def plot_cv_folds_observed_vs_predicted(
     group_numeric_column=None,
     columns_to_transform=None,
     n_bins=5,
-    cmap_name="viridis"
+    cmap_name="viridis",
+    log_transformer=None
 ):
     """
     fold_preds: list of dicts with keys 'fold', 'y_val', 'y_pred', 'target', 'model', and optionally 'val_groups', 'X_val'
     Plots a grid: rows = models, columns = folds. Each subplot is a scatter for a model/fold.
-    Supports group coloring (no log-transform applied).
+    Supports group coloring and log-transform inversion.
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -193,6 +194,27 @@ def plot_cv_folds_observed_vs_predicted(
     elif n_folds == 1:
         axes = np.atleast_2d(axes).T
     fig.suptitle(f"{sup_title}\nTarget: {target}", fontsize=18)
+
+    # --- Compute global min/max for all folds for consistent axis scaling ---
+    all_y_vals = []
+    all_y_preds = []
+    for model_folds in model_groups.values():
+        for fold_pred in model_folds:
+            y_val = np.array(fold_pred['y_val'])
+            y_pred = np.array(fold_pred['y_pred'])
+            # Inverse transform for log-transformed targets
+            is_log = columns_to_transform and target in columns_to_transform
+            if is_log and log_transformer is not None:
+                y_pred = log_transformer.inverse_transform(y_pred)
+            valid_mask = (~pd.isna(y_val)) & (~pd.isna(y_pred))
+            all_y_vals.append(y_val[valid_mask])
+            all_y_preds.append(y_pred[valid_mask])
+    if all_y_vals and all_y_preds:
+        global_min = min(np.min(np.concatenate(all_y_vals)), np.min(np.concatenate(all_y_preds)))
+        global_max = max(np.max(np.concatenate(all_y_vals)), np.max(np.concatenate(all_y_preds)))
+    else:
+        global_min, global_max = 0, 1
+
     for i, model_name in enumerate(model_names):
         model_folds = sorted(model_groups[model_name], key=lambda d: d['fold'])
         for j, fold_pred in enumerate(model_folds):
@@ -204,7 +226,10 @@ def plot_cv_folds_observed_vs_predicted(
             # Convert to numpy arrays for safety
             y_val = np.array(y_val)
             y_pred = np.array(y_pred)
-            # No log-transform applied here
+            # Inverse transform for log-transformed targets
+            is_log = columns_to_transform and target in columns_to_transform
+            if is_log and log_transformer is not None:
+                y_pred = log_transformer.inverse_transform(y_pred)
             # Filter out NaNs
             valid_mask = (~pd.isna(y_val)) & (~pd.isna(y_pred))
             y_val_clean = y_val[valid_mask]
@@ -216,10 +241,13 @@ def plot_cv_folds_observed_vs_predicted(
                 valid_idx = np.where(valid_mask)[0]
                 X_val_valid = X_val_df.iloc[valid_idx]
                 if group_prefix and group_label_map:
-                    # Use a mask that selects all rows in X_val_valid
-                    group_codes, group_labels, cmap = prepare_group_labels(X_val_valid, np.ones(len(X_val_valid), dtype=bool), group_prefix, group_label_map)
+                    group_codes, group_labels, cmap = prepare_group_labels(
+                        X_val_valid, np.ones(len(X_val_valid), dtype=bool), group_prefix, group_label_map
+                    )
                 elif group_numeric_column and group_numeric_column in X_val_valid.columns:
-                    group_codes, group_labels, cmap = prepare_numeric_groups(X_val_valid, X_val_valid.index, group_numeric_column, n_bins=n_bins, cmap_name=cmap_name)
+                    group_codes, group_labels, cmap = prepare_numeric_groups(
+                        X_val_valid, X_val_valid.index, group_numeric_column, n_bins=n_bins, cmap_name=cmap_name
+                    )
             if len(y_val_clean) == 0 or len(y_pred_clean) == 0:
                 ax.set_title(f"{model_name} - Fold {fold_pred['fold']}: No valid data")
                 ax.text(0.5, 0.5, "No data", ha='center', va='center', fontsize=12)
@@ -238,9 +266,10 @@ def plot_cv_folds_observed_vs_predicted(
                 ax.legend(handles=handles, title="Group", loc="lower right", fontsize=8)
             else:
                 ax.scatter(y_val_clean, y_pred_clean, alpha=0.5, s=40)
-            min_val = min(np.min(y_val_clean), np.min(y_pred_clean))
-            max_val = max(np.max(y_val_clean), np.max(y_pred_clean))
-            ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=1)
+            # Use global min/max for all folds
+            ax.plot([global_min, global_max], [global_min, global_max], 'r--', lw=1)
+            ax.set_xlim(global_min, global_max)
+            ax.set_ylim(global_min, global_max)
             # Title with model, fold, and val groups
             if val_groups is not None:
                 val_groups_str = ', '.join(str(int(g)) if isinstance(g, (int, float)) and float(g).is_integer() else str(g) for g in val_groups)
@@ -254,7 +283,7 @@ def plot_cv_folds_observed_vs_predicted(
             if len(y_val_clean) > 1 and len(y_pred_clean) > 1:
                 coef = np.polyfit(y_val_clean, y_pred_clean, 1)
                 reg_line = np.poly1d(coef)
-                x_vals = np.linspace(min_val, max_val, 100)
+                x_vals = np.linspace(global_min, global_max, 100)
                 ax.plot(x_vals, reg_line(x_vals), 'k--', lw=1)
             # Metrics
             from sklearn.metrics import r2_score, mean_squared_error
@@ -270,7 +299,6 @@ def plot_cv_folds_observed_vs_predicted(
             axes[i, j].axis('off')
     plt.tight_layout(rect=(0, 0, 1, 0.96))
     return fig
-
 def plot_feature_importances(model_file, X, bands_csv_path=None, worldclim_csv_path=None, top_n=20, title=None):
     """
     Plot and return a matplotlib figure for feature importances for a fitted model pipeline.

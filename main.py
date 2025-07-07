@@ -177,6 +177,8 @@ class SoilModelTraining:
         """Save CV metrics and plots for all targets and models."""
         metrics_dir = os.path.join(self.output_dir, "metrics")
         plots_dir = os.path.join(self.output_dir, "plots")
+        group_label_map = load_dict_from_file(self.config.SOIL_GROUPS_FILE_PATH)
+        group_prefix = self.config.CATEGORICAL_FEATURES[0] + "_"
         os.makedirs(metrics_dir, exist_ok=True)
         os.makedirs(plots_dir, exist_ok=True)
         metrics_df.to_csv(os.path.join(metrics_dir, "cv_folds_metrics.csv"), index=False)

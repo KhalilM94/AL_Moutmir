@@ -148,6 +148,7 @@ class ModelTrainer:
                         results.append(metrics)
                         fold_preds.append({
                             "fold": fold_idx,
+                            "X_val": X_val,
                             "y_val": y_val,
                             "y_pred": y_pred_val,
                             "target": target,
