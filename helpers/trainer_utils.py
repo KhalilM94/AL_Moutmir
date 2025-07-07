@@ -164,11 +164,11 @@ class Tuner:
                 best_model = search.fit(X_train, y_train)
                 best_params = {}
 
-                models.append({
-                    'model': best_model,
-                    'fold': None,  # No fold in non-CV mode
-                    'best_params': best_params})
-                #return pipeline, "Default (no tuning)"
+            models.append({
+                'model': best_model,
+                'fold': None,  # No fold in non-CV mode
+                'best_params': best_params})
+            #return pipeline, "Default (no tuning)"
         return models
 
 class ModelEvaluator:
