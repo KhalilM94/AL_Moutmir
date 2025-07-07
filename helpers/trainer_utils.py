@@ -6,7 +6,7 @@ from sklearn.cross_decomposition import PLSRegression
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.svm import SVR
 from sklearn.base import BaseEstimator
-from sklearn.model_selection import KFold, GroupKFold, StratifiedShuffleSplit
+from sklearn.model_selection import KFold, GroupKFold
 from sklearn.model_selection import GridSearchCV, cross_validate
 from sklearn.metrics import (mean_squared_error, mean_absolute_error, 
                              r2_score, explained_variance_score)
@@ -51,14 +51,9 @@ class CVSplitter:
             splits = list(cv.split(X))
         elif strategy == 'groupkfold':
             if groups is None:
-                raise ValueError("Groups must be provided for groupkfold CV strategy.")
+                raise ValueError("Groups must be provided for GroupKFold CV strategy.")
             cv = GroupKFold(n_splits=self.n_splits)
             splits = list(cv.split(X, y, groups))
-        elif strategy == 'stratifiedshuffle':
-            if y is None:
-                raise ValueError("Target y must be provided for stratifiedshuffle CV strategy.")
-            cv = StratifiedShuffleSplit(n_splits=self.n_splits, test_size=0.2, random_state=self.random_state)
-            splits = list(cv.split(X, y))
         else:
             raise ValueError(f"Unsupported CV strategy: {self.cv_strategy}")
 
