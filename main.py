@@ -182,7 +182,6 @@ class SoilModelTraining:
         os.makedirs(metrics_dir, exist_ok=True)
         os.makedirs(plots_dir, exist_ok=True)
         metrics_df.to_csv(os.path.join(metrics_dir, "cv_folds_metrics.csv"), index=False)
-        from helpers.plot_utils import plot_cv_folds_observed_vs_predicted
         group_label_map = load_dict_from_file(self.config.SOIL_GROUPS_FILE_PATH)
         group_prefix = self.config.CATEGORICAL_FEATURES[0] + "_"
         for target, fold_preds in all_fold_preds.items():

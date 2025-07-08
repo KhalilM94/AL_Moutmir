@@ -1,3 +1,4 @@
+from collections import defaultdict
 import os
 import joblib
 import numpy as np
@@ -175,10 +176,6 @@ def plot_cv_folds_observed_vs_predicted(
     Plots a grid: rows = models, columns = folds. Each subplot is a scatter for a model/fold.
     Supports group coloring and log-transform inversion.
     """
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import pandas as pd
-    from collections import defaultdict
     # Helper functions from this module
     from .plot_utils import prepare_group_labels, prepare_numeric_groups
 
@@ -286,7 +283,6 @@ def plot_cv_folds_observed_vs_predicted(
                 x_vals = np.linspace(global_min, global_max, 100)
                 ax.plot(x_vals, reg_line(x_vals), 'k--', lw=1)
             # Metrics
-            from sklearn.metrics import r2_score, mean_squared_error
             r2 = r2_score(y_val_clean, y_pred_clean)
             rmse = np.sqrt(mean_squared_error(y_val_clean, y_pred_clean))
             bias = np.mean(y_pred_clean - y_val_clean)
@@ -310,10 +306,6 @@ def plot_feature_importances(model_file, X, bands_csv_path=None, worldclim_csv_p
     - title: plot title (optional)
     Returns: matplotlib figure
     """
-    import joblib
-    import numpy as np
-    import pandas as pd
-    import matplotlib.pyplot as plt
     # Load model
     model = joblib.load(model_file)
     # Get feature importances (works for tree-based models)
@@ -413,10 +405,6 @@ def plot_plsr_biplot(ax, plsr_model, X, top_n=20, friendly_names=None):
     ax.set_ylim(-1.2, 1.2)
 
 def plot_plsr_vip_and_biplot(model_file, X, bands_csv_path=None, worldclim_csv_path=None, top_n=20, title=None):
-    import joblib
-    import numpy as np
-    import pandas as pd
-    import matplotlib.pyplot as plt
     plsr_model = joblib.load(model_file).named_steps['model']
     # Prepare friendly names
     bands_dict = None
@@ -454,9 +442,6 @@ def plot_train_test_histograms(y_train, y_test, target_columns, plots_dir, bins=
     Each subplot is a target, with train and test histograms overlayed.
     Bins are normalized between train and test. Orientation can be 'horizontal' or 'vertical'.
     """
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import os
     n_targets = len(target_columns)
     # Determine subplot arrangement
     if orientation == 'vertical':
