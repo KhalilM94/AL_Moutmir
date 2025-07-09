@@ -53,6 +53,7 @@ class SoilModelTraining:
             use_bayes_opt=self.config.USE_BAYES_OPT,
             enable_rfe=self.config.ENABLE_RFE,
             seed=self.config.RANDOM_SEED,
+            cv_only_mode=self.config.CV_ONLY_MODE.get("enabled", False),
             output_dir=self.output_dir,
             logger=self.logger
         )
@@ -79,8 +80,7 @@ class SoilModelTraining:
         group_prefix = self.config.CATEGORICAL_FEATURES[0] + "_"
 
         if metrics_df.empty or "target" not in metrics_df.columns:
-            self.logger.error("No valid metrics to save. Skipping result saving.")
-            print("No valid metrics to save. Check logs for errors.")
+            self.logger.error("Metrics DataFrame is empty or missing 'target' column. Skipping result saving.")
             return
 
         # Save metrics
@@ -154,7 +154,6 @@ class SoilModelTraining:
                     print(f"[DEBUG] Saved feature importance plot for {model_name}")
                     self.logger.info(f"Feature importance plot saved to {plots_dir}/{target}_{model_name}_feature_importance.png")
             except Exception as e:
-                print(f"[ERROR] Could not plot feature importances for {target} - {model_name}: {e}")
                 self.logger.warning(f"Could not plot feature importances for {target} - {model_name}: {e}")
 
         # --- Plot train/test histograms for all targets ---
@@ -170,7 +169,7 @@ class SoilModelTraining:
             )
 
         # Display results
-        print("\nFinal Metrics DataFrame:")
+        self.logger.info("Training results:")
         print(metrics_df)
 
     def save_cv_results_and_plots(self, metrics_df, all_fold_preds):
@@ -264,9 +263,10 @@ class SoilModelTraining:
                         print(f"[DEBUG] (CV) Saved feature importance plot for {model_name} (fold: {fold})")
                         self.logger.info(f"Feature importance plot (CV) saved to {plots_dir}/{out_name}")
                 except Exception as e:
-                    print(f"[ERROR] (CV) Could not plot feature importances for {target} - {model_name} (fold: {fold}): {e}")
                     self.logger.warning(f"Could not plot feature importances (CV) for {target} - {model_name} (fold: {fold}): {e}")
-        print("\nCV Folds Metrics DataFrame:")
+        self.logger.info("CV results and plots saved successfully.")
+        self.logger.info("Metrics DataFrame:")
+        # Display the metrics DataFrame
         print(metrics_df)
     
 
