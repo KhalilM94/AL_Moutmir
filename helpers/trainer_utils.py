@@ -192,7 +192,6 @@ class ModelEvaluator:
                 "fold": fold,
                 "X_val": X_test,
                 "y_val": y_test,
-                "y_pred": y_pred,
                 "target": target,
                 "model": model_name,
                 "val_groups": val_groups.tolist() if val_groups is not None else None

@@ -1,8 +1,5 @@
-import numpy as np
 import pandas as pd
 from typing import Optional, List, Dict, Tuple, Any
-from sklearn.model_selection import GridSearchCV
-from sklearn.base import clone
 
 from .training_logger import TrainingLogger
 from .trainer_utils import (CVSplitter, PipelineBuilder, Tuner, 

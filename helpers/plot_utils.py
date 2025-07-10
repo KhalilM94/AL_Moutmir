@@ -4,7 +4,14 @@ import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
+import joblib
+import os
+import contextily as ctx
+import geopandas as gpd
+from scipy.spatial import ConvexHull
+from shapely.geometry import Polygon
+from collections import defaultdict
+from matplotlib.colors import ListedColormap, Normalize
 from matplotlib.lines import Line2D
 from sklearn.metrics import r2_score, mean_squared_error
 
@@ -159,6 +166,148 @@ def plot_observed_vs_predicted(
     plt.tight_layout(rect=(0, 0, 1, 0.96))
     return plt
 
+def plot_residuals(
+    X_train,
+    y_train_dict,
+    lat_train,
+    lon_train,
+    X_test,
+    y_test_dict,
+    lat_test,
+    lon_test,
+    model_pipelines,
+    target_columns,
+    columns_to_transform,
+    model_dir="final_models",
+    sup_title="Residuals Analysis",
+    log_transformer=None
+):
+    """
+    Plots residual analysis for each model and target for both train and test sets.
+    For each, it generates a figure with two subplots:
+    1. Residuals vs. Predicted for train and test sets.
+    2. A spatial map of residuals for train and test sets with a convex hull for the test set.
+    """
+    model_names = list(model_pipelines.keys())
+    figs = []
+
+    for target in target_columns:
+        y_train_full = y_train_dict[target]
+        y_test_full = y_test_dict[target]
+        is_log = target in columns_to_transform
+
+        for model_name in model_names:
+            model_file = os.path.join(model_dir, f"{target.replace('/', '_')}_{model_name}.pkl")
+            if not os.path.exists(model_file):
+                continue
+
+            model = joblib.load(model_file)
+
+            # Process train data
+            y_pred_train_raw = model.predict(X_train)
+            y_train = pd.Series(y_train_full, index=X_train.index)
+            y_pred_train = pd.Series(y_pred_train_raw, index=X_train.index)
+            if is_log and log_transformer:
+                y_pred_train = log_transformer.inverse_transform(y_pred_train)
+            
+            valid_mask_train = y_train.notna() & y_pred_train.notna()
+            y_train_clean = y_train[valid_mask_train]
+            y_pred_train_clean = y_pred_train[valid_mask_train]
+            lat_train_clean = lat_train[valid_mask_train]
+            lon_train_clean = lon_train[valid_mask_train]
+            residuals_train = y_pred_train_clean - y_train_clean
+
+            # Process test data
+            y_pred_test_raw = model.predict(X_test)
+            y_test = pd.Series(y_test_full, index=X_test.index)
+            y_pred_test = pd.Series(y_pred_test_raw, index=X_test.index)
+            if is_log and log_transformer:
+                y_pred_test = log_transformer.inverse_transform(y_pred_test)
+
+            valid_mask_test = y_test.notna() & y_pred_test.notna()
+            y_test_clean = y_test[valid_mask_test]
+            y_pred_test_clean = y_pred_test[valid_mask_test]
+            lat_test_clean = lat_test[valid_mask_test]
+            lon_test_clean = lon_test[valid_mask_test]
+            residuals_test = y_pred_test_clean - y_test_clean
+
+            if len(y_test_clean) == 0 or len(y_train_clean) == 0:
+                continue
+
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
+            fig.suptitle(f"{sup_title}\nTarget: {target} - Model: {model_name}", fontsize=16)
+
+            # Subplot 1: Residuals vs. Predicted
+            ax1.scatter(y_pred_train_clean, residuals_train, alpha=0.5, edgecolor='none', s=30, label='Train')
+            ax1.scatter(y_pred_test_clean, residuals_test, alpha=0.7, s=40, marker='^', edgecolor='none', label='Test')
+            ax1.axhline(0, color='red', linestyle='--')
+            ax1.set_xlabel("Predicted Values")
+            ax1.set_ylabel("Residuals")
+            ax1.set_title("Residuals vs. Predicted")
+            ax1.legend()
+            ax1.grid(True)
+
+            # Subplot 2: Spatial Map of Residuals
+            gdf_train = gpd.GeoDataFrame(
+                {'residuals': residuals_train},
+                geometry=gpd.points_from_xy(lon_train_clean, lat_train_clean),
+                crs="EPSG:4326"
+            ).to_crs(epsg=3857)
+            
+            gdf_test = gpd.GeoDataFrame(
+                {'residuals': residuals_test},
+                geometry=gpd.points_from_xy(lon_test_clean, lat_test_clean),
+                crs="EPSG:4326"
+            ).to_crs(epsg=3857)
+
+            # Make color bar symmetrical around zero
+            max_abs_residual = pd.concat([residuals_train, residuals_test]).abs().max()
+            vmin = -max_abs_residual
+            vmax = max_abs_residual
+            norm = Normalize(vmin=vmin, vmax=vmax)
+
+            # Plotting
+            gdf_train.plot(ax=ax2, column='residuals', cmap='coolwarm', 
+                           norm=norm, legend=False, s=30, 
+                           marker='o', edgecolor='k', linewidth=0.2)
+            gdf_test.plot(ax=ax2, column='residuals', cmap='coolwarm', 
+                          norm=norm, legend=False, s=50, 
+                          marker='^', edgecolor='k', linewidth=0.2)
+            
+            # Add convex hull for test set
+            if len(lon_test_clean) >= 3:
+                points = np.column_stack((lon_test_clean, lat_test_clean))
+                hull = ConvexHull(points)
+                hull_points = points[hull.vertices]
+                polygon = Polygon(hull_points)
+                
+                gdf_hull = gpd.GeoDataFrame([1], geometry=[polygon], crs="EPSG:4326").to_crs(epsg=3857)
+                gdf_hull.plot(ax=ax2, facecolor='none', edgecolor='yellow', lw=2)
+
+            ctx.add_basemap(ax2)
+            ax2.set_title("Spatial Distribution of Residuals")
+            ax2.set_xlabel("Longitude")
+            ax2.set_ylabel("Latitude")
+            
+            # Create a shared colorbar
+            sm = plt.cm.ScalarMappable(cmap='coolwarm', norm=norm)
+            sm.set_array([])
+            fig.colorbar(sm, ax=ax2, label="Residual Value")
+
+            # Create legend for markers
+            legend_elements = [
+                Line2D([0], [0], marker='o', color='w', label='Train', markerfacecolor='gray', markersize=10),
+                Line2D([0], [0], marker='^', color='w', label='Test', markerfacecolor='gray', markersize=10),
+                Line2D([0], [0], color='yellow', lw=2, label='Test Area')
+            ]
+            ax2.legend(handles=legend_elements)
+            
+            plt.tight_layout(rect=(0, 0, 1, 0.95))
+            figs.append((fig, target, model_name))
+
+    return figs
+
+
 def plot_cv_folds_observed_vs_predicted(
     fold_preds,
     target,
@@ -169,15 +318,48 @@ def plot_cv_folds_observed_vs_predicted(
     columns_to_transform=None,
     n_bins=5,
     cmap_name="viridis",
-    log_transformer=None
+    log_transformer=None,
+    model_dir="final_models"
 ):
     """
-    fold_preds: list of dicts with keys 'fold', 'y_val', 'y_pred', 'target', 'model', and optionally 'val_groups', 'X_val'
+    fold_preds: list of dicts with keys 'fold', 'X_val', 'target', 'model', and optionally 'val_groups'.
     Plots a grid: rows = models, columns = folds. Each subplot is a scatter for a model/fold.
     Supports group coloring and log-transform inversion.
     """
-    # Helper functions from this module
-    from .plot_utils import prepare_group_labels, prepare_numeric_groups
+    from pathlib import Path
+
+    # --- Global group and color mapping ---
+    global_group_labels = None
+    global_cmap = None
+    global_color_map_dict = None
+
+    if group_prefix and group_label_map:
+        all_labels = set()
+        for d in fold_preds:
+            X_val_df = pd.DataFrame(d['X_val'])
+            dummy_cols = [col for col in X_val_df.columns if col.startswith(group_prefix)]
+            if dummy_cols:
+                suffixes = X_val_df[dummy_cols].idxmax(axis=1).str.replace(group_prefix, '', regex=False)
+                labels = suffixes.map(lambda s: fuzzy_map_suffix(s, group_label_map))
+                all_labels.update(labels.dropna().unique())
+        
+        if all_labels:
+            global_group_labels = sorted(list(all_labels))
+            cmap_obj = plt.cm.get_cmap('viridis', len(global_group_labels))
+            global_color_map_dict = {label: cmap_obj(i) for i, label in enumerate(global_group_labels)}
+
+    elif group_numeric_column:
+        all_values = pd.concat([pd.DataFrame(d['X_val'])[group_numeric_column] for d in fold_preds if group_numeric_column in pd.DataFrame(d['X_val']).columns]).dropna()
+        if not all_values.empty:
+            # Ensure all_values is a Series for qcut
+            if isinstance(all_values, pd.DataFrame):
+                all_values = all_values.iloc[:, 0]
+            bins = pd.qcut(all_values, q=n_bins, duplicates='drop', labels=False, retbins=True)[1]
+            bin_labels = [f'({bins[i]:.2f}, {bins[i+1]:.2f}]' for i in range(len(bins)-1)]
+            global_group_labels = sorted(bin_labels)
+            cmap_obj = plt.cm.get_cmap(cmap_name, len(global_group_labels))
+            global_color_map_dict = {label: cmap_obj(i) for i, label in enumerate(global_group_labels)}
+
 
     model_groups = defaultdict(list)
     for d in fold_preds:
@@ -197,8 +379,14 @@ def plot_cv_folds_observed_vs_predicted(
     all_y_preds = []
     for model_folds in model_groups.values():
         for fold_pred in model_folds:
+            #os.path.join(model_dir, f"{target.replace('/', '_')}_{model_name}.pkl")
+            model_file = Path(model_dir) / f"{fold_pred['target'].replace('/', '_')}_{fold_pred['model']}_fold_{fold_pred['fold']}.pkl"
+            if not model_file.exists():
+                raise FileNotFoundError(f"Model file {model_file} not found.")
+            model = joblib.load(model_file)
+            X_val = fold_pred['X_val']
             y_val = np.array(fold_pred['y_val'])
-            y_pred = np.array(fold_pred['y_pred'])
+            y_pred = np.array(model.predict(X_val))
             # Inverse transform for log-transformed targets
             is_log = columns_to_transform and target in columns_to_transform
             if is_log and log_transformer is not None:
@@ -216,13 +404,11 @@ def plot_cv_folds_observed_vs_predicted(
         model_folds = sorted(model_groups[model_name], key=lambda d: d['fold'])
         for j, fold_pred in enumerate(model_folds):
             ax = axes[i, j]
-            y_val = fold_pred['y_val']
-            y_pred = fold_pred['y_pred']
-            X_val = fold_pred.get('X_val', None)
-            val_groups = fold_pred.get('val_groups', None)
-            # Convert to numpy arrays for safety
-            y_val = np.array(y_val)
-            y_pred = np.array(y_pred)
+            model_file = Path(model_dir) / f"{fold_pred['target']}_{fold_pred['model']}_fold_{fold_pred['fold']}.pkl"
+            model = joblib.load(model_file)
+            X_val = fold_pred['X_val']
+            y_val = np.array(fold_pred['y_val'])
+            y_pred = np.array(model.predict(X_val))
             # Inverse transform for log-transformed targets
             is_log = columns_to_transform and target in columns_to_transform
             if is_log and log_transformer is not None:
@@ -231,43 +417,63 @@ def plot_cv_folds_observed_vs_predicted(
             valid_mask = (~pd.isna(y_val)) & (~pd.isna(y_pred))
             y_val_clean = y_val[valid_mask]
             y_pred_clean = y_pred[valid_mask]
+            
             # Group label coloring (optional)
-            group_codes, group_labels, cmap = None, None, None
-            if X_val is not None and valid_mask.sum() > 0:
-                X_val_df = pd.DataFrame(X_val).reset_index(drop=True)
-                valid_idx = np.where(valid_mask)[0]
-                X_val_valid = X_val_df.iloc[valid_idx]
-                if group_prefix and group_label_map:
-                    group_codes, group_labels, cmap = prepare_group_labels(
-                        X_val_valid, np.ones(len(X_val_valid), dtype=bool), group_prefix, group_label_map
-                    )
-                elif group_numeric_column and group_numeric_column in X_val_valid.columns:
-                    group_codes, group_labels, cmap = prepare_numeric_groups(
-                        X_val_valid, X_val_valid.index, group_numeric_column, n_bins=n_bins, cmap_name=cmap_name
-                    )
+            group_colors = None
+            legend_handles = None
+            labels = None
+
+            if (group_prefix and group_label_map) or group_numeric_column:
+                if X_val is not None and valid_mask.sum() > 0 and global_color_map_dict:
+                    X_val_df = pd.DataFrame(X_val).reset_index(drop=True)
+                    valid_idx = np.where(valid_mask)[0]
+                    X_val_valid = X_val_df.iloc[valid_idx]
+
+                    if group_prefix:
+                        dummy_cols = [col for col in X_val_valid.columns if col.startswith(group_prefix)]
+                        if dummy_cols:
+                            suffixes = X_val_valid[dummy_cols].idxmax(axis=1).str.replace(group_prefix, '', regex=False)
+                            labels = suffixes.map(lambda s: fuzzy_map_suffix(s, group_label_map))
+                            group_colors = labels.map(global_color_map_dict).values
+                    
+                    elif group_numeric_column and group_numeric_column in X_val_valid.columns and global_group_labels:
+                        values = X_val_valid[group_numeric_column]
+                        # Find which global bin each value belongs to
+                        interval_bins = pd.IntervalIndex.from_tuples([(float(c.strip('()[]').split(', ')[0]), float(c.strip('()[]').split(', ')[1])) for c in global_group_labels], closed='right')
+                        bins = pd.cut(values, bins=interval_bins, right=True)
+                        labels = bins.astype(str)
+                        group_colors = labels.map(global_color_map_dict).values
+
+                    if labels is not None and global_group_labels is not None:
+                        present_labels = pd.Series(labels).dropna().unique()
+                        legend_handles = [
+                            Line2D([0], [0], marker='o', color='w', label=label,
+                                   markerfacecolor=global_color_map_dict[label],
+                                   markeredgecolor='k', markersize=6)
+                            for label in global_group_labels if label in present_labels
+                        ]
+
             if len(y_val_clean) == 0 or len(y_pred_clean) == 0:
                 ax.set_title(f"{model_name} - Fold {fold_pred['fold']}: No valid data")
                 ax.text(0.5, 0.5, "No data", ha='center', va='center', fontsize=12)
                 ax.axis('off')
                 continue
-            if group_codes is not None and group_labels is not None and cmap is not None:
-                ax.scatter(y_val_clean, y_pred_clean, c=group_codes, cmap=cmap, alpha=0.7, edgecolor='k', s=40)
-                handles = [
-                    Line2D([0], [0], marker='o', color='w',
-                           label=label,
-                           markerfacecolor=cmap(i),
-                           markeredgecolor='k',
-                           markersize=6)
-                    for i, label in enumerate(group_labels)
-                ]
-                ax.legend(handles=handles, title="Group", loc="lower right", fontsize=8)
+
+            if group_colors is not None and legend_handles:
+                # Filter out points where color could not be determined
+                valid_color_mask = ~pd.isna(group_colors)
+                ax.scatter(y_val_clean[valid_color_mask], y_pred_clean[valid_color_mask], c=group_colors[valid_color_mask], alpha=0.7, edgecolor='k', s=40)
+                if legend_handles:
+                    ax.legend(handles=legend_handles, title="Group", loc="lower right", fontsize=8)
             else:
                 ax.scatter(y_val_clean, y_pred_clean, alpha=0.5, s=40)
+
             # Use global min/max for all folds
             ax.plot([global_min, global_max], [global_min, global_max], 'r--', lw=1)
             ax.set_xlim(global_min, global_max)
             ax.set_ylim(global_min, global_max)
             # Title with model, fold, and val groups
+            val_groups = fold_pred.get('val_groups', None)
             if val_groups is not None:
                 val_groups_str = ', '.join(str(int(g)) if isinstance(g, (int, float)) and float(g).is_integer() else str(g) for g in val_groups)
                 ax.set_title(f"{model_name} - Fold {fold_pred['fold']}: Val set ({val_groups_str})")
@@ -293,7 +499,7 @@ def plot_cv_folds_observed_vs_predicted(
     for i in range(n_models):
         for j in range(len(model_groups[model_names[i]]), n_folds):
             axes[i, j].axis('off')
-    plt.tight_layout(rect=(0, 0, 1, 0.96))
+    plt.tight_layout(rect=(0, 0.03, 1, 0.96))
     return fig
 def plot_feature_importances(model_file, X, bands_csv_path=None, worldclim_csv_path=None, top_n=20, title=None):
     """

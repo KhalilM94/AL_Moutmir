@@ -8,9 +8,9 @@ from helpers.preprocessors import load_dict_from_file
 from helpers.misc_utils import LogTransformer
 import pandas as pd
 import os
-import joblib
 from typing import Dict
 from config import Config
+import matplotlib.pyplot as plt
 
 class SoilModelTraining:
     def __init__(self):
@@ -71,7 +71,7 @@ class SoilModelTraining:
         metrics_df = pd.DataFrame(all_results)
         return metrics_df, all_fold_preds
 
-    def save_results(self, metrics_df: pd.DataFrame, test_data: Dict):
+    def save_results(self, metrics_df: pd.DataFrame, split_data: Dict):
         """Save training results and test sets."""
         metrics_dir = os.path.join(self.output_dir, "metrics")
         models_dir = os.path.join(self.output_dir, "final_models")
@@ -93,9 +93,9 @@ class SoilModelTraining:
 
         # --- Add plot_observed_vs_predicted and save the plot ---
         fig = plot_observed_vs_predicted(
-            test_data['X_test'],
-            test_data['y_test'],
-            self.model_configs.build_model_configs(num_features=test_data['X_test'].shape[1]),
+            split_data['X_test'],
+            split_data['y_test'],
+            self.model_configs.build_model_configs(num_features=split_data['X_test'].shape[1]),
             self.config.TARGET_COLUMNS,
             self.config.COLUMNS_TO_TRANSFORM,
             model_dir=models_dir,
@@ -107,6 +107,31 @@ class SoilModelTraining:
         os.makedirs(plots_dir, exist_ok=True)
         fig.savefig(os.path.join(plots_dir, "observed_vs_predicted.png"))   
         self.logger.info(f"Obs_vs_Pred Plot saved to {plots_dir}/observed_vs_predicted.png")
+
+        # --- Residuals Plots ---
+        from helpers.plot_utils import plot_residuals
+        residual_figs = plot_residuals(
+            split_data['X_train'],
+            split_data['y_train'],
+            split_data['lat_train'],
+            split_data['lon_train'],
+            split_data['X_test'],
+            split_data['y_test'],
+            split_data['lat_test'],
+            split_data['lon_test'],
+            self.model_configs.build_model_configs(num_features=split_data['X_train'].shape[1]),
+            self.config.TARGET_COLUMNS,
+            self.config.COLUMNS_TO_TRANSFORM,
+            model_dir=models_dir,
+            sup_title="Residuals Analysis",
+            log_transformer=self.log_transformer
+        )
+        for fig, target, model_name in residual_figs:
+            plot_filename = f"residuals_{target.replace('/', '_')}_{model_name}.png"
+            fig.savefig(os.path.join(plots_dir, plot_filename))
+            self.logger.info(f"Saved residual plot to {os.path.join(plots_dir, plot_filename)}")
+            plt.close(fig)
+
 
         # --- Feature Importance Plots for ALL models in final_models ---
         from helpers.plot_utils import plot_feature_importances, plot_plsr_vip_and_biplot
@@ -123,7 +148,7 @@ class SoilModelTraining:
             else:
                 target, model_name = base, ''
             print(f"[DEBUG] Attempting plot for model: {model_name} at {model_path}")
-            if target not in test_data['X_test'].columns and target not in test_data['y_test']:
+            if target not in split_data['X_test'].columns and target not in split_data['y_test']:
                 print(f"[DEBUG] Skipping {model_file}: target not in test data.")
                 continue
             try:
@@ -131,7 +156,7 @@ class SoilModelTraining:
                     print(f"[DEBUG] Detected PLSRegression model. Calling plot_plsr_vip_and_biplot...")
                     fig = plot_plsr_vip_and_biplot(
                         model_path,
-                        test_data['X_test'],
+                        split_data['X_test'],
                         bands_csv_path=bands_csv_path,
                         worldclim_csv_path=worldclim_csv_path,
                         top_n=20,
@@ -144,7 +169,7 @@ class SoilModelTraining:
                     print(f"[DEBUG] Detected non-PLSR model. Calling plot_feature_importances...")
                     fig = plot_feature_importances(
                         model_path,
-                        test_data['X_test'],
+                        split_data['X_test'],
                         bands_csv_path=bands_csv_path,
                         worldclim_csv_path=worldclim_csv_path,
                         top_n=20,
@@ -158,10 +183,10 @@ class SoilModelTraining:
 
         # --- Plot train/test histograms for all targets ---
         from helpers.plot_utils import plot_train_test_histograms
-        if 'y_train' in test_data and 'y_test' in test_data:
+        if 'y_train' in split_data and 'y_test' in split_data:
             plot_train_test_histograms(
-                test_data['y_train'],
-                test_data['y_test'],
+                split_data['y_train'],
+                split_data['y_test'],
                 self.config.TARGET_COLUMNS,
                 plots_dir,
                 filename="train_test_histograms_overlayed.png",
@@ -175,6 +200,7 @@ class SoilModelTraining:
     def save_cv_results_and_plots(self, metrics_df, all_fold_preds):
         """Save CV metrics and plots for all targets and models."""
         metrics_dir = os.path.join(self.output_dir, "metrics")
+        models_dir = os.path.join(self.output_dir, "final_models")
         plots_dir = os.path.join(self.output_dir, "plots")
         group_label_map = load_dict_from_file(self.config.SOIL_GROUPS_FILE_PATH)
         group_prefix = self.config.CATEGORICAL_FEATURES[0] + "_"
@@ -192,7 +218,9 @@ class SoilModelTraining:
                 sup_title="CV Folds Observed vs Predicted",
                 group_prefix=group_prefix,
                 group_label_map=group_label_map,
-                columns_to_transform=self.config.COLUMNS_TO_TRANSFORM
+                columns_to_transform=self.config.COLUMNS_TO_TRANSFORM,
+                model_dir=models_dir,
+                log_transformer=self.log_transformer
             )
             fig.savefig(os.path.join(plots_dir, f"{target}_cv_folds.png"))
             self.logger.info(f"CV folds plot saved to {plots_dir}/{target}_cv_folds.png")

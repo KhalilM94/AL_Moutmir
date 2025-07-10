@@ -1,7 +1,6 @@
 from .model_config_factory import ModelConfigFactory, BaseSpatialClusterStrategy
-from .trainer_utils import CVSplitter
 import pandas as pd
-from sklearn.model_selection import GroupShuffleSplit, train_test_split, KFold, GroupKFold
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 import os
 from typing import Dict
 
@@ -56,7 +55,9 @@ class DataManager:
 
         preprocessed =  {
             'X' : X,
-            'y': clustered_cleaned[self.config.TARGET_COLUMNS]
+            'y': clustered_cleaned[self.config.TARGET_COLUMNS],
+            'Latitude_Y': clustered_data['Latitude_Y'],
+            'Longitude_X': clustered_data['Longitude_X']
         }
         if self.config.ENABLE_CLUSTERING:
             preprocessed['groups'] = clustered_cleaned['cluster']
@@ -65,16 +66,23 @@ class DataManager:
     def split_data(self, processed_data: Dict) -> Dict:
         X: pd.DataFrame = processed_data['X']
         y: pd.DataFrame = processed_data['y']
+        lat = processed_data['Latitude_Y']
+        lon = processed_data['Longitude_X']
         splitted_data = {}
+
         if self.config.ENABLE_CLUSTERING and not (self.config.CV_ONLY_MODE.get("enabled", True) is True):
             groups = processed_data['groups']
             """Split data into training and test sets."""
             self.logger.info("Splitting dataset into train and test groups using GroupShuffleSplit...")
             gss = GroupShuffleSplit(n_splits=1, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_SEED)
             train_idx, test_idx = next(gss.split(X, y, groups=groups))
+            
             X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
             y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+            lat_train, lat_test = lat.iloc[train_idx], lat.iloc[test_idx]
+            lon_train, lon_test = lon.iloc[train_idx], lon.iloc[test_idx]
             groups_train, groups_test = groups.iloc[train_idx], groups.iloc[test_idx]
+
             splitted_data['groups_train'] = groups_train
             splitted_data['groups_test'] = groups_test
             self.logger.info(f"Train group distribution:\n{groups_train.value_counts().sort_index().to_string()}")
@@ -82,8 +90,8 @@ class DataManager:
 
         else:
             self.logger.info("Splitting dataset using simple train-test split...")
-            X_train, X_test, y_train, y_test= train_test_split(
-                X, y, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_SEED
+            X_train, X_test, y_train, y_test, lat_train, lat_test, lon_train, lon_test = train_test_split(
+                X, y, lat, lon, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_SEED
             )
         
         self.logger.info(f"Train: {len(X_train)} rows | Test: {len(X_test)} rows")
@@ -92,6 +100,10 @@ class DataManager:
         splitted_data['X_test'] = X_test
         splitted_data['y_train'] = y_train
         splitted_data['y_test'] = y_test
+        splitted_data['lat_train'] = lat_train
+        splitted_data['lat_test'] = lat_test
+        splitted_data['lon_train'] = lon_train
+        splitted_data['lon_test'] = lon_test
         
         return splitted_data
 
