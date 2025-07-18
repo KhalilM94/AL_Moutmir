@@ -1,5 +1,6 @@
 from collections import defaultdict
 import os
+from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
@@ -24,17 +25,17 @@ def fuzzy_map_suffix(suffix, label_map):
 # Function to prepare group labels from dummy-coded columns
 def prepare_group_labels(X, valid_mask, prefix, label_map):
     """Extract dummy-encoded group labels and map to human-readable values."""
-    dummy_cols = [col for col in X.columns if col.startswith(prefix)]
-    if not dummy_cols:
+    dummy_column_names = [col for col in X.columns if col.startswith(prefix)]
+    if not dummy_column_names:
         return None, None, None
 
-    group_dummies = X.loc[valid_mask, dummy_cols]
-    suffixes = group_dummies.idxmax(axis=1).str.replace(prefix, '', regex=False)
+    dummy_columns = X.loc[valid_mask, dummy_column_names]
+    suffixes = dummy_columns.idxmax(axis=1).str.replace(prefix, '', regex=False)
     labels = suffixes.map(lambda s: fuzzy_map_suffix(s, label_map))
     cat = pd.Categorical(labels)
     
     # Use get_cmap properly and avoid deprecated usage
-    cmap = plt.cm.get_cmap('viridis')  # directly use the colormap (viridis is a default colormap in matplotlib)
+    cmap = plt.get_cmap('viridis')  # directly use the colormap (viridis is a default colormap in matplotlib)
     discrete_colors = cmap(np.linspace(0, 1, len(cat.categories)))  # Generate discrete colors
     color_map = ListedColormap(discrete_colors)
     
@@ -98,11 +99,11 @@ def plot_observed_vs_predicted(
                 continue
 
             model = joblib.load(model_file)
-            y_pred_raw = model.predict(X_test)
+            y_pred_full = model.predict(X_test)
 
             # Align actual and predicted values
             y_test = pd.Series(y_test_full, index=X_test.index)
-            y_pred = pd.Series(y_pred_raw, index=X_test.index)
+            y_pred = pd.Series(y_pred_full, index=X_test.index)
 
             # Inverse transform for log-transformed targets
             if is_log and log_transformer:
@@ -131,9 +132,9 @@ def plot_observed_vs_predicted(
                            markersize=6)
                     for i, label in enumerate(group_labels)
                 ]
-                ax.legend(handles=handles, title="Group", loc="lower right", fontsize=8)
+                ax.legend(handles=handles, title= group_prefix, loc="lower right", fontsize=8)
             else:
-                ax.scatter(y_test_clean, y_pred_clean, alpha=0.5, s=40)
+                ax.scatter(y_test_clean, y_pred_clean, alpha=0.7, s=40)
 
             # Identity line (1:1 line) and formatting
             min_val = min(y_test_clean.min(), y_pred_clean.min())
@@ -165,6 +166,218 @@ def plot_observed_vs_predicted(
     # Tighten layout and display plot
     plt.tight_layout(rect=(0, 0, 1, 0.96))
     return plt
+
+def _get_global_min_max_cv_folds(fold_preds, 
+                                 target, 
+                                 columns_to_transform=None, 
+                                 log_transformer=None, 
+                                 model_dir="final_models"):
+    """
+    Compute global min and max for observed and predicted values across all folds and models.
+    """
+    all_y_vals = []
+    all_y_preds = []
+    for fold_pred in fold_preds:
+        model_file = Path(model_dir) / f"{fold_pred['target'].replace('/', '_')}_{fold_pred['model']}_fold_{fold_pred['fold']}.pkl"
+        if not model_file.exists():
+            raise FileNotFoundError(f"Model file {model_file} not found.")
+        model = joblib.load(model_file)
+        X_val = fold_pred['X_val']
+        y_val = np.array(fold_pred['y_val'])
+        y_pred = np.array(model.predict(X_val))
+        is_log = columns_to_transform and target in columns_to_transform
+        if is_log and log_transformer is not None:
+            y_pred = log_transformer.inverse_transform(y_pred)
+        valid_mask = (~pd.isna(y_val)) & (~pd.isna(y_pred))
+        all_y_vals.append(y_val[valid_mask])
+        all_y_preds.append(y_pred[valid_mask])
+    if all_y_vals and all_y_preds:
+        global_min = min(np.min(np.concatenate(all_y_vals)), np.min(np.concatenate(all_y_preds)))
+        global_max = max(np.max(np.concatenate(all_y_vals)), np.max(np.concatenate(all_y_preds)))
+    else:
+        global_min, global_max = 0, 1
+    return global_min, global_max
+
+
+def _prepare_global_group_labels(fold_preds, group_prefix=None, group_label_map=None, group_numeric_column=None, n_bins=5, cmap_name="viridis"):
+    """
+    Compute global group labels and color map dict for all folds, for either dummy-coded or numeric group columns.
+    Returns (global_group_labels, global_color_map_dict)
+    """
+    global_group_labels = None
+    global_color_map_dict = None
+    if group_prefix and group_label_map:
+        all_labels = set()
+        for d in fold_preds:
+            X_val_df = pd.DataFrame(d['X_val'])
+            dummy_cols = [col for col in X_val_df.columns if col.startswith(group_prefix)]
+            if dummy_cols:
+                suffixes = X_val_df[dummy_cols].idxmax(axis=1).str.replace(group_prefix, '', regex=False)
+                labels = suffixes.map(lambda s: fuzzy_map_suffix(s, group_label_map))
+                all_labels.update(labels.dropna().unique())
+        if all_labels:
+            global_group_labels = sorted(list(all_labels))
+            cmap_obj = plt.cm.get_cmap(cmap_name, len(global_group_labels))
+            global_color_map_dict = {label: cmap_obj(i) for i, label in enumerate(global_group_labels)}
+    elif group_numeric_column:
+        all_values = pd.concat([
+            pd.DataFrame(d['X_val'])[group_numeric_column]
+            for d in fold_preds if group_numeric_column in pd.DataFrame(d['X_val']).columns
+        ]).dropna()
+        if not all_values.empty:
+            if isinstance(all_values, pd.DataFrame):
+                all_values = all_values.iloc[:, 0]
+            bins = pd.qcut(all_values, q=n_bins, duplicates='drop', labels=False, retbins=True)[1]
+            bin_labels = [f'({bins[i]:.2f}, {bins[i+1]:.2f}]' for i in range(len(bins)-1)]
+            global_group_labels = sorted(bin_labels)
+            cmap_obj = plt.cm.get_cmap(cmap_name, len(global_group_labels))
+            global_color_map_dict = {label: cmap_obj(i) for i, label in enumerate(global_group_labels)}
+    return global_group_labels, global_color_map_dict
+
+def plot_cv_folds_observed_vs_predicted(
+    fold_preds,
+    target,
+    sup_title="CV Folds Observed vs Predicted",
+    group_prefix=None,
+    group_label_map=None,
+    group_numeric_column=None,
+    columns_to_transform=None,
+    n_bins=5,
+    cmap_name="viridis",
+    log_transformer=None,
+    model_dir="final_models"
+):
+    """
+    fold_preds: list of dicts with keys 'fold', 'X_val', 'target', 'model', and optionally 'val_groups'.
+    Plots a grid: rows = models, columns = folds. Each subplot is a scatter for a model/fold.
+    Supports group coloring and log-transform inversion.
+    """
+    # --- Global group and color mapping ---
+    global_group_labels, global_color_map_dict = _prepare_global_group_labels(
+        fold_preds,
+        group_prefix=group_prefix,
+        group_label_map=group_label_map,
+        group_numeric_column=group_numeric_column,
+        n_bins=n_bins,
+        cmap_name=cmap_name
+    )
+    model_groups = defaultdict(list)
+    for d in fold_preds:
+        model_groups[d['model']].append(d)
+    model_names = list(model_groups.keys())
+    n_models = len(model_names)
+    n_folds = max(len(v) for v in model_groups.values()) if n_models > 0 else 1
+    fig, axes = plt.subplots(n_models, n_folds, figsize=(5 * n_folds, 5 * n_models))
+    if n_models == 1:
+        axes = np.atleast_2d(axes)
+    elif n_folds == 1:
+        axes = np.atleast_2d(axes).T
+    fig.suptitle(f"{sup_title}\nTarget: {target}", fontsize=18)
+
+    # --- Compute global min/max for all folds for consistent axis scaling ---
+    global_min, global_max = _get_global_min_max_cv_folds(
+        fold_preds, target, columns_to_transform=columns_to_transform, log_transformer=log_transformer, model_dir=model_dir
+    )
+
+    for i, model_name in enumerate(model_names):
+        model_folds = sorted(model_groups[model_name], key=lambda d: d['fold'])
+        for j, fold_pred in enumerate(model_folds):
+            ax = axes[i, j]
+            model_file = Path(model_dir) / f"{fold_pred['target']}_{fold_pred['model']}_fold_{fold_pred['fold']}.pkl"
+            model = joblib.load(model_file)
+            X_val = fold_pred['X_val']
+            y_val = np.array(fold_pred['y_val'])
+            y_pred = np.array(model.predict(X_val))
+            is_log = columns_to_transform and target in columns_to_transform
+            if is_log and log_transformer is not None:
+                y_pred = log_transformer.inverse_transform(y_pred)
+            valid_mask = (~pd.isna(y_val)) & (~pd.isna(y_pred))
+            y_val_clean = y_val[valid_mask]
+            y_pred_clean = y_pred[valid_mask]
+            
+            # Group label coloring (optional)
+            group_colors = None
+            legend_handles = None
+            labels = None
+
+            if (group_prefix and group_label_map) or group_numeric_column:
+                if X_val is not None and valid_mask.sum() > 0 and global_color_map_dict:
+                    X_val_df = pd.DataFrame(X_val).reset_index(drop=True)
+                    valid_idx = np.where(valid_mask)[0]
+                    X_val_valid = X_val_df.iloc[valid_idx]
+
+                    if group_prefix:
+                        dummy_cols = [col for col in X_val_valid.columns if col.startswith(group_prefix)]
+                        if dummy_cols:
+                            suffixes = X_val_valid[dummy_cols].idxmax(axis=1).str.replace(group_prefix, '', regex=False)
+                            labels = suffixes.map(lambda s: fuzzy_map_suffix(s, group_label_map))
+                            group_colors = labels.map(global_color_map_dict).values
+                    
+                    elif group_numeric_column and group_numeric_column in X_val_valid.columns and global_group_labels:
+                        values = X_val_valid[group_numeric_column]
+                        # Find which global bin each value belongs to
+                        interval_bins = pd.IntervalIndex.from_tuples([(float(c.strip('()[]').split(', ')[0]), float(c.strip('()[]').split(', ')[1])) for c in global_group_labels], closed='right')
+                        bins = pd.cut(values, bins=interval_bins, right=True)
+                        labels = bins.astype(str)
+                        group_colors = labels.map(global_color_map_dict).values
+
+                    if labels is not None and global_group_labels is not None:
+                        present_labels = pd.Series(labels).dropna().unique()
+                        legend_handles = [
+                            Line2D([0], [0], marker='o', color='w', label=label,
+                                   markerfacecolor=global_color_map_dict[label],
+                                   markeredgecolor='k', markersize=6)
+                            for label in global_group_labels if label in present_labels
+                        ]
+
+            if len(y_val_clean) == 0 or len(y_pred_clean) == 0:
+                ax.set_title(f"{model_name} - Fold {fold_pred['fold']}: No valid data")
+                ax.text(0.5, 0.5, "No data", ha='center', va='center', fontsize=12)
+                ax.axis('off')
+                continue
+
+            if group_colors is not None and legend_handles:
+                # Filter out points where color could not be determined
+                valid_color_mask = ~pd.isna(group_colors)
+                ax.scatter(y_val_clean[valid_color_mask], y_pred_clean[valid_color_mask], c=group_colors[valid_color_mask], alpha=0.7, edgecolor='k', s=40)
+                if legend_handles:
+                    ax.legend(handles=legend_handles, title="Group", loc="lower right", fontsize=8)
+            else:
+                ax.scatter(y_val_clean, y_pred_clean, alpha=0.5, s=40)
+
+            # Use global min/max for all folds
+            ax.plot([global_min, global_max], [global_min, global_max], 'r--', lw=1)
+            ax.set_xlim(global_min, global_max)
+            ax.set_ylim(global_min, global_max)
+            # Title with model, fold, and val groups
+            val_groups = fold_pred.get('val_groups', None)
+            if val_groups is not None:
+                val_groups_str = ', '.join(str(int(g)) if isinstance(g, (int, float)) and float(g).is_integer() else str(g) for g in val_groups)
+                ax.set_title(f"{model_name} - Fold {fold_pred['fold']}: Val set ({val_groups_str})")
+            else:
+                ax.set_title(f"{model_name} - Fold {fold_pred['fold']}")
+            ax.set_xlabel("Observed")
+            ax.set_ylabel("Predicted")
+            ax.set_aspect('equal', 'box')
+            # Regression line
+            if len(y_val_clean) > 1 and len(y_pred_clean) > 1:
+                coef = np.polyfit(y_val_clean, y_pred_clean, 1)
+                reg_line = np.poly1d(coef)
+                x_vals = np.linspace(global_min, global_max, 100)
+                ax.plot(x_vals, reg_line(x_vals), 'k--', lw=1)
+            # Metrics
+            r2 = r2_score(y_val_clean, y_pred_clean)
+            rmse = np.sqrt(mean_squared_error(y_val_clean, y_pred_clean))
+            bias = np.mean(y_pred_clean - y_val_clean)
+            ax.text(0.05, 0.95, f"R²: {r2:.2f}\nRMSE: {rmse:.2f}\nBias: {bias:.2f}",
+                    transform=ax.transAxes, fontsize=9, verticalalignment='top',
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
+    # Hide unused axes
+    for i in range(n_models):
+        for j in range(len(model_groups[model_names[i]]), n_folds):
+            axes[i, j].axis('off')
+    plt.tight_layout(rect=(0, 0.03, 1, 0.96))
+    return fig
 
 def plot_residuals(
     X_train,
@@ -307,200 +520,6 @@ def plot_residuals(
 
     return figs
 
-
-def plot_cv_folds_observed_vs_predicted(
-    fold_preds,
-    target,
-    sup_title="CV Folds Observed vs Predicted",
-    group_prefix=None,
-    group_label_map=None,
-    group_numeric_column=None,
-    columns_to_transform=None,
-    n_bins=5,
-    cmap_name="viridis",
-    log_transformer=None,
-    model_dir="final_models"
-):
-    """
-    fold_preds: list of dicts with keys 'fold', 'X_val', 'target', 'model', and optionally 'val_groups'.
-    Plots a grid: rows = models, columns = folds. Each subplot is a scatter for a model/fold.
-    Supports group coloring and log-transform inversion.
-    """
-    from pathlib import Path
-
-    # --- Global group and color mapping ---
-    global_group_labels = None
-    global_cmap = None
-    global_color_map_dict = None
-
-    if group_prefix and group_label_map:
-        all_labels = set()
-        for d in fold_preds:
-            X_val_df = pd.DataFrame(d['X_val'])
-            dummy_cols = [col for col in X_val_df.columns if col.startswith(group_prefix)]
-            if dummy_cols:
-                suffixes = X_val_df[dummy_cols].idxmax(axis=1).str.replace(group_prefix, '', regex=False)
-                labels = suffixes.map(lambda s: fuzzy_map_suffix(s, group_label_map))
-                all_labels.update(labels.dropna().unique())
-        
-        if all_labels:
-            global_group_labels = sorted(list(all_labels))
-            cmap_obj = plt.cm.get_cmap('viridis', len(global_group_labels))
-            global_color_map_dict = {label: cmap_obj(i) for i, label in enumerate(global_group_labels)}
-
-    elif group_numeric_column:
-        all_values = pd.concat([pd.DataFrame(d['X_val'])[group_numeric_column] for d in fold_preds if group_numeric_column in pd.DataFrame(d['X_val']).columns]).dropna()
-        if not all_values.empty:
-            # Ensure all_values is a Series for qcut
-            if isinstance(all_values, pd.DataFrame):
-                all_values = all_values.iloc[:, 0]
-            bins = pd.qcut(all_values, q=n_bins, duplicates='drop', labels=False, retbins=True)[1]
-            bin_labels = [f'({bins[i]:.2f}, {bins[i+1]:.2f}]' for i in range(len(bins)-1)]
-            global_group_labels = sorted(bin_labels)
-            cmap_obj = plt.cm.get_cmap(cmap_name, len(global_group_labels))
-            global_color_map_dict = {label: cmap_obj(i) for i, label in enumerate(global_group_labels)}
-
-
-    model_groups = defaultdict(list)
-    for d in fold_preds:
-        model_groups[d['model']].append(d)
-    model_names = list(model_groups.keys())
-    n_models = len(model_names)
-    n_folds = max(len(v) for v in model_groups.values()) if n_models > 0 else 1
-    fig, axes = plt.subplots(n_models, n_folds, figsize=(5 * n_folds, 5 * n_models))
-    if n_models == 1:
-        axes = np.atleast_2d(axes)
-    elif n_folds == 1:
-        axes = np.atleast_2d(axes).T
-    fig.suptitle(f"{sup_title}\nTarget: {target}", fontsize=18)
-
-    # --- Compute global min/max for all folds for consistent axis scaling ---
-    all_y_vals = []
-    all_y_preds = []
-    for model_folds in model_groups.values():
-        for fold_pred in model_folds:
-            #os.path.join(model_dir, f"{target.replace('/', '_')}_{model_name}.pkl")
-            model_file = Path(model_dir) / f"{fold_pred['target'].replace('/', '_')}_{fold_pred['model']}_fold_{fold_pred['fold']}.pkl"
-            if not model_file.exists():
-                raise FileNotFoundError(f"Model file {model_file} not found.")
-            model = joblib.load(model_file)
-            X_val = fold_pred['X_val']
-            y_val = np.array(fold_pred['y_val'])
-            y_pred = np.array(model.predict(X_val))
-            # Inverse transform for log-transformed targets
-            is_log = columns_to_transform and target in columns_to_transform
-            if is_log and log_transformer is not None:
-                y_pred = log_transformer.inverse_transform(y_pred)
-            valid_mask = (~pd.isna(y_val)) & (~pd.isna(y_pred))
-            all_y_vals.append(y_val[valid_mask])
-            all_y_preds.append(y_pred[valid_mask])
-    if all_y_vals and all_y_preds:
-        global_min = min(np.min(np.concatenate(all_y_vals)), np.min(np.concatenate(all_y_preds)))
-        global_max = max(np.max(np.concatenate(all_y_vals)), np.max(np.concatenate(all_y_preds)))
-    else:
-        global_min, global_max = 0, 1
-
-    for i, model_name in enumerate(model_names):
-        model_folds = sorted(model_groups[model_name], key=lambda d: d['fold'])
-        for j, fold_pred in enumerate(model_folds):
-            ax = axes[i, j]
-            model_file = Path(model_dir) / f"{fold_pred['target']}_{fold_pred['model']}_fold_{fold_pred['fold']}.pkl"
-            model = joblib.load(model_file)
-            X_val = fold_pred['X_val']
-            y_val = np.array(fold_pred['y_val'])
-            y_pred = np.array(model.predict(X_val))
-            # Inverse transform for log-transformed targets
-            is_log = columns_to_transform and target in columns_to_transform
-            if is_log and log_transformer is not None:
-                y_pred = log_transformer.inverse_transform(y_pred)
-            # Filter out NaNs
-            valid_mask = (~pd.isna(y_val)) & (~pd.isna(y_pred))
-            y_val_clean = y_val[valid_mask]
-            y_pred_clean = y_pred[valid_mask]
-            
-            # Group label coloring (optional)
-            group_colors = None
-            legend_handles = None
-            labels = None
-
-            if (group_prefix and group_label_map) or group_numeric_column:
-                if X_val is not None and valid_mask.sum() > 0 and global_color_map_dict:
-                    X_val_df = pd.DataFrame(X_val).reset_index(drop=True)
-                    valid_idx = np.where(valid_mask)[0]
-                    X_val_valid = X_val_df.iloc[valid_idx]
-
-                    if group_prefix:
-                        dummy_cols = [col for col in X_val_valid.columns if col.startswith(group_prefix)]
-                        if dummy_cols:
-                            suffixes = X_val_valid[dummy_cols].idxmax(axis=1).str.replace(group_prefix, '', regex=False)
-                            labels = suffixes.map(lambda s: fuzzy_map_suffix(s, group_label_map))
-                            group_colors = labels.map(global_color_map_dict).values
-                    
-                    elif group_numeric_column and group_numeric_column in X_val_valid.columns and global_group_labels:
-                        values = X_val_valid[group_numeric_column]
-                        # Find which global bin each value belongs to
-                        interval_bins = pd.IntervalIndex.from_tuples([(float(c.strip('()[]').split(', ')[0]), float(c.strip('()[]').split(', ')[1])) for c in global_group_labels], closed='right')
-                        bins = pd.cut(values, bins=interval_bins, right=True)
-                        labels = bins.astype(str)
-                        group_colors = labels.map(global_color_map_dict).values
-
-                    if labels is not None and global_group_labels is not None:
-                        present_labels = pd.Series(labels).dropna().unique()
-                        legend_handles = [
-                            Line2D([0], [0], marker='o', color='w', label=label,
-                                   markerfacecolor=global_color_map_dict[label],
-                                   markeredgecolor='k', markersize=6)
-                            for label in global_group_labels if label in present_labels
-                        ]
-
-            if len(y_val_clean) == 0 or len(y_pred_clean) == 0:
-                ax.set_title(f"{model_name} - Fold {fold_pred['fold']}: No valid data")
-                ax.text(0.5, 0.5, "No data", ha='center', va='center', fontsize=12)
-                ax.axis('off')
-                continue
-
-            if group_colors is not None and legend_handles:
-                # Filter out points where color could not be determined
-                valid_color_mask = ~pd.isna(group_colors)
-                ax.scatter(y_val_clean[valid_color_mask], y_pred_clean[valid_color_mask], c=group_colors[valid_color_mask], alpha=0.7, edgecolor='k', s=40)
-                if legend_handles:
-                    ax.legend(handles=legend_handles, title="Group", loc="lower right", fontsize=8)
-            else:
-                ax.scatter(y_val_clean, y_pred_clean, alpha=0.5, s=40)
-
-            # Use global min/max for all folds
-            ax.plot([global_min, global_max], [global_min, global_max], 'r--', lw=1)
-            ax.set_xlim(global_min, global_max)
-            ax.set_ylim(global_min, global_max)
-            # Title with model, fold, and val groups
-            val_groups = fold_pred.get('val_groups', None)
-            if val_groups is not None:
-                val_groups_str = ', '.join(str(int(g)) if isinstance(g, (int, float)) and float(g).is_integer() else str(g) for g in val_groups)
-                ax.set_title(f"{model_name} - Fold {fold_pred['fold']}: Val set ({val_groups_str})")
-            else:
-                ax.set_title(f"{model_name} - Fold {fold_pred['fold']}")
-            ax.set_xlabel("Observed")
-            ax.set_ylabel("Predicted")
-            ax.set_aspect('equal', 'box')
-            # Regression line
-            if len(y_val_clean) > 1 and len(y_pred_clean) > 1:
-                coef = np.polyfit(y_val_clean, y_pred_clean, 1)
-                reg_line = np.poly1d(coef)
-                x_vals = np.linspace(global_min, global_max, 100)
-                ax.plot(x_vals, reg_line(x_vals), 'k--', lw=1)
-            # Metrics
-            r2 = r2_score(y_val_clean, y_pred_clean)
-            rmse = np.sqrt(mean_squared_error(y_val_clean, y_pred_clean))
-            bias = np.mean(y_pred_clean - y_val_clean)
-            ax.text(0.05, 0.95, f"R²: {r2:.2f}\nRMSE: {rmse:.2f}\nBias: {bias:.2f}",
-                    transform=ax.transAxes, fontsize=9, verticalalignment='top',
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
-    # Hide unused axes
-    for i in range(n_models):
-        for j in range(len(model_groups[model_names[i]]), n_folds):
-            axes[i, j].axis('off')
-    plt.tight_layout(rect=(0, 0.03, 1, 0.96))
-    return fig
 def plot_feature_importances(model_file, X, bands_csv_path=None, worldclim_csv_path=None, top_n=20, title=None):
     """
     Plot and return a matplotlib figure for feature importances for a fitted model pipeline.
