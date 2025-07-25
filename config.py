@@ -15,6 +15,7 @@ class Config:
 
         # General settings
         self.DATA_FOLDER = self._get_config('DATA_FOLDER', 'doukkala_ssl_datasets')
+        self.DATA_FILE = self._get_config('DATA_FILE', 'data.csv')
         self.OUTPUT_FOLDER = self._get_config('OUTPUT_FOLDER', 'outputs')
         self.SOIL_GROUPS_FILE_PATH = self._get_config('SOIL_GROUPS_FILE_PATH', 'soil_groups.txt')
         self.RANDOM_SEED = self._get_config('RANDOM_SEED', random.randint(0, 1000000))

@@ -10,14 +10,12 @@ class DataManager:
         self.logger = logger
 
     def load_data(self) -> pd.DataFrame:
-        """Load and return the initial dataset."""
-        csv_files = [f for f in os.listdir(self.config.DATA_FOLDER) if f.endswith('.csv')]
-        self.logger.info(f"Found data files: {csv_files}")
-        
-        if not csv_files:
-            raise FileNotFoundError(f"No CSV files found in {self.config.DATA_FOLDER}")
-            
-        return pd.read_csv(os.path.join(self.config.DATA_FOLDER, csv_files[0]))
+        """Load and return the initial dataset from the CSV file specified in DATA_FOLDER and DATA_FILE_NAME."""
+        data_path = os.path.join(self.config.DATA_FOLDER, self.config.DATA_FILE_NAME)
+        self.logger.info(f"Loading data from file: {data_path}")
+        if not os.path.isfile(data_path):
+            raise FileNotFoundError(f"CSV file not found: {data_path}")
+        return pd.read_csv(data_path)
         
     def preprocess_data(self, data: pd.DataFrame) -> Dict:
         """Preprocess the data and return prepared datasets."""
