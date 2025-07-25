@@ -10,8 +10,8 @@ class DataManager:
         self.logger = logger
 
     def load_data(self) -> pd.DataFrame:
-        """Load and return the initial dataset from the CSV file specified in DATA_FOLDER and DATA_FILE_NAME."""
-        data_path = os.path.join(self.config.DATA_FOLDER, self.config.DATA_FILE_NAME)
+        """Load and return the initial dataset from the CSV file specified in DATA_FOLDER and DATA_FILE."""
+        data_path = os.path.join(self.config.DATA_FOLDER, self.config.DATA_FILE)
         self.logger.info(f"Loading data from file: {data_path}")
         if not os.path.isfile(data_path):
             raise FileNotFoundError(f"CSV file not found: {data_path}")
