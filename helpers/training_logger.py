@@ -1,7 +1,7 @@
 import logging
 import os
 import sys
-from datetime import datetime
+import tempfile
 
 class TrainingLogger:
     """
@@ -9,7 +9,9 @@ class TrainingLogger:
     Logs are written to both console and a timestamped log file.
     """
 
-    def __init__(self, name: str = 'ML', log_dir: str = 'logs') -> None:
+    def __init__(self, name: str = 'ML', 
+                 log_dir: str = os.path.join(tempfile.TemporaryDirectory().name, "logs"), 
+                 log_filename: str = "logger") -> None:
         """
         Initialize the logger with a given name and log directory.
 
@@ -20,9 +22,11 @@ class TrainingLogger:
         self.logger: logging.Logger = logging.getLogger(name)
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
-        self._setup_handlers(log_dir, name)
+        self.log_dir = log_dir 
+        self.log_filename = log_filename
+        self._setup_handlers()
 
-    def _setup_handlers(self, log_dir: str, name: str) -> None:
+    def _setup_handlers(self) -> None:
         """
         Sets up file and stream handlers for the logger.
 
@@ -33,9 +37,8 @@ class TrainingLogger:
         if self.logger.hasHandlers():
             self.logger.handlers.clear()
 
-        timestamp: str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        log_file: str = os.path.join(log_dir, f"{name}_training_{timestamp}.log")
-        os.makedirs(log_dir, exist_ok=True)
+        self.log_file: str = os.path.join(self.log_dir, f"{self.log_filename}_training.log")
+        os.makedirs(self.log_dir, exist_ok=True)
 
         formatter: logging.Formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -44,7 +47,7 @@ class TrainingLogger:
         stream_handler: logging.StreamHandler = logging.StreamHandler(sys.stdout)
         stream_handler.setFormatter(formatter)
 
-        file_handler: logging.FileHandler = logging.FileHandler(log_file)
+        file_handler: logging.FileHandler = logging.FileHandler(self.log_file)
         file_handler.setFormatter(formatter)
 
         self.logger.addHandler(stream_handler)
