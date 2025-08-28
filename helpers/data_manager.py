@@ -1,7 +1,9 @@
 from .model_config_factory import ModelConfigFactory, BaseSpatialClusterStrategy
-import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
+import pandas as pd
+import mlflow
 import os
+import tempfile
 from typing import Dict
 
 class DataManager:
@@ -68,7 +70,7 @@ class DataManager:
         lon = processed_data['Longitude_X']
         splitted_data = {}
 
-        if self.config.ENABLE_CLUSTERING and not (self.config.CV_ONLY_MODE.get("enabled", True) is True):
+        if self.config.ENABLE_CLUSTERING:
             groups = processed_data['groups']
             """Split data into training and test sets."""
             self.logger.info("Splitting dataset into train and test groups using GroupShuffleSplit...")
@@ -93,6 +95,15 @@ class DataManager:
             )
         
         self.logger.info(f"Train: {len(X_train)} rows | Test: {len(X_test)} rows")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            X_train.to_parquet(os.path.join(tmpdir, "X_train.parquet"), index=False)
+            X_test.to_parquet(os.path.join(tmpdir, "X_test.parquet"), index=False)
+            y_train.to_parquet(os.path.join(tmpdir, "y_train.parquet"), index=False)
+            y_test.to_parquet(os.path.join(tmpdir, "y_test.parquet"), index=False)
+
+            # Log them as artifacts
+            mlflow.log_artifacts(tmpdir, artifact_path="data_splits")
         
         splitted_data['X_train'] = X_train
         splitted_data['X_test'] = X_test
