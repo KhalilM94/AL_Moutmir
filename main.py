@@ -29,6 +29,7 @@ class SoilModelTraining:
         self.logger.info("Starting full training process for all targets...")
         X_key = "X_train" if "X_train" in data else "X"
         trainer = ModelTrainer(
+            config=self.config,
             columns_to_transform=self.config.COLUMNS_TO_TRANSFORM,
             enable_clustering =self.config.ENABLE_CLUSTERING,
             split_strategy=self.config.SPLIT_STRATEGY,

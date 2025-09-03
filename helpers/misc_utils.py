@@ -1,12 +1,10 @@
 from sklearn.base import BaseEstimator, TransformerMixin
 import numpy as np
-import re
-import unicodedata
-import pandas as pd
-from collections.abc import Iterable
+import geopandas as gpd
+from shapely.geometry import box
+from pyproj import CRS
 from sklearn.metrics import make_scorer, root_mean_squared_error
 from mlflow.models import make_metric
-import numpy as np
 
 class LogTransformer(BaseEstimator, TransformerMixin):
     def transform(self, y):
@@ -15,34 +13,65 @@ class LogTransformer(BaseEstimator, TransformerMixin):
     def inverse_transform(self, y):
         return np.expm1(y / 10)
 
-def sanitize_names(names: Iterable[str]):
-    """
-    Sanitize column or list of names:
-    - Normalize Unicode (NFKC)
-    - Replace special characters, dashes, and whitespace with underscores
-    - Collapse multiple consecutive underscores
-    - Strip leading/trailing underscores
-    """
-    sanitized = []
-    for name in names:
-        # Normalize hidden Unicode forms
-        clean_name = unicodedata.normalize("NFKC", name)
+def _infer_utm_crs(lon_series, lat_series):
+    lon_mean = lon_series.mean()
+    lat_mean = lat_series.mean()
+    zone = int((lon_mean + 180) // 6) + 1
+    epsg = 32600 + zone if lat_mean >= 0 else 32700 + zone
+    return CRS.from_epsg(epsg)
 
-        # Replace unwanted chars (including '-') with underscores
-        clean_name = re.sub(r"[\/:.\%\"'()\[\]\s-]+", "_", clean_name)
+def assign_grid_ids(df, cell_size_m, lon_col='Longitude_X', lat_col='Latitude_Y'):
+    """Assign each point to a grid cell and return (grid_id array, grid_gdf)."""
+    if isinstance(df, gpd.GeoDataFrame):
+        gdf_wgs = df.copy()
+        if gdf_wgs.crs is None:
+            gdf_wgs.set_crs('EPSG:4326', inplace=True)
+        elif gdf_wgs.crs.to_epsg() != 4326:
+            gdf_wgs = gdf_wgs.to_crs(4326)
+    else:
+        gdf_wgs = gpd.GeoDataFrame(
+            df.copy(),
+            geometry=gpd.points_from_xy(df[lon_col], df[lat_col]),
+            crs='EPSG:4326'
+        )
 
-        # Collapse multiple underscores
-        clean_name = re.sub(r"_+", "_", clean_name)
+    utm_crs = _infer_utm_crs(gdf_wgs[lon_col], gdf_wgs[lat_col])
+    gdf_utm = gdf_wgs.to_crs(utm_crs)
 
-        # Remove leading/trailing underscores
-        clean_name = clean_name.strip("_")
+    xmin, ymin, xmax, ymax = gdf_utm.total_bounds
+    width, height = xmax - xmin, ymax - ymin
 
-        sanitized.append(clean_name)
+    if cell_size_m is None or cell_size_m <= 0:
+        raise ValueError("cell_size_m must be a positive number.")
+    if cell_size_m < 100:
+        raise ValueError(f"cell_size_m={cell_size_m} too small (meters expected).")
+    if cell_size_m > max(width, height):
+        raise ValueError(f"cell_size_m={cell_size_m} exceeds dataset extent ({max(width, height):.1f}).")
 
-    # Keep same type as input
-    if isinstance(names, pd.Index):
-        return pd.Index(sanitized, name=names.name)
-    return sanitized
+    nx = max(1, int(np.ceil(width / cell_size_m)))
+    ny = max(1, int(np.ceil(height / cell_size_m)))
+
+    xs, ys = gdf_utm.geometry.x, gdf_utm.geometry.y
+    col = np.clip(((xs - xmin) / cell_size_m).astype(int), 0, nx - 1)
+    row = np.clip(((ys - ymin) / cell_size_m).astype(int), 0, ny - 1)
+    grid_id = (row * nx + col).astype(int)
+
+    # Polygons for plotting
+    occupied_cells = set(zip(row, col))
+    grid_polys_utm, grid_ids = [], []
+    for r in range(ny):
+        y0, y1 = ymin + r * cell_size_m, min(ymin + (r + 1) * cell_size_m, ymax)
+        for c in range(nx):
+            if (r, c) not in occupied_cells:
+                continue
+            x0, x1 = xmin + c * cell_size_m, min(xmin + (c + 1) * cell_size_m, xmax)
+            grid_polys_utm.append(box(x0, y0, x1, y1))
+            grid_ids.append(r * nx + c)
+
+    grid_gdf_utm = gpd.GeoDataFrame({"Grid_ID": grid_ids}, geometry=grid_polys_utm, crs=utm_crs)
+    grid_gdf = grid_gdf_utm.to_crs(4326)
+
+    return grid_id, grid_gdf
 
 def rpd_score(predictions, targets):
     """RPD: Ratio of Performance to Deviation."""

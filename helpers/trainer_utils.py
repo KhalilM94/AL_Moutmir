@@ -48,17 +48,7 @@ class CVSplitter:
         else:
             raise ValueError(f"Unsupported CV strategy: {self.cv_strategy}")
 
-        # Prepare fold assignment series with -1 default (for samples not assigned)
-        indices = X.index if hasattr(X, 'index') else range(len(X))
-
-        fold_assignments = pd.Series(data=-1, index=indices)
-
-        for fold_number, (_, test_idx) in enumerate(splits):
-            fold_assignments.iloc[test_idx] = fold_number
-
-        fold_info_df = pd.DataFrame({'index': fold_assignments.index, 'fold': fold_assignments.values})
-
-        return splits, fold_info_df
+        return splits
 
 class TargetNanFilter(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):

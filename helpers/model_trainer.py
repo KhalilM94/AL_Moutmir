@@ -2,6 +2,7 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.base import clone
 import pandas as pd
 from typing import Optional, List, Dict
+import traceback
 
 from .training_logger import TrainingLogger
 from .mlflow_loggers import ChildRunLogger
@@ -11,6 +12,7 @@ from .misc_utils import LogTransformer
 class ModelTrainer:
     def __init__(
         self,
+        config,
         columns_to_transform: Optional[List[str]] = None,
         enable_clustering: bool = False,
         split_strategy: str = 'kfold',
@@ -19,6 +21,7 @@ class ModelTrainer:
         logger= None,
         tuning_verbose: int = 0
     ):
+        self.config = config
         self.columns_to_transform = columns_to_transform or []
         self.enable_clustering = enable_clustering
         self.split_strategy = split_strategy
@@ -64,7 +67,7 @@ class ModelTrainer:
                     self.logger.info(f"Training {model_name} for {target}")
 
                     cv_splitter = CVSplitter(cv_strategy=self.split_strategy, n_splits=self.n_splits, random_state=self.seed)
-                    splits, _ = cv_splitter.create_splits(X_train, y_train, groups_train)
+                    splits = cv_splitter.create_splits(X_train, y_train, groups_train)
 
                     model = config["model"]
                     params = config.get("params", {})
@@ -113,6 +116,7 @@ class ModelTrainer:
                         plot_func.update({cv_plot: {"args": [cv_results]}})
 
                     mlflow_logger.log_child_run(
+                        config=self.config,
                         search=search,
                         cv_results=cv_results,
                         best_model=best_model,
@@ -126,6 +130,7 @@ class ModelTrainer:
 
                 except Exception as e:
                     self.logger.warning(f"Training failed for {model_name} on {target}: {e}")
+                    print(f"Exception caught:\n{traceback.format_exc()}")
 
         else:
             self.logger.warning(f"Skipping training for target {target} due to insufficient data.")

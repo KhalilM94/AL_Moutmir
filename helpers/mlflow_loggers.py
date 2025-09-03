@@ -64,6 +64,7 @@ class ChildRunLogger:
 
     def log_child_run(
         self,
+        config,
         search,
         cv_results,
         best_model,
@@ -83,7 +84,12 @@ class ChildRunLogger:
                 "model_name": model_name
             })
             # --- Params ---
+            mlflow.log_params({
+                "cell_size_m": config.CLUSTERING_STRATEGY.get('params', {}).get('cell_size_m', None) if config.ENABLE_CLUSTERING else None,
+                "n_clusters": config.CLUSTERING_STRATEGY.get('params', {}).get('n_clusters', None) if config.ENABLE_CLUSTERING else None,
+            })
             mlflow.log_params(search.best_params_)
+
             # --- Model ---
             signature = infer_signature(X_test, best_model.predict(X_test))
             model_info = mlflow.sklearn.log_model(sk_model=best_model,  # type: ignore
@@ -204,7 +210,9 @@ class ParentRunLogger:
             "TARGET_COLUMNS": trainer.config.TARGET_COLUMNS,
             "COLUMNS_TO_TRANSFORM": [column for column in trainer.config.COLUMNS_TO_TRANSFORM
                                      if column in trainer.config.TARGET_COLUMNS],
-            "CLUSTERING_STRATEGY": trainer.config.CLUSTERING_STRATEGY.get('class_path').rsplit('.', 1)[1] if trainer.config.ENABLE_CLUSTERING else None
+            "CLUSTERING_STRATEGY": trainer.config.CLUSTERING_STRATEGY.get('class_path').rsplit('.', 1)[1] if trainer.config.ENABLE_CLUSTERING else None,
+            "cell_size_m": trainer.config.CLUSTERING_STRATEGY.get('params', {}).get('cell_size_m', None) if trainer.config.ENABLE_CLUSTERING else None,
+            "n_clusters": trainer.config.CLUSTERING_STRATEGY.get('params', {}).get('n_clusters', None) if trainer.config.ENABLE_CLUSTERING else None,
         })
 
         # 1. Fetch child runs

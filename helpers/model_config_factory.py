@@ -4,6 +4,14 @@ from dataclasses import dataclass
 from typing import Optional
 import pandas as pd
 from sklearn.cluster import KMeans
+from .misc_utils import assign_grid_ids
+
+import matplotlib.pyplot as plt
+import tempfile
+import os
+import mlflow
+import numpy as np
+
 
 class BaseSpatialClusterStrategy(ABC):
     """
@@ -16,6 +24,70 @@ class BaseSpatialClusterStrategy(ABC):
         Clusters the input DataFrame spatially and adds a 'cluster' column.
         """
         pass
+
+    def plot_train_test(
+        self,
+        df: pd.DataFrame,
+        train_idx: np.ndarray,
+        test_idx: np.ndarray,
+        lon_col: str = "Longitude_X",
+        lat_col: str = "Latitude_Y",
+        title: str = "Train/Test Split",
+        artifact_path: str = "splits_plots",
+        filename: str = "train_test_split.png",
+        show: bool = False,
+    ):
+        """
+        Plot clustered points with train/test coloring, save to temp file,
+        and log to MLflow as an artifact.
+        """
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+
+        # plot train points
+        ax.scatter(
+            df.loc[train_idx, lon_col],
+            df.loc[train_idx, lat_col],
+            c="blue",
+            s=12,
+            alpha=0.6,
+            label="Train",
+            zorder=2,
+        )
+
+        # plot test points
+        ax.scatter(
+            df.loc[test_idx, lon_col],
+            df.loc[test_idx, lat_col],
+            c="red",
+            s=20,
+            alpha=0.8,
+            label="Test",
+            marker="x",
+            zorder=3,
+        )
+
+        # overlay grid boundaries if available on this strategy
+        grid_gdf = getattr(self, "grid_gdf_", None)
+        if grid_gdf is not None:
+            grid_gdf.boundary.plot(ax=ax, color="lightgray", linewidth=0.5, zorder=1)
+
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.set_title(title)
+        ax.legend()
+        plt.tight_layout()
+
+        # save to temp file and log to MLflow
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, filename)
+            fig.savefig(filepath, dpi=150, bbox_inches="tight")
+            mlflow.log_artifact(filepath, artifact_path=artifact_path)
+
+        if show:
+            plt.show()
+
+        plt.close(fig)
 
 @dataclass
 class KMeansClusterStrategy(BaseSpatialClusterStrategy):
@@ -48,26 +120,33 @@ class KMeansClusterStrategy(BaseSpatialClusterStrategy):
         return df.dropna(subset=['cluster'])
 
 @dataclass
-class GridClusterStrategy(BaseSpatialClusterStrategy):
+class SpatialGridClusterStrategy(BaseSpatialClusterStrategy):
     """
-    Grid-based spatial clustering using a regular grid of fixed size (in degrees).
+    Regular grid-based spatial clustering.
+
+    Parameters
+    ----------
+    cell_size_m : int
+        Size of each grid cell in meters.
+    lat_col : str, default='Latitude_Y'
+        Latitude column in the DataFrame.
+    lon_col : str, default='Longitude_X'
+        Longitude column in the DataFrame.
     """
-    grid_size: float = 0.1  # e.g., 0.1 degrees
-    lat_col: str = 'Latitude_Y'
-    lon_col: str = 'Longitude_X'
+
+    cell_size_m: int
+    lat_col: str = "Latitude_Y"
+    lon_col: str = "Longitude_X"
+    random_state: int = 42
 
     def cluster(self, df: pd.DataFrame) -> pd.DataFrame:
-        coords = df[[self.lat_col, self.lon_col]].dropna()
-
-        lat_grid = (coords[self.lat_col] // self.grid_size).astype(int)
-        lon_grid = (coords[self.lon_col] // self.grid_size).astype(int)
-
-        # Create combined grid cell label and encode it as numeric cluster ID
-        labels = (lat_grid.astype(str) + "_" + lon_grid.astype(str)).astype('category').cat.codes + 1
-
         df = df.copy()
-        df.loc[coords.index, 'cluster'] = labels
-        return df.dropna(subset=['cluster'])
+        grid_ids, grid_gdf = assign_grid_ids(
+            df, cell_size_m=self.cell_size_m, lon_col=self.lon_col, lat_col=self.lat_col
+        )
+        df["cluster"] = grid_ids.astype(int)
+        self.grid_gdf_ = grid_gdf  # save polygons for later plotting
+        return df
 
 @dataclass
 class ModelConfigFactory:

@@ -225,11 +225,16 @@ def create_parent_pred_obs(eval_dfs):
     n_cols = len(models)
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 5*n_rows))
-    if n_rows == 1:
-        axes = [axes]  # ensure iterable
+    
+    # Normalize axes shape → always 2D array (n_rows, n_cols)
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = np.array([axes])  # shape (1, n_cols)
+    elif n_cols == 1:
+        axes = axes[:, np.newaxis]  # shape (n_rows, 1)
 
     for i, target in enumerate(targets):
-        row_axes = axes[i] if n_rows > 1 else axes
         for j, model in enumerate(models):
             # Subset the correct eval_df
             df = next(df for df in eval_dfs if df["target_name"].iloc[0] == target and df["model_name"].iloc[0] == model)
@@ -237,7 +242,7 @@ def create_parent_pred_obs(eval_dfs):
             y_pred = df["prediction"]
 
             # Panel 1: Predicted vs Actual
-            ax1 = row_axes[j]
+            ax1 = axes[i, j]
             sns.regplot(x=y_test, y=y_pred, ax=ax1,
                         scatter_kws={'alpha': 0.6, 'edgecolor': 'k'},
                         line_kws={'color': 'blue'})
@@ -300,7 +305,7 @@ def plot_leaderboard_scatter(leaderboard_df, metric_x="rmse_test", metric_y="r2_
     n_rows = int(np.ceil(n_targets / n_cols)) or 1
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 5*n_rows))
-    axes = axes.flatten()
+    axes = np.atleast_1d(axes).flatten()
 
     for ax, target in zip(axes, targets):
         df_target = leaderboard_df[leaderboard_df[hue_col] == target]

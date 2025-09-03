@@ -20,27 +20,17 @@ class DataManager:
         return pd.read_csv(data_path)
         
     def preprocess_data(self, data: pd.DataFrame) -> Dict:
-        """Preprocess the data and return prepared datasets."""
-        self.logger.info(f"Clustering dataset based on {self.config.CLUSTERING_STRATEGY.get('class_path').rsplit('.', 1)[1]}...")
-        
-        self.cluster_strategy = ModelConfigFactory(self.config.CLUSTERING_STRATEGY, self.config.RANDOM_SEED).load_splitter_from_config()
-        if isinstance(self.cluster_strategy, BaseSpatialClusterStrategy):
-            self.cluster_strategy
-            clustered_data = self.cluster_strategy.cluster(data)
-            self.logger.info(f"Cluster value counts:\n{clustered_data['cluster'].value_counts().to_string()}")
-        else:
-             clustered_data = data
         
         # Get feature columns
-        feature_columns = [col for col in clustered_data.columns 
+        feature_columns = [col for col in data.columns 
                           if col not in self.config.TARGET_COLUMNS + 
                           self.config.ELIMINATED_FEATURES + 
                           self.config.EXCLUDE_CATEGORICAL +
                           self.config.IGNORE_BANDS]
         
         # Prepare feature matrix
-        valid_feature_columns = clustered_data[feature_columns].dropna(axis=1, how='all').columns.tolist()
-        X = clustered_data[valid_feature_columns]
+        valid_feature_columns = data[feature_columns].dropna(axis=1, how='all').columns.tolist()
+        X = data[valid_feature_columns]
         
         # One-hot encoding if needed
         categorical_cols = [col for col in self.config.CATEGORICAL_FEATURES 
@@ -51,16 +41,14 @@ class DataManager:
             
         # Fill remaining NaNs with column means
         X = X.apply(lambda row: row.fillna(row.mean()), axis=1)
-        clustered_cleaned = clustered_data.loc[X.index]
+        data_cleaned = data.loc[X.index]
 
         preprocessed =  {
             'X' : X,
-            'y': clustered_cleaned[self.config.TARGET_COLUMNS],
-            'Latitude_Y': clustered_data['Latitude_Y'],
-            'Longitude_X': clustered_data['Longitude_X']
+            'y': data_cleaned[self.config.TARGET_COLUMNS],
+            'Latitude_Y': data_cleaned['Latitude_Y'],
+            'Longitude_X': data_cleaned['Longitude_X']
         }
-        if self.config.ENABLE_CLUSTERING:
-            preprocessed['groups'] = clustered_cleaned['cluster']
         return preprocessed
         
     def split_data(self, processed_data: Dict) -> Dict:
@@ -70,31 +58,53 @@ class DataManager:
         lon = processed_data['Longitude_X']
         splitted_data = {}
 
+        X_train = X_test = y_train = y_test = pd.DataFrame()
+        lat_train = lat_test = lon_train = lon_test = pd.Series()
+        
         if self.config.ENABLE_CLUSTERING:
-            groups = processed_data['groups']
-            """Split data into training and test sets."""
-            self.logger.info("Splitting dataset into train and test groups using GroupShuffleSplit...")
-            gss = GroupShuffleSplit(n_splits=1, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_SEED)
-            train_idx, test_idx = next(gss.split(X, y, groups=groups))
-            
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-            lat_train, lat_test = lat.iloc[train_idx], lat.iloc[test_idx]
-            lon_train, lon_test = lon.iloc[train_idx], lon.iloc[test_idx]
-            groups_train, groups_test = groups.iloc[train_idx], groups.iloc[test_idx]
+            """Preprocess the data and return prepared datasets."""
+            self.logger.info(f"Clustering dataset based on {self.config.CLUSTERING_STRATEGY.get('class_path').rsplit('.', 1)[1]}...")
 
-            splitted_data['groups_train'] = groups_train
-            splitted_data['groups_test'] = groups_test
-            self.logger.info(f"Train group distribution:\n{groups_train.value_counts().sort_index().to_string()}")
-            self.logger.info(f"Test group distribution:\n{groups_test.value_counts().sort_index().to_string()}")
+            self.cluster_strategy = ModelConfigFactory(self.config.CLUSTERING_STRATEGY, self.config.RANDOM_SEED).load_splitter_from_config()
+            if isinstance(self.cluster_strategy, BaseSpatialClusterStrategy):
+                self.cluster_strategy
+                clustered_data = self.cluster_strategy.cluster(X)
+                self.logger.info(f"Cluster value counts:\n{clustered_data['cluster'].value_counts().to_string()}")
+
+                groups = clustered_data['cluster']
+                """Split data into training and test sets."""
+                self.logger.info("Splitting dataset into train and test groups using GroupShuffleSplit...")
+                gss = GroupShuffleSplit(n_splits=1, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_SEED)
+                train_idx, test_idx = next(gss.split(X, y, groups=groups))
+
+                self.cluster_strategy.plot_train_test(
+                    clustered_data,
+                    train_idx,
+                    test_idx,
+                    title="Spatial Grid Train/Test Split",
+                    filename="grid_split.png")
+
+                X.drop(['Latitude_Y', 'Longitude_X'], axis=1, inplace=True)
+
+                X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+                y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+                lat_train, lat_test = lat.iloc[train_idx], lat.iloc[test_idx]
+                lon_train, lon_test = lon.iloc[train_idx], lon.iloc[test_idx]
+                groups_train, groups_test = groups.iloc[train_idx], groups.iloc[test_idx]
+
+                splitted_data['groups_train'] = groups_train
+                splitted_data['groups_test'] = groups_test
+                self.logger.info(f"Train group distribution:\n{groups_train.value_counts().sort_index().to_string()}")
+                self.logger.info(f"Test group distribution:\n{groups_test.value_counts().sort_index().to_string()}")
 
         else:
+            X.drop(['Latitude_Y', 'Longitude_X'], axis=1, inplace=True)
             self.logger.info("Splitting dataset using simple train-test split...")
             X_train, X_test, y_train, y_test, lat_train, lat_test, lon_train, lon_test = train_test_split(
                 X, y, lat, lon, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_SEED
             )
         
-        self.logger.info(f"Train: {len(X_train)} rows | Test: {len(X_test)} rows")
+            self.logger.info(f"Train: {len(X_train)} rows | Test: {len(X_test)} rows")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             X_train.to_parquet(os.path.join(tmpdir, "X_train.parquet"), index=False)
