@@ -30,8 +30,8 @@ class BaseSpatialClusterStrategy(ABC):
         df: pd.DataFrame,
         train_idx: np.ndarray,
         test_idx: np.ndarray,
-        lon_col: str = "Longitude_X",
-        lat_col: str = "Latitude_Y",
+        lon_col: str = "lon",
+        lat_col: str = "lat",
         title: str = "Train/Test Split",
         artifact_path: str = "splits_plots",
         filename: str = "train_test_split.png",
@@ -135,8 +135,8 @@ class SpatialGridClusterStrategy(BaseSpatialClusterStrategy):
     """
 
     cell_size_m: int
-    lat_col: str = "Latitude_Y"
-    lon_col: str = "Longitude_X"
+    lat_col: str = "lat"
+    lon_col: str = "lon"
     random_state: int = 42
 
     def cluster(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -185,11 +185,14 @@ class ModelConfigFactory:
                 builder_func = self._dynamic_import(custom_model_builder)
                 model_instance = ModelClass(build_fn=lambda: builder_func(num_features))
             else:
+                if 'input_dim' in init_args:
+                    init_args['input_dim'] = num_features
                 model_instance = ModelClass(**init_args)
 
             model_configs[name] = {
                 "model": model_instance,
-                "params": spec.get("params", {})
+                "params": spec.get("params", {}),
+                "modeltype": spec.get("modeltype", "ml")
             }
 
         return model_configs

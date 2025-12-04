@@ -46,16 +46,16 @@ class DataManager:
         preprocessed =  {
             'X' : X,
             'y': data_cleaned[self.config.TARGET_COLUMNS],
-            'Latitude_Y': data_cleaned['Latitude_Y'],
-            'Longitude_X': data_cleaned['Longitude_X']
+            'lat': data_cleaned['lat'],
+            'lon': data_cleaned['lon']
         }
         return preprocessed
         
     def split_data(self, processed_data: Dict) -> Dict:
         X: pd.DataFrame = processed_data['X']
         y: pd.DataFrame = processed_data['y']
-        lat = processed_data['Latitude_Y']
-        lon = processed_data['Longitude_X']
+        lat = processed_data['lat']
+        lon = processed_data['lon']
         splitted_data = {}
 
         X_train = X_test = y_train = y_test = pd.DataFrame()
@@ -84,7 +84,7 @@ class DataManager:
                     title="Spatial Grid Train/Test Split",
                     filename="grid_split.png")
 
-                X.drop(['Latitude_Y', 'Longitude_X'], axis=1, inplace=True)
+                X.drop(['lat', 'lon'], axis=1, inplace=True)
 
                 X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
                 y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
@@ -98,7 +98,7 @@ class DataManager:
                 self.logger.info(f"Test group distribution:\n{groups_test.value_counts().sort_index().to_string()}")
 
         else:
-            X.drop(['Latitude_Y', 'Longitude_X'], axis=1, inplace=True)
+            X.drop(['lat', 'lon'], axis=1, inplace=True)
             self.logger.info("Splitting dataset using simple train-test split...")
             X_train, X_test, y_train, y_test, lat_train, lat_test, lon_train, lon_test = train_test_split(
                 X, y, lat, lon, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_SEED

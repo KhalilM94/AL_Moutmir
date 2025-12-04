@@ -20,6 +20,9 @@ torchvision = ">=0.24.0,<0.25"
 pytorch-gpu = "*"
 xgboost = ">=3.1.1,<4"
 mlflow = ">=3.5.1,<4"
+torchmetrics = ">=1.8.2,<2"
+torchinfo = ">=1.8.0,<2"
+lightning = ">=2.6.0,<3"
 
 [pypi-dependencies]
 affine = "*"

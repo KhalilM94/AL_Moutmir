@@ -167,7 +167,7 @@ def create_pred_obs_plot(eval_df, builtin_metrics, artifacts_dir):
     y_pred = eval_df["prediction"]
     residuals = y_test - y_pred
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
     # --- Panel 1: Predicted vs Actual ---
     ax = axes[0]
@@ -206,6 +206,15 @@ def create_pred_obs_plot(eval_df, builtin_metrics, artifacts_dir):
     ax.set_title(f"{y_test.name}\nResiduals vs Predicted")
     ax.grid(True)
     ax.set_axisbelow(True)
+    # --- Panel 3: KDE density plot ---
+    ax = axes[2]
+    sns.kdeplot(x=y_test, y=y_pred, fill=True, cmap="gnuplot2", thresh=0.005, levels=200, ax=ax)
+    ax.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
+    ax.set_xlabel("Actual")
+    ax.set_ylabel("Predicted")
+    ax.set_title(f"{y_test.name}\nDensity KDE of Pred vs Actual")
+    ax.grid(True)
+
     fig.tight_layout()
     plot_path = os.path.join(artifacts_dir, "obs_pred_and_residual_plot.png")
     plt.savefig(plot_path, bbox_inches="tight", dpi=100)

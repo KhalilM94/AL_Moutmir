@@ -20,7 +20,7 @@ def _infer_utm_crs(lon_series, lat_series):
     epsg = 32600 + zone if lat_mean >= 0 else 32700 + zone
     return CRS.from_epsg(epsg)
 
-def assign_grid_ids(df, cell_size_m, lon_col='Longitude_X', lat_col='Latitude_Y'):
+def assign_grid_ids(df, cell_size_m, lon_col='lon', lat_col='lat'):
     """Assign each point to a grid cell and return (grid_id array, grid_gdf)."""
     if isinstance(df, gpd.GeoDataFrame):
         gdf_wgs = df.copy()

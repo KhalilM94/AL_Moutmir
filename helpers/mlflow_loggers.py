@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import mlflow
 import mlflow.sklearn
 from mlflow.models import infer_signature
+from sklearn.metrics import r2_score
 
 import os
 import importlib
@@ -68,6 +69,8 @@ class ChildRunLogger:
         search,
         cv_results,
         best_model,
+        X_train,
+        y_train,
         X_test,
         y_test,
         target,
@@ -99,6 +102,8 @@ class ChildRunLogger:
             # --- CV results as artifact ---
             self._log_cv_results(cv_results, target, model_name, param_names)
             # --- CV metrics (best index) ---
+            r2_train = r2_score(y_train, best_model.predict(X_train))
+            mlflow.log_metric("r2_train", r2_train)
             mlflow.log_metric("mean_train_score", -cv_results["mean_train_score"][search.best_index_])
             mlflow.log_metric("mean_test_score", -cv_results["mean_test_score"][search.best_index_])
 

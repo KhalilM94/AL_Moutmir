@@ -146,7 +146,7 @@ def drop_junk_spectra(df, bands_df, ranges):
     return modified_spectra
 
 
-def kmeans_clustering_map(df, feature_cols, coord_cols=['Longitude_X', 'Latitude_Y'], k_range=(3, 20),
+def kmeans_clustering_map(df, feature_cols, coord_cols=['lon', 'lat'], k_range=(3, 20),
                           cmap='Set1', random_state=42, title='KMeans Clustering Map',
                           show_map=True, return_df=False, show_cluster_labels=True):
     """
@@ -199,8 +199,8 @@ def kmeans_clustering_map(df, feature_cols, coord_cols=['Longitude_X', 'Latitude
 def extract_spectral_values(
     image_path,
     df,
-    lat_col='Latitude_Y',
-    lon_col='Longitude_X',
+    lat_col='lat',
+    lon_col='lon',
     nodata_value=None,
     mask_path=None,
     verbose=True

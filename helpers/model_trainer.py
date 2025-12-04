@@ -1,6 +1,7 @@
 from sklearn.model_selection import GridSearchCV
 from sklearn.base import clone
 import pandas as pd
+import numpy as np
 from typing import Optional, List, Dict
 import traceback
 
@@ -71,63 +72,67 @@ class ModelTrainer:
 
                     model = config["model"]
                     params = config.get("params", {})
+                    modeltype = config.get("modeltype", "ml")
+                    if modeltype == "ml":
+                        # Build pipeline
+                        pipeline = self.pipeline_builder.build(model, is_log_target)
 
-                    # Build pipeline
-                    pipeline = self.pipeline_builder.build(model, is_log_target)
-                    
-                    # Adjust param grid if using TransformedTargetRegressor
-                    if is_log_target and bool(params):
-                        params = {
-                            k.replace("model__", "model__regressor__") : v
-                            for k, v in params.items()
-                        }
-                    search = GridSearchCV(
-                        estimator=clone(pipeline),
-                        param_grid= params if params is not None else {},
-                        cv=splits, refit=False,
-                        scoring= "neg_root_mean_squared_error",
-                        n_jobs=-1, return_train_score=True,
-                        verbose=self.tuning_verbose
-                    )
+                        # Adjust param grid if using TransformedTargetRegressor
+                        if is_log_target and bool(params):
+                            params = {
+                                k.replace("model__", "model__regressor__") : v
+                                for k, v in params.items()
+                            }
+                        search = GridSearchCV(
+                            estimator=clone(pipeline),
+                            param_grid= params if params is not None else {},
+                            cv=splits, refit=False,
+                            scoring= "neg_root_mean_squared_error",
+                            n_jobs=-1, return_train_score=True,
+                            verbose=self.tuning_verbose
+                        )
 
-                    search.fit(X_train, y_train)
-                    best_params = search.best_params_ if params is not None else {}
-                    cv_results = pd.DataFrame(search.cv_results_)
-                    best_model = clone(pipeline)
-                    if params is not None:
-                        best_model.set_params(**best_params)
-                    best_model.fit(X_train, y_train)
-                    
-                    if not any(cv_results.get("params", [])):
-                        cv_results["params"] = [best_model.get_params()]
+                        search.fit(X_train, y_train)
+                        best_params = search.best_params_ if params is not None else {}
+                        cv_results = pd.DataFrame(search.cv_results_)
+                        best_model = clone(pipeline)
+                        if params is not None:
+                            best_model.set_params(**best_params)
+                        best_model.fit(X_train, y_train)
 
-                    #Evaluate model
-                    param_names = list(params.keys()) if params else []
-                    plot_func = {}
-                    if len(param_names) > 1:
-                        cv_plot = "helpers.plot_utils.cv_parallel_coordinates"
-                    elif len(param_names) == 1:
-                        cv_plot = "helpers.plot_utils.cv_val_curve"
+                        if not any(cv_results.get("params", [])):
+                            cv_results["params"] = [best_model.get_params()]
+                        #Evaluate model
+                        param_names = list(params.keys()) if params else []
+                        plot_func = {}
+                        if len(param_names) > 1:
+                            cv_plot = "helpers.plot_utils.cv_parallel_coordinates"
+                        elif len(param_names) == 1:
+                            cv_plot = "helpers.plot_utils.cv_val_curve"
+                        else:
+                            cv_plot = None  # No hyperparameters to plot
+                            param_names = list(best_model.get_params().keys())
+
+                        if cv_plot is not None:
+                            plot_func.update({cv_plot: {"args": [cv_results]}})
+                        mlflow_logger.log_child_run(
+                            config=self.config,
+                            search=search,
+                            cv_results=cv_results,
+                            best_model=best_model,
+                            X_train=X_train,
+                            y_train=y_train,
+                            X_test=X_test,
+                            y_test=y_test,
+                            target=target,
+                            param_names=param_names,
+                            model_name=model_name,
+                            plot_functions=plot_func
+                            )
+                    elif modeltype == "dl":
+                        continue
                     else:
-                        cv_plot = None  # No hyperparameters to plot
-                        param_names = list(best_model.get_params().keys())
-
-                    if cv_plot is not None:
-                        plot_func.update({cv_plot: {"args": [cv_results]}})
-
-                    mlflow_logger.log_child_run(
-                        config=self.config,
-                        search=search,
-                        cv_results=cv_results,
-                        best_model=best_model,
-                        X_test=X_test,
-                        y_test=y_test,
-                        target=target,
-                        param_names=param_names,
-                        model_name=model_name,
-                        plot_functions=plot_func
-                    )
-
+                        raise ValueError(f"Unknown modeltype: {modeltype}")
                 except Exception as e:
                     self.logger.warning(f"Training failed for {model_name} on {target}: {e}")
                     print(f"Exception caught:\n{traceback.format_exc()}")
