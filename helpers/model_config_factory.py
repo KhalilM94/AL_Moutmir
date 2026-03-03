@@ -98,16 +98,16 @@ class KMeansClusterStrategy(BaseSpatialClusterStrategy):
     -----------
     n_clusters : int, default=12
         Number of spatial clusters to form.
-    lat_col : str, default='Latitude_Y'
+    lat_col : str, default='lat'
         Name of the latitude column in the DataFrame.
-    lon_col : str, default='Longitude_X'
+    lon_col : str, default='lon'
         Name of the longitude column in the DataFrame.
     random_state : int, default=42
         Random seed for reproducibility of clustering.
     """
     n_clusters: int = 12
-    lat_col: str = 'Latitude_Y'
-    lon_col: str = 'Longitude_X'
+    lat_col: str = 'lat'
+    lon_col: str = 'lon'
     random_state: int = 42
 
     def cluster(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -128,9 +128,9 @@ class SpatialGridClusterStrategy(BaseSpatialClusterStrategy):
     ----------
     cell_size_m : int
         Size of each grid cell in meters.
-    lat_col : str, default='Latitude_Y'
+    lat_col : str, default='lat'
         Latitude column in the DataFrame.
-    lon_col : str, default='Longitude_X'
+    lon_col : str, default='lon'
         Longitude column in the DataFrame.
     """
 

@@ -2,13 +2,15 @@ import os
 import random
 import yaml
 import json
-from typing import Any
+from typing import Any, Optional
 
 class Config:
-    def __init__(self):
-        config_path = os.getenv('CONFIG_PATH', 'config.yml')
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
+    def __init__(self, config_path: Optional[str] = None, registry_path: Optional[str] = None):
+        self.config_path = config_path or os.getenv('CONFIG_PATH', 'configs/config.yml')
+        self.registry_path = registry_path or os.getenv('MODEL_REGISTRY_PATH', 'configs/model_registry.yml')
+
+        if os.path.exists(self.config_path):
+            with open(self.config_path, 'r') as f:
                 self.config = yaml.safe_load(f)
         else:
             self.config = {}
@@ -16,7 +18,6 @@ class Config:
         # General settings
         self.DATA_FOLDER = self._get_config('DATA_FOLDER', 'doukkala_ssl_datasets')
         self.DATA_FILE = self._get_config('DATA_FILE', 'data.csv')
-        self.OUTPUT_FOLDER = self._get_config('OUTPUT_FOLDER', 'outputs')
         self.SOIL_GROUPS_FILE_PATH = self._get_config('SOIL_GROUPS_FILE_PATH', 'soil_groups.txt')
         self.RANDOM_SEED = self._get_config('RANDOM_SEED', random.randint(0, 1000000))
         self.TEST_SIZE = self._get_config('TEST_SIZE', 0.2)
@@ -60,12 +61,11 @@ class Config:
         return config_val
 
     def _load_model_registry(self):
-        registry_path = os.getenv("MODEL_REGISTRY_PATH", "model_registry.yml")
         try:
-            with open(registry_path, 'r') as f:
+            with open(self.registry_path, 'r') as f:
                 return yaml.safe_load(f)
         except FileNotFoundError:
-            raise FileNotFoundError(f"Model registry YAML not found at {registry_path}. Stopping execution.")
+            raise FileNotFoundError(f"Model registry YAML not found at {self.registry_path}. Stopping execution.")
     
     def _get_ignore_bands(self, default: Any) -> list:
         if self._get_config('IGNORE_BANDS', False):

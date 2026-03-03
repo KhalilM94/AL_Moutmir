@@ -8,12 +8,18 @@ from config import Config
 import mlflow
 import datetime
 from typing import Dict
+import argparse
 
 class SoilModelTraining:
-    def __init__(self, run_name: str = "Soil_Model_Training"):
+    def __init__(
+        self,
+        run_name: str = "Soil_Model_Training",
+        config_path: str = "configs/config.yml",
+        registry_path: str = "configs/model_registry.yml",
+    ):
         self.run_name = run_name
         # Initialize components
-        self.config = Config()
+        self.config = Config(config_path=config_path, registry_path=registry_path)
         # Setup directories
         self.log_transformer = LogTransformer()
         self.logger_wrapper = TrainingLogger(name='AlMoutmir Soil Models Training',
@@ -42,7 +48,23 @@ class SoilModelTraining:
                 data=data,
                 model_pipelines = self.model_configs.build_model_configs(num_features= data[X_key].shape[1] ),)
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train soil models")
+    parser.add_argument(
+        "--config-path",
+        default="configs/config.yml",
+        help="Path to the main YAML config file",
+    )
+    parser.add_argument(
+        "--registry-path",
+        default="configs/model_registry.yml",
+        help="Path to the model registry YAML file",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     mlflow.enable_system_metrics_logging()
     EXPERIMENT_NAME = "Soil_Model_Training_Experiment"
     # Set up MLflow tracking
@@ -61,7 +83,13 @@ def main():
     mlflow_logger = ParentRunLogger()
     with mlflow.start_run(run_name=run_name) as main_run:
         # Initialize and run the training pipeline
-        trainer = SoilModelTraining(run_name=run_name)
+        trainer = SoilModelTraining(
+            run_name=run_name,
+            config_path=args.config_path,
+            registry_path=args.registry_path,
+        )
+        mlflow.log_param("CONFIG_PATH", trainer.config.config_path)
+        mlflow.log_param("REGISTRY_PATH", trainer.config.registry_path)
         try:
             # Load and preprocess data
             raw_data = trainer.data_manager.load_data()
