@@ -4,10 +4,13 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.model_selection import KFold, GroupKFold
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
+from sklearn.impute import SimpleImputer
 
 import pandas as pd
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 @dataclass
 class CVSplitter:
@@ -67,8 +70,57 @@ class TargetNanFilter(BaseEstimator, TransformerMixin):
 class PipelineBuilder:
     seed: int = 42
 
-    def build(self, model, is_log_target: bool = False) -> Pipeline:
-        steps: List[Tuple[str, BaseEstimator]] = [('scaler', RobustScaler())]
+    def _is_tree_based_model(self, model: BaseEstimator) -> bool:
+        model_name = model.__class__.__name__.lower()
+        model_module = model.__class__.__module__.lower()
+        tree_markers = ("tree", "forest", "boost", "xgb", "lightgbm", "catboost")
+        return any(marker in model_name or marker in model_module for marker in tree_markers)
+
+    def _build_preprocessor(self, model: BaseEstimator, categorical_cols: List[str], numeric_cols: List[str]) -> ColumnTransformer:
+        is_tree_model = self._is_tree_based_model(model)
+
+        numeric_steps: List[Tuple[str, BaseEstimator]] = [
+            ('imputer', SimpleImputer(strategy='median'))
+        ]
+        if not is_tree_model:
+            numeric_steps.append(('scaler', RobustScaler()))
+
+        if is_tree_model:
+            categorical_encoder: BaseEstimator = OrdinalEncoder(
+                handle_unknown='use_encoded_value',
+                unknown_value=-1,
+                encoded_missing_value=-1
+            )
+        else:
+            categorical_encoder = OneHotEncoder(handle_unknown='ignore')
+
+        transformers: List[Tuple[str, BaseEstimator, List[str]]] = []
+        if numeric_cols:
+            transformers.append(('num', Pipeline(numeric_steps), numeric_cols))
+        if categorical_cols:
+            transformers.append((
+                'cat',
+                Pipeline([
+                    ('imputer', SimpleImputer(strategy='most_frequent')),
+                    ('encoder', categorical_encoder)
+                ]),
+                categorical_cols
+            ))
+
+        return ColumnTransformer(transformers=transformers, remainder='drop')
+
+    def build(
+        self,
+        model,
+        is_log_target: bool = False,
+        categorical_cols: Optional[List[str]] = None,
+        numeric_cols: Optional[List[str]] = None,
+    ) -> Pipeline:
+        categorical_cols = categorical_cols or []
+        numeric_cols = numeric_cols or []
+        preprocessor = self._build_preprocessor(model, categorical_cols, numeric_cols)
+
+        steps: List[Tuple[str, BaseEstimator]] = [('preprocessor', preprocessor)]
         if is_log_target:
             steps.append((
                 'model', 

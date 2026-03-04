@@ -74,8 +74,23 @@ class ModelTrainer:
                     params = config.get("params", {})
                     modeltype = config.get("modeltype", "ml")
                     if modeltype == "ml":
+                        is_tree_model = self.pipeline_builder._is_tree_based_model(model)
+                        categorical_encoding = "ordinal" if is_tree_model else "onehot"
+                        categorical_cols = [
+                            col for col in self.config.CATEGORICAL_FEATURES
+                            if col in X_train.columns
+                        ]
+                        numeric_cols = [
+                            col for col in X_train.columns
+                            if col not in categorical_cols
+                        ]
                         # Build pipeline
-                        pipeline = self.pipeline_builder.build(model, is_log_target)
+                        pipeline = self.pipeline_builder.build(
+                            model,
+                            is_log_target,
+                            categorical_cols=categorical_cols,
+                            numeric_cols=numeric_cols,
+                        )
 
                         # Adjust param grid if using TransformedTargetRegressor
                         if is_log_target and bool(params):
@@ -127,7 +142,10 @@ class ModelTrainer:
                             target=target,
                             param_names=param_names,
                             model_name=model_name,
-                            plot_functions=plot_func
+                            plot_functions=plot_func,
+                            extra_params={
+                                "categorical_encoding": categorical_encoding,
+                            },
                             )
                     elif modeltype == "dl":
                         continue

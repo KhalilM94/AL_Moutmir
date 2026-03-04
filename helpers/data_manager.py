@@ -31,16 +31,17 @@ class DataManager:
         # Prepare feature matrix
         valid_feature_columns = data[feature_columns].dropna(axis=1, how='all').columns.tolist()
         X = data[valid_feature_columns]
-        
-        # One-hot encoding if needed
-        categorical_cols = [col for col in self.config.CATEGORICAL_FEATURES 
-                            if col in X.columns and col not in self.config.EXCLUDE_CATEGORICAL]
+
+        categorical_cols = [
+            col for col in self.config.CATEGORICAL_FEATURES
+            if col in X.columns and col not in self.config.EXCLUDE_CATEGORICAL
+        ]
         if categorical_cols:
-            self.logger.info(f"Applying one-hot encoding to categorical columns: {', '.join(categorical_cols)}")
-            X = pd.get_dummies(X, columns=categorical_cols)
-            
-        # Fill remaining NaNs with column means
-        X = X.apply(lambda row: row.fillna(row.mean()), axis=1)
+            self.logger.info(
+                "Categorical encoding will be applied per model in the training pipeline "
+                "(one-hot for linear models, ordinal encoding for tree-based models)."
+            )
+
         data_cleaned = data.loc[X.index]
 
         preprocessed =  {
@@ -98,7 +99,7 @@ class DataManager:
                 self.logger.info(f"Test group distribution:\n{groups_test.value_counts().sort_index().to_string()}")
 
         else:
-            X.drop(['lat', 'lon'], axis=1, inplace=True)
+            X = X.drop(['lat', 'lon'], axis=1)
             self.logger.info("Splitting dataset using simple train-test split...")
             X_train, X_test, y_train, y_test, lat_train, lat_test, lon_train, lon_test = train_test_split(
                 X, y, lat, lon, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_SEED

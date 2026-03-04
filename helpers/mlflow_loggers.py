@@ -77,6 +77,7 @@ class ChildRunLogger:
         param_names,
         model_name,
         plot_functions,
+        extra_params=None,
     ):
         """Log one child run with params, metrics, plots, and model."""
         run_name = f"{target}_{model_name}"
@@ -91,6 +92,8 @@ class ChildRunLogger:
                 "cell_size_m": config.CLUSTERING_STRATEGY.get('params', {}).get('cell_size_m', None) if config.ENABLE_CLUSTERING else None,
                 "n_clusters": config.CLUSTERING_STRATEGY.get('params', {}).get('n_clusters', None) if config.ENABLE_CLUSTERING else None,
             })
+            if extra_params:
+                mlflow.log_params(extra_params)
             mlflow.log_params(search.best_params_)
 
             # --- Model ---
