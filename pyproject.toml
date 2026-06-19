@@ -1,15 +1,33 @@
-[workspace]
+[project]
+authors = [{name = "KhalilM94", email = "khalil.misbah@protonmail.com"}]
+license = { file = "LICENSE" }
+name = "yg-eo-soilnet"
+requires-python = ">= 3.11"
+version = "0.1.0"
+
+[project.urls]
+Homepage = "https://github.com/KhalilM94/yg-eo-soilnet"
+Repository = "https://github.com/KhalilM94/yg-eo-soilnet.git"
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[dependency-groups]
+dev = [
+	"pytest>=9.0.2,<10",
+]
+
+[tool.pixi.workspace]
 channels = ["conda-forge", "main", "r", "msys2", "nvidia", "pytorch"]
 name = "almoutmir-env"
 platforms = ["linux-64"]
 version = "0.1.0"
 
-[system-requirements]
+[tool.pixi.system-requirements]
 cuda = "12.8"
 
-[tasks]
-
-[dependencies]
+[tool.pixi.dependencies]
 python = "3.12.*"
 numpy = "*"
 pandas = "*"
@@ -24,7 +42,7 @@ torchmetrics = ">=1.8.2,<2"
 torchinfo = ">=1.8.0,<2"
 lightning = ">=2.6.0,<3"
 
-[pypi-dependencies]
+[tool.pixi.pypi-dependencies]
 affine = "*"
 alembic = "*"
 annotated-types = "*"
@@ -225,3 +243,9 @@ psycopg = ">=3.2.12, <4"
 pytest = ">=9.0.2, <10"
 statsmodels = ">=0.14.6, <0.15"
 pykrige = ">=1.7.3, <2"
+yg_eo_soilnet = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+
+[tool.pixi.feature.dev.dependencies]
+pre-commit = "*"
