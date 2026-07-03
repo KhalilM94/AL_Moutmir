@@ -1,4 +1,4 @@
-from .misc_utils import rpiq_score
+from yg_eo_soilnet.utils import rpiq_score
 from sklearn.metrics import r2_score, root_mean_squared_error
 import numpy as np
 import seaborn as sns
@@ -330,7 +330,7 @@ def plot_leaderboard_scatter(leaderboard_df, metric_x="rmse_test", metric_y="r2_
         # Annotate points
         for _, row in df_target.iterrows():
             ax.text(row[metric_x], row[metric_y], str(row[label_col]),
-                    horizontalalignment='left', size='small', color='black', weight='semibold')
+                    horizontalalignment='left', size='small', color='black', weight='normal')
 
         # Add average lines per target
         ax.axvline(avg_rmse, color="blue", linestyle="--", label="Avg RMSE")

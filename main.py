@@ -1,9 +1,7 @@
-from helpers.model_trainer import ModelTrainer
-from helpers.training_logger import TrainingLogger
-from helpers.model_config_factory import ModelConfigFactory
-from helpers.data_manager import DataManager
-from helpers.misc_utils import LogTransformer
-from helpers.mlflow_loggers import ParentRunLogger
+from yg_eo_soilnet import DataManager, LogTransformer
+from yg_eo_soilnet.logger import ParentRunLogger, TrainingLogger
+from yg_eo_soilnet.models import ModelConfigFactory
+from yg_eo_soilnet.trainers import ModelTrainer
 from config import Config
 import mlflow
 import datetime
@@ -14,8 +12,8 @@ class SoilModelTraining:
     def __init__(
         self,
         run_name: str = "Soil_Model_Training",
-        config_path: str = "configs/config.yml",
-        registry_path: str = "configs/model_registry.yml",
+        config_path: str = "config.yml",
+        registry_path: str = "model_registry.yml",
     ):
         self.run_name = run_name
         # Initialize components
@@ -52,12 +50,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train soil models")
     parser.add_argument(
         "--config-path",
-        default="configs/config.yml",
+        default="config.yml",
         help="Path to the main YAML config file",
     )
     parser.add_argument(
         "--registry-path",
-        default="configs/model_registry.yml",
+        default="model_registry.yml",
         help="Path to the model registry YAML file",
     )
     return parser.parse_args()

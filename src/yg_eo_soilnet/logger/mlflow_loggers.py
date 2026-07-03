@@ -1,5 +1,5 @@
-from .misc_utils import mlflow_rpiq_score
-from .plot_utils import plot_leaderboard_scatter, create_pred_obs_plot, create_parent_pred_obs
+from yg_eo_soilnet.utils import mlflow_rpiq_score
+from yg_eo_soilnet.plot_utils import plot_leaderboard_scatter, create_pred_obs_plot, create_parent_pred_obs
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -101,7 +101,12 @@ class ChildRunLogger:
             model_info = mlflow.sklearn.log_model(sk_model=best_model,  # type: ignore
                                          signature=signature,
                                          name = f"{target}_{model_name}",
-                                         input_example=X_test[:5])
+                                         input_example=X_test[:5],
+                                         skops_trusted_types=[
+                                             "numpy.dtype", 
+                                             "xgboost.core.Booster", 
+                                             "xgboost.sklearn.XGBRegressor"
+                                             ])
             # --- CV results as artifact ---
             self._log_cv_results(cv_results, target, model_name, param_names)
             # --- CV metrics (best index) ---
@@ -121,7 +126,7 @@ class ChildRunLogger:
                 mlflow.log_artifact(eval_path, artifact_path="eval_results")
 
     
-            mlflow.evaluate(
+            mlflow.models.evaluate(
                 model_info.model_uri,
                 data=pd.concat([X_test, y_test], axis=1),
                 targets=target,

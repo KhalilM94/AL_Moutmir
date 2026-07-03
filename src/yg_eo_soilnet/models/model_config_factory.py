@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 import pandas as pd
 from sklearn.cluster import KMeans
-from .misc_utils import assign_grid_ids
+from yg_eo_soilnet.utils import assign_grid_ids
 
 import matplotlib.pyplot as plt
 import tempfile

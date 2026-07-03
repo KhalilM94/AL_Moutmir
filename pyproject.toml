@@ -1,251 +1,77 @@
 [project]
 authors = [{name = "KhalilM94", email = "khalil.misbah@protonmail.com"}]
-license = { file = "LICENSE" }
+license = "MIT"
 name = "yg-eo-soilnet"
-requires-python = ">= 3.11"
+requires-python = ">= 3.10"
 version = "0.1.0"
+readme = "README.md"
+dependencies = ["mlflow==3.14.*", "psutil>=7.2.2,<8", "pip>=26.1.2,<27"]
 
 [project.urls]
 Homepage = "https://github.com/KhalilM94/yg-eo-soilnet"
-Repository = "https://github.com/KhalilM94/yg-eo-soilnet.git"
+Repository = "https://github.com/KhalilM94/yg-eo-soilnet.git" 
 
 [build-system]
 build-backend = "hatchling.build"
 requires = ["hatchling"]
 
-[dependency-groups]
-dev = [
-	"pytest>=9.0.2,<10",
-]
+[tool.hatch.build.targets.wheel]
+packages = ["src/yg_eo_soilnet"]
 
 [tool.pixi.workspace]
-channels = ["conda-forge", "main", "r", "msys2", "nvidia", "pytorch"]
-name = "almoutmir-env"
-platforms = ["linux-64"]
+channels = ["conda-forge", "main", "r", "msys2", "nvidia"]
+name = "yg_eo_soilnet"
+platforms = ["linux-64", "win-64", "osx-arm64", "osx-64"]
 version = "0.1.0"
 
-[tool.pixi.system-requirements]
-cuda = "12.8"
-
-[tool.pixi.dependencies]
-python = "3.12.*"
-numpy = "*"
-pandas = "*"
-pip = "*"
-proj = ">=9.7.0,<10"
-pytorch = ">=2.8.0,<3"
-torchvision = ">=0.24.0,<0.25"
-pytorch-gpu = "*"
-xgboost = ">=3.1.1,<4"
-mlflow = ">=3.5.1,<4"
-torchmetrics = ">=1.8.2,<2"
-torchinfo = ">=1.8.0,<2"
-lightning = ">=2.6.0,<3"
-
 [tool.pixi.pypi-dependencies]
-affine = "*"
-alembic = "*"
-annotated-types = "*"
-anyio = "*"
-argon2-cffi = "*"
-argon2-cffi-bindings = "*"
-arrow = "*"
-asttokens = "*"
-async-lru = "*"
-attrs = "*"
-authlib = "*"
-babel = "*"
-beautifulsoup4 = "*"
-bleach = "*"
-blinker = "*"
-cachetools = "*"
-cartopy = "*"
-certifi = "*"
-cffi = "*"
-charset-normalizer = "*"
-click = "*"
-click-plugins = "*"
-cligj = "*"
-cloudpickle = "*"
-comm = "*"
-contourpy = "*"
-cryptography = "*"
-cycler = "*"
-cyclopts = "*"
-databricks-sdk = "*"
-debugpy = "*"
-decorator = "*"
-defusedxml = "*"
-dnspython = "*"
-docker = "*"
-docstring-parser = "*"
-docutils = "*"
-email-validator = "*"
-exceptiongroup = "*"
-executing = "*"
-fastapi = "*"
-fastjsonschema = "*"
-fastmcp = "*"
-flask = "*"
-flask-cors = "*"
-fonttools = "*"
-fqdn = "*"
-geopandas = "*"
-gitdb = "*"
-gitpython = "*"
-google-auth = "*"
-graphene = "*"
-graphql-core = "*"
-graphql-relay = "*"
-greenlet = "*"
-gunicorn = "*"
-h11 = "*"
-httpcore = "*"
-httpx = "*"
-httpx-sse = "*"
-idna = "*"
-importlib-metadata = "*"
-ipykernel = "*"
-ipython = "*"
-ipython-pygments-lexers = "*"
-isodate = "*"
-isoduration = "*"
-itsdangerous = "*"
-jedi = "*"
-jinja2 = "*"
-joblib = "*"
-json5 = "*"
-jsonpointer = "*"
-jsonschema = "*"
-jsonschema-path = "*"
-jsonschema-specifications = "*"
-jupyter-events = "*"
-jupyter-lsp = "*"
-jupyter-client = "*"
-jupyter-core = "*"
-jupyter-server = "*"
-jupyter-server-terminals = "*"
-jupyterlab = "*"
-jupyterlab-pygments = "*"
-jupyterlab-server = "*"
-kiwisolver = "*"
-lark = "*"
-lazy-object-proxy = "*"
-mako = "*"
-markdown-it-py = "*"
-markupsafe = "*"
-matplotlib = "*"
-matplotlib-inline = "*"
-mcp = "*"
-mdurl = "*"
-mistune = "*"
-mlflow = "*"
-mlflow-skinny = "*"
-mlflow-tracing = "*"
-more-itertools = "*"
-nbclient = "*"
-nbconvert = "*"
-nbformat = "*"
-nest-asyncio = "*"
-notebook = "*"
-notebook-shim = "*"
-numpy = "*"
-openapi-core = "*"
-openapi-pydantic = "*"
-openapi-schema-validator = "*"
-openapi-spec-validator = "*"
-opentelemetry-api = "*"
-opentelemetry-proto = "*"
-opentelemetry-sdk = "*"
-opentelemetry-semantic-conventions = "*"
-packaging = "*"
-pandas = "*"
-pandocfilters = "*"
-parse = "*"
-parso = "*"
-pathable = "*"
-pexpect = "*"
-pillow = "*"
-platformdirs = "*"
-prometheus-client = "*"
-prompt-toolkit = "*"
-protobuf = "*"
-psutil = "*"
-ptyprocess = "*"
-pure-eval = "*"
-pyarrow = "*"
-pyasn1 = "*"
-pyasn1-modules = "*"
-pycparser = "*"
-pydantic = "*"
-pydantic-settings = "*"
-pydantic-core = "*"
-pygments = "*"
-pyogrio = "*"
-pyparsing = "*"
-pyperclip = "*"
-pyproj = "*"
-pyshp = "*"
-python-dateutil = "*"
-python-dotenv = "*"
-python-json-logger = "*"
-python-multipart = "*"
-pytz = "*"
-pyyaml = "*"
-pyzmq = "*"
-rasterio = "*"
-referencing = "*"
-requests = "*"
-rfc3339-validator = "*"
-rfc3986-validator = "*"
-rfc3987-syntax = "*"
-rich = "*"
-rich-rst = "*"
-rpds-py = "*"
-rsa = "*"
-scikit-learn = "*"
-scipy = "*"
-seaborn = "*"
-send2trash = "*"
-setuptools = "*"
-shapely = ">=2.1.2, <3"
-six = "*"
-smmap = "*"
-sniffio = "*"
-soupsieve = "*"
-sqlalchemy = ">=2.0.44, <3"
-sqlparse = "*"
-sse-starlette = "*"
-stack-data = "*"
-starlette = "*"
-terminado = "*"
-threadpoolctl = "*"
-tinycss2 = "*"
-tornado = "*"
-tqdm = "*"
-traitlets = "*"
-typing-inspection = "*"
-typing-extensions = "*"
-tzdata = "*"
-uri-template = "*"
-urllib3 = "*"
-uvicorn = "*"
-wcwidth = "*"
-webcolors = "*"
-webencodings = "*"
-websocket-client = "*"
-werkzeug = "*"
-wheel = "*"
-zipp = "*"
-psycopg-binary = ">=3.2.12, <4"
-geoalchemy2 = ">=0.18.0, <0.19"
-psycopg = ">=3.2.12, <4"
-pytest = ">=9.0.2, <10"
-statsmodels = ">=0.14.6, <0.15"
-pykrige = ">=1.7.3, <2"
 yg_eo_soilnet = { path = ".", editable = true }
 
 [tool.pixi.tasks]
+mlflow = { cmd = "mlflow ui", env = { MLFLOW_ALLOW_FILE_STORE = "true" } }
 
-[tool.pixi.feature.dev.dependencies]
-pre-commit = "*"
+[tool.pixi.feature.prod-core.dependencies]
+python = ">=3.11,<3.13"
+scikit-learn = ">=1.9.0,<2"
+shap = ">=0.50.0,<0.53"
+pyproj = ">=3.7.2,<4"
+numpy = ">=2.4.6,<3"
+geopandas = ">=1.1.4,<2"
+matplotlib = ">=3.11.0,<4"
+scipy = ">=1.18.0,<2"
+pandas = "<3"
+pytorch = ">=2.12.1,<3"
+seaborn = ">=0.13.2,<0.14"
+
+[tool.pixi.feature.gpu-backend.system-requirements]
+cuda = "12.0"
+
+[tool.pixi.feature.gpu-backend.target.linux-64.pypi-dependencies]
+xgboost = ">=3.3.0, <4"
+
+[tool.pixi.feature.gpu-backend.target.win-64.pypi-dependencies]
+xgboost = ">=3.3.0, <4"
+
+[tool.pixi.environments]
+core = { features = ["prod-core", "cpu-backend"], solve-group = "default" }
+core-gpu = { features = ["prod-core", "gpu-backend"], solve-group = "default" }
+dev = { features = ["prod-core", "gpu-backend", "dev"], solve-group = "core-gpu" }
+explore = { features = ["prod-core", "cpu-backend", "explore"], solve-group = "core" }
+
+[tool.pixi.feature.dev.tasks]
+dev-env = "pixi shell -e dev"
+test = "pytest ./tests"
+lint = "ruff lint"
+
+[tool.pixi.feature.explore.tasks]
+notebook = "jupyter lab"
+
+[tool.pixi.feature.cpu-backend.dependencies]
+py-xgboost = ">=3.3.0,<4"
+
+[dependency-groups]
+explore = ["jupyterlab"]
+test = ["pytest", "ruff", "pytest-cov"]
+docs = ["sphinx"]
+dev = [{include-group = "test"}, {include-group = "docs"}]
+

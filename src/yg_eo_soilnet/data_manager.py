@@ -1,4 +1,4 @@
-from .model_config_factory import ModelConfigFactory, BaseSpatialClusterStrategy
+from yg_eo_soilnet.models import ModelConfigFactory, BaseSpatialClusterStrategy
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 import pandas as pd
 import mlflow

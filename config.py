@@ -21,8 +21,11 @@ class Config:
         self.SOIL_GROUPS_FILE_PATH = self._get_config('SOIL_GROUPS_FILE_PATH', 'soil_groups.txt')
         self.RANDOM_SEED = self._get_config('RANDOM_SEED', random.randint(0, 1000000))
         self.TEST_SIZE = self._get_config('TEST_SIZE', 0.2)
-        self.ENABLE_CLUSTERING = self._get_config('CLUSTERING_STRATEGY', None).get('enabled', False)
-        self.CLUSTERING_STRATEGY = self._get_config('CLUSTERING_STRATEGY', None)
+        clustering_strategy = self._get_config('CLUSTERING_STRATEGY', None)
+        if isinstance(clustering_strategy, str):
+            clustering_strategy = json.loads(clustering_strategy)
+        self.CLUSTERING_STRATEGY = clustering_strategy or {}
+        self.ENABLE_CLUSTERING = self.CLUSTERING_STRATEGY.get('enabled', False)
         self.SPLIT_STRATEGY = self._get_config('SPLIT_STRATEGY', 'kfold')
 
         # Target and feature configuration

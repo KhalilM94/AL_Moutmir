@@ -1,14 +1,12 @@
 from sklearn.model_selection import GridSearchCV
 from sklearn.base import clone
 import pandas as pd
-import numpy as np
 from typing import Optional, List, Dict
 import traceback
 
-from .training_logger import TrainingLogger
-from .mlflow_loggers import ChildRunLogger
-from .trainer_utils import (CVSplitter, PipelineBuilder, TargetNanFilter)
-from .misc_utils import LogTransformer
+from yg_eo_soilnet.logger import ChildRunLogger, TrainingLogger
+from yg_eo_soilnet.trainer_utils import (CVSplitter, PipelineBuilder, TargetNanFilter)
+from yg_eo_soilnet.utils import LogTransformer
 
 class ModelTrainer:
     def __init__(
@@ -46,8 +44,10 @@ class ModelTrainer:
         """
         self._validate_model_pipelines(model_pipelines)
         X_train = data['X_train']
+        X_train = X_train.astype({col: 'float64' for col in X_train.select_dtypes(include=['int64', 'int32']).columns})
         y_train = data['y_train'][target]
-        X_test = data['X_test']
+        X_test = data['X_test'] 
+        X_test = X_test.astype({col: 'float64' for col in X_train.select_dtypes(include=['int64', 'int32']).columns})
         y_test = data['y_test'][target]
         groups_train = data['groups_train'] if self.enable_clustering else None
 
@@ -121,9 +121,9 @@ class ModelTrainer:
                         param_names = list(params.keys()) if params else []
                         plot_func = {}
                         if len(param_names) > 1:
-                            cv_plot = "helpers.plot_utils.cv_parallel_coordinates"
+                            cv_plot = "yg_eo_soilnet.plot_utils.cv_parallel_coordinates"
                         elif len(param_names) == 1:
-                            cv_plot = "helpers.plot_utils.cv_val_curve"
+                            cv_plot = "yg_eo_soilnet.plot_utils.cv_val_curve"
                         else:
                             cv_plot = None  # No hyperparameters to plot
                             param_names = list(best_model.get_params().keys())

@@ -1,15 +1,5 @@
 # Python
 __pycache__/
-*.py[cod]
-*.pyd
-*.so
-.Python
-
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
 
 # Pixi
 .pixi/*
@@ -21,13 +11,8 @@ ENV/
 .coverage.*
 htmlcov/
 
-# Notebooks
-.ipynb_checkpoints/
-inference/
-
 # ML / training artifacts
 mlruns/
-inference/final_models/
 
 # Build artifacts
 build/

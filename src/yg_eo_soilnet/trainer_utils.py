@@ -1,4 +1,4 @@
-from.misc_utils import LogTransformer
+from yg_eo_soilnet.utils import LogTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
 from sklearn.base import BaseEstimator, TransformerMixin
