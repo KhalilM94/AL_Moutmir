@@ -1,0 +1,389 @@
+"""Convolutional encoders over a rasterised calendar grid.
+
+Convolution needs a regular lattice, but the observations arrive ragged and date-stamped. The
+rasteriser here is what bridges the two: it scatters each reading into the (year, month) cell its
+date names, leaving unfilled cells empty and flagged. Everything downstream then convolves over a
+proper grid without any of it having been faked into existence.
+
+Two properties are preserved from the sequence path and are load-bearing:
+
+* **No parameter is sized by the grid.** Pooling is global, so the same weights run on a three-year
+  grid and a twelve-year one.
+* **No feature encodes an absolute epoch.** Rows are counted back from each point's own latest
+  observation and columns are calendar months, so shifting every date by a decade changes nothing.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Optional
+
+import torch
+from torch import nn
+
+MONTHS_PER_YEAR = 12
+
+# Day-of-year on which each month starts in a non-leap year, 1-indexed.
+_MONTH_START_DAY = (1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335)
+_DAYS_PER_YEAR = 365.25
+
+
+def decimal_year_to_month_index(times: torch.Tensor) -> torch.Tensor:
+    """Decimal years -> calendar month index in [0, 11].
+
+    Deliberately not ``floor(frac * 12)``, which is wrong wherever month lengths drift from
+    365.25/12: 1 November is decimal .8323, and ``floor(.8323 * 12) == 9`` puts it in October. This
+    converts back to a day-of-year and looks the month up.
+
+    The table is leap-adjusted per year. Without that, every month from March on starts a day late in
+    a leap year, so the last day of each of those months lands on the next month's tabulated
+    boundary - 10 misplaced days per leap year. Harmless for the first-of-month stamps this dataset
+    uses, wrong for anything sampled daily.
+    """
+    times = times.to(dtype=torch.float64)
+    year = torch.floor(times)
+    day_of_year = (times - year) * _DAYS_PER_YEAR + 1.0
+
+    starts = torch.tensor(_MONTH_START_DAY, dtype=torch.float64, device=times.device)
+    is_leap = (((year % 4 == 0) & (year % 100 != 0)) | (year % 400 == 0)).to(dtype=torch.float64)
+    leap_shift = torch.zeros(MONTHS_PER_YEAR, dtype=torch.float64, device=times.device)
+    leap_shift[2:] = 1.0  # March onward starts a day later once February has 29 days
+    starts = starts + is_leap.unsqueeze(-1) * leap_shift
+
+    # The tolerance is not cosmetic. to_decimal_year divides the day-of-year by 365.25 and this
+    # multiplies it back, so 1 February round-trips to 31.999999... and would test as falling before
+    # its own month's 32-day boundary - putting every first-of-month reading in the previous month.
+    # Real day-of-year values are integers, so a 1e-6 slack cannot reach the next boundary.
+    month = ((day_of_year.unsqueeze(-1) + 1e-6) >= starts).sum(dim=-1) - 1
+    return month.clamp(0, MONTHS_PER_YEAR - 1).to(dtype=torch.long)
+
+
+class CalendarGridRasterizer(nn.Module):
+    """Ragged date-stamped observations -> a dense (years x months) calendar grid.
+
+    ``grid_years`` rows are counted back from each point's **own** latest observation, so the grid
+    describes a point's recent history rather than a fixed slice of the calendar. Columns are
+    calendar months, which is what makes a convolution across the month axis mean "phenology"
+    rather than "whatever twelve steps happened to follow each other".
+
+    Output channels per modality, in order:
+    ``C`` standardized readings, ``C`` per-channel validity, 1 cell-observed flag, and optionally
+    2 month sin/cos. The positional pair earns its place: convolution is translation-equivariant
+    along the month axis and global pooling discards position, so without it the network can learn
+    the *shape* of a seasonal transition but never which column is January.
+    """
+
+    def __init__(
+        self,
+        num_channels: int,
+        grid_years: Optional[int] = None,
+        *,
+        use_validity_channels: bool = True,
+        month_positional: bool = True,
+    ):
+        super().__init__()
+        self.num_channels = int(num_channels)
+        self.grid_years = None if grid_years in (None, 0) else max(1, int(grid_years))
+        self.use_validity_channels = bool(use_validity_channels)
+        self.month_positional = bool(month_positional)
+
+        if self.month_positional:
+            months = torch.arange(MONTHS_PER_YEAR, dtype=torch.float32)
+            angle = 2.0 * math.pi * months / MONTHS_PER_YEAR
+            self.register_buffer("month_sin", torch.sin(angle), persistent=False)
+            self.register_buffer("month_cos", torch.cos(angle), persistent=False)
+
+    @property
+    def output_channels(self) -> int:
+        channels = self.num_channels + 1
+        if self.use_validity_channels:
+            channels += self.num_channels
+        if self.month_positional:
+            channels += 2
+        return channels
+
+    def resolve_grid_years(self, times: torch.Tensor, mask: torch.Tensor) -> int:
+        """The configured span, or the batch's own longest history when none was configured."""
+        if self.grid_years is not None:
+            return self.grid_years
+        if not bool(mask.any()):
+            return 1
+        years = torch.floor(times.to(dtype=torch.float64))
+        largest = years.masked_fill(~mask, float("-inf")).max(dim=1).values
+        smallest = years.masked_fill(~mask, float("inf")).min(dim=1).values
+        spans = (largest - smallest + 1.0)[mask.any(dim=1)]
+        return max(1, int(spans.max().item()))
+
+    def forward(
+        self,
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        times: torch.Tensor,
+        validity: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(B,L,C) -> grid (B, output_channels, Y, 12)`` plus ``cell_mask (B, Y, 12)``."""
+        batch_size, length, channels = values.shape
+        if channels != self.num_channels:
+            raise ValueError(
+                f"CalendarGridRasterizer was built for {self.num_channels} channel(s) but received {channels}"
+            )
+        mask = mask.to(dtype=torch.bool)
+        device = values.device
+        grid_years = self.resolve_grid_years(times, mask)
+        cells = grid_years * MONTHS_PER_YEAR
+
+        if validity is None:
+            validity = torch.ones_like(values, dtype=torch.bool)
+        validity = validity.to(dtype=torch.bool) & mask.unsqueeze(-1)
+
+        years = torch.floor(times.to(dtype=torch.float64))
+        latest = years.masked_fill(~mask, float("-inf")).max(dim=1, keepdim=True).values
+        latest = torch.where(mask.any(dim=1, keepdim=True), latest, torch.zeros_like(latest))
+
+        row = (years - latest).to(dtype=torch.long) + (grid_years - 1)
+        column = decimal_year_to_month_index(times)
+        flat = row * MONTHS_PER_YEAR + column
+
+        # Observations older than the window, and padding, are routed to a trailing bin that is
+        # sliced off below. Clamping them into a real cell instead would fabricate readings.
+        keep = mask & (row >= 0) & (row < grid_years)
+        flat = torch.where(keep, flat, torch.full_like(flat, cells))
+
+        index = flat.unsqueeze(1).expand(-1, channels, -1)
+        source = (values * keep.unsqueeze(-1)).transpose(1, 2)
+
+        totals = torch.zeros(batch_size, channels, cells + 1, device=device, dtype=values.dtype)
+        totals.scatter_add_(2, index, source)
+
+        counts = torch.zeros(batch_size, 1, cells + 1, device=device, dtype=values.dtype)
+        counts.scatter_add_(2, flat.unsqueeze(1), keep.unsqueeze(1).to(dtype=values.dtype))
+
+        valid_totals = torch.zeros(batch_size, channels, cells + 1, device=device, dtype=values.dtype)
+        valid_totals.scatter_add_(2, index, (validity & keep.unsqueeze(-1)).to(dtype=values.dtype).transpose(1, 2))
+
+        totals, counts, valid_totals = totals[..., :cells], counts[..., :cells], valid_totals[..., :cells]
+
+        # Repeated readings in one cell average. This never fires on the current dataset - the
+        # (point, year, month) scatter is injective there - but the encoder must not depend on that.
+        occupancy = counts.clamp_min(1.0)
+        readings = totals / occupancy
+        cell_mask = counts.squeeze(1) > 0
+
+        layers = [readings]
+        if self.use_validity_channels:
+            layers.append(valid_totals / occupancy)
+        layers.append(cell_mask.unsqueeze(1).to(dtype=values.dtype))
+
+        grid = torch.cat(layers, dim=1).view(batch_size, -1, grid_years, MONTHS_PER_YEAR)
+
+        if self.month_positional:
+            positional = torch.stack([self.month_sin, self.month_cos]).to(dtype=grid.dtype, device=device)
+            positional = positional.view(1, 2, 1, MONTHS_PER_YEAR).expand(batch_size, -1, grid_years, -1)
+            grid = torch.cat([grid, positional], dim=1)
+
+        return grid, cell_mask.view(batch_size, grid_years, MONTHS_PER_YEAR)
+
+
+def masked_global_pool(features: torch.Tensor, cell_mask: torch.Tensor, *, masked: bool = True) -> torch.Tensor:
+    """Global average over the trailing spatial dims: ``(B, C, *grid) -> (B, C)``.
+
+    With ``masked`` the average runs over occupied cells only. Averaging over the whole grid instead
+    scales a point's embedding by its coverage, so a point with 55 of 108 cells filled arrives at
+    roughly half the magnitude of a full one - a systematic pull toward zero, and therefore toward
+    the target mean, for exactly the sparse points a regressor already struggles with.
+    """
+    spatial_dims = tuple(range(2, features.ndim))
+    if not masked:
+        return features.mean(dim=spatial_dims)
+
+    weights = cell_mask.to(dtype=features.dtype).unsqueeze(1)
+    occupied = weights.sum(dim=spatial_dims)
+    pooled = (features * weights).sum(dim=spatial_dims) / occupied.clamp_min(1.0)
+    return pooled * (occupied > 0).to(dtype=features.dtype)
+
+
+def _build_norm(kind: str, num_features: int, dims: int) -> nn.Module:
+    kind = str(kind).lower()
+    if kind == "none":
+        return nn.Identity()
+    if kind == "group":
+        # Batch statistics are polluted by the empty cells that padding leaves behind; GroupNorm is
+        # computed per sample and sidesteps that entirely.
+        return nn.GroupNorm(num_groups=math.gcd(8, num_features) or 1, num_channels=num_features)
+    if kind == "batch":
+        return nn.BatchNorm1d(num_features) if dims == 1 else nn.BatchNorm2d(num_features)
+    raise ValueError(f"norm must be 'batch', 'group' or 'none', got {kind!r}")
+
+
+class _MaskedConvStack(nn.Module):
+    """Convolution stages with the empty cells re-zeroed after each one.
+
+    Without this an empty cell is not neutral: a convolution has a bias, so an unoccupied cell emits
+    ``activation(bias)`` and its occupied neighbours read that as signal on the next layer. Two
+    consequences, both bad. A gap in the record starts contributing a learned constant, which is the
+    "missing looks like data" failure this whole representation exists to avoid. And an occupied cell
+    at the edge of the data sees ``activation(bias)`` from an interior empty neighbour but a true zero
+    from outside the tensor, so simply widening the grid with empty years changes the answer.
+
+    Re-zeroing makes an interior empty cell behave exactly like the padding beyond the tensor edge,
+    which is what lets the grid span be inferred rather than frozen.
+    """
+
+    def __init__(self, stages: list[nn.Module], mask_between: bool = True):
+        super().__init__()
+        self.stages = nn.ModuleList(stages)
+        self.mask_between = bool(mask_between)
+
+    def forward(self, features: torch.Tensor, cell_mask: torch.Tensor) -> torch.Tensor:
+        weights = cell_mask.unsqueeze(1).to(dtype=features.dtype)
+        if self.mask_between:
+            features = features * weights
+        for stage in self.stages:
+            features = stage(features)
+            if self.mask_between:
+                features = features * weights
+        return features
+
+
+def _conv_stages(conv_factory, hidden_dim: int, norm: str, dropout: float, dims: int) -> list[nn.Module]:
+    first, second = conv_factory()
+    return [
+        nn.Sequential(first, _build_norm(norm, hidden_dim, dims=dims), nn.GELU(), nn.Dropout(dropout)),
+        nn.Sequential(second, _build_norm(norm, hidden_dim, dims=dims), nn.GELU()),
+    ]
+
+
+class DilatedTempCNNEncoder(nn.Module):
+    """Architecture 1: dilated 1D convolutions over the flattened calendar grid.
+
+    The second layer is the point of the design. With ``kernel_size=3`` and ``dilation=12`` its taps
+    sit on months ``t-12``, ``t`` and ``t+12``, so a single weight compares a month against the same
+    month in the neighbouring years. ``padding=12`` makes that exactly length-preserving.
+    """
+
+    def __init__(
+        self,
+        num_channels: int,
+        output_dim: int,
+        hidden_dim: int = 32,
+        num_blocks: int = 1,
+        dropout: float = 0.1,
+        norm: str = "batch",
+        pool: str = "masked_avg",
+        mask_between_blocks: bool = True,
+    ):
+        super().__init__()
+        self.pool = str(pool).lower()
+        if self.pool not in {"masked_avg", "avg"}:
+            raise ValueError(f"pool must be 'masked_avg' or 'avg', got {pool!r}")
+
+        hidden_dim = int(hidden_dim)
+        stages: list[nn.Module] = []
+        in_channels = int(num_channels)
+        for _ in range(max(1, int(num_blocks))):
+            channels = in_channels
+            stages += _conv_stages(
+                lambda c=channels: (
+                    # Short-term structure: adjacent months, i.e. within-quarter trend.
+                    nn.Conv1d(c, hidden_dim, kernel_size=3, padding=1, dilation=1),
+                    # Year-over-year: month t wired directly to month t-12.
+                    nn.Conv1d(
+                        hidden_dim,
+                        hidden_dim,
+                        kernel_size=3,
+                        padding=MONTHS_PER_YEAR,
+                        dilation=MONTHS_PER_YEAR,
+                    ),
+                ),
+                hidden_dim,
+                norm,
+                dropout,
+                dims=1,
+            )
+            in_channels = hidden_dim
+        self.blocks = _MaskedConvStack(stages, mask_between=mask_between_blocks)
+        self.projection = nn.Linear(hidden_dim, int(output_dim))
+        self.output_dim = int(output_dim)
+
+    def forward(self, grid: torch.Tensor, cell_mask: torch.Tensor) -> torch.Tensor:
+        batch_size = grid.size(0)
+        sequence = grid.reshape(batch_size, grid.size(1), -1)
+        flat_mask = cell_mask.reshape(batch_size, -1)
+        features = self.blocks(sequence, flat_mask)
+        pooled = masked_global_pool(features, flat_mask, masked=self.pool == "masked_avg")
+        return self.projection(pooled)
+
+
+class AnnualGrid2DEncoder(nn.Module):
+    """Architecture 2: separable 2D convolutions over the (years x months) grid.
+
+    Factorising the kernel is what makes the two axes interpretable. ``(1, 3)`` moves along the month
+    axis within a single year and never mixes years, so it can only learn phenology; ``(3, 1)`` moves
+    along the year axis at a fixed calendar month, so it can only learn how a given month drifts
+    across years.
+    """
+
+    def __init__(
+        self,
+        num_channels: int,
+        output_dim: int,
+        hidden_dim: int = 32,
+        num_blocks: int = 1,
+        dropout: float = 0.1,
+        norm: str = "batch",
+        pool: str = "masked_avg",
+        mask_between_blocks: bool = True,
+    ):
+        super().__init__()
+        self.pool = str(pool).lower()
+        if self.pool not in {"masked_avg", "avg"}:
+            raise ValueError(f"pool must be 'masked_avg' or 'avg', got {pool!r}")
+
+        hidden_dim = int(hidden_dim)
+        stages: list[nn.Module] = []
+        in_channels = int(num_channels)
+        for _ in range(max(1, int(num_blocks))):
+            channels = in_channels
+            stages += _conv_stages(
+                lambda c=channels: (
+                    # Intra-annual: slides across the 12 calendar months, one year at a time.
+                    nn.Conv2d(c, hidden_dim, kernel_size=(1, 3), padding=(0, 1)),
+                    # Inter-annual: slides across years, one calendar month at a time.
+                    nn.Conv2d(hidden_dim, hidden_dim, kernel_size=(3, 1), padding=(1, 0)),
+                ),
+                hidden_dim,
+                norm,
+                dropout,
+                dims=2,
+            )
+            in_channels = hidden_dim
+        self.blocks = _MaskedConvStack(stages, mask_between=mask_between_blocks)
+        self.projection = nn.Linear(hidden_dim, int(output_dim))
+        self.output_dim = int(output_dim)
+
+    def forward(self, grid: torch.Tensor, cell_mask: torch.Tensor) -> torch.Tensor:
+        features = self.blocks(grid, cell_mask)
+        pooled = masked_global_pool(features, cell_mask, masked=self.pool == "masked_avg")
+        return self.projection(pooled)
+
+
+class ConcatGatedFusion(nn.Module):
+    """``Z = concat(static, temporal) * sigmoid(Linear(concat(static, temporal)))``.
+
+    A self-gate over the concatenation, so the output keeps both branches at full width and the gate
+    decides per feature how much of each survives. Note this is *not* the interpolating gate the
+    sequence model uses, which trades one branch off against the other at a shared width.
+    """
+
+    def __init__(self, static_dim: int, temporal_dim: int):
+        super().__init__()
+        self.output_dim = int(static_dim) + int(temporal_dim)
+        self.gate = nn.Linear(self.output_dim, self.output_dim)
+
+    def forward(self, static_features: torch.Tensor, temporal_features: Optional[torch.Tensor]) -> torch.Tensor:
+        joined = (
+            static_features
+            if temporal_features is None
+            else torch.cat([static_features, temporal_features], dim=-1)
+        )
+        return joined * torch.sigmoid(self.gate(joined))

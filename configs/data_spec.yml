@@ -1,0 +1,60 @@
+# Every measured lab value. A column named here is NEVER a feature, whether or not a model is
+# being fitted for it. This is what makes a joint static+targets file safe: without it, commenting
+# a target out of TARGET_COLUMNS silently promotes it to a predictor of the remaining targets.
+LABEL_COLUMNS:
+  - sand_pct
+  - clay_pct
+  - total_silt_pct
+  - fine_silt_pct
+  - coarse_silt_pct
+  - coarse_element_pct
+  - ph_water
+  - caco3_pct_total
+  - caco3_active_pct
+  - c_e_c_meq_100g
+  - ce_ext1_5_ms_cm
+  - na2o_ppm
+  - cl_ppm
+  - na_meq_100g
+  - c_n_ratio
+  - organic_matter_pct
+  - organic_matter_g_kg
+  - exchangeable_k2o_ppm
+  - p2o5_ehangable_olsen_ppm
+  - mgo_ppm
+  - cao_ppm
+  - iron_ppm_dtpa
+  - mn_ppm_dtpa
+  - cu_ppm_dtpa
+  - zn_ppm_dtpa
+  - b_ppm_hot_water
+
+# The subset of LABEL_COLUMNS to actually fit models for in this run. A name on either side is
+# treated as a label and kept out of the features; only these get models fitted.
+TARGET_COLUMNS:
+  - organic_matter_pct
+
+PREDICTOR_COLUMNS: []
+
+# Metadata only. Lab values live in LABEL_COLUMNS and no longer need blacklisting here.
+IGNORED_COLUMNS: &ignored_columns
+  - point_id
+  - lat
+  - lon
+  - geometry
+  - uuid
+  - cluster
+  - date
+
+ELIMINATED_FEATURES: *ignored_columns
+
+CATEGORICAL_FEATURES:
+  - texture_20cm
+  - landform_class
+
+existing_hs_features:
+  enabled: false
+  ignore: false
+  prefix: ["S2_", "S1_", "SOIL_", "AG_", "CLIM_"]
+  band_count: 6
+  band_names: []

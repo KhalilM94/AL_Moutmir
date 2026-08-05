@@ -1,0 +1,3 @@
+# Controls whether Lightning's default logger is enabled.
+# Set to false to disable local lightning_logs/ creation.
+LIGHTNING_ENABLE_DEFAULT_LOGGER: true

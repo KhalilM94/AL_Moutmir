@@ -1,0 +1,38 @@
+common:
+  # Every source below is one path that may be a FILE or a FOLDER of files.
+  data:
+    root: "/home/kmisbah/CESBIO/AL_Moutmir/Soil_Datasets/soil_dataset_20251118_140815"
+    # Static features. Targets may live in this same file (joint) or be listed separately below.
+    static: 'Morocco_Static_Covariates_Processed_V_160726.csv'
+    # Omit / leave null when `static` is a joint file that already carries the target columns.
+    # Lab targets live in their own file; lat/lon are carried across from it on the join.
+    targets: 'Morocco_soil_targets_uuid_roadsafe_6ksample_V_160726.csv'
+    # Time-series always arrives separately: a single file, or a folder of per-modality shards.
+    timeseries: 'Morocco_Soil_Predictors_2017_2025_TS_with_indices_V_160726_Copy.csv'
+    # Optional index.json listing exact paths per source (static_features / targets / timeseries).
+    manifest: null
+  POINT_ID_COLUMN: "uuid"
+  LAT_COLUMN: "lat"
+  LON_COLUMN: "lon"
+  RANDOM_SEED: 42
+  TEST_SIZE: 0.3
+  FAIL_IF_ALL_MODELS_FAIL_FOR_TARGET: true
+  FAIL_ON_MODEL_ERROR: false
+  DATA_SPEC_PATH: "data_spec.yml"
+  SKLEARN_CONFIG_PATH: "sklearn/config.yml"
+  LIGHTNING_CONFIG_PATH: "lightning/config.yml"
+  SKLEARN_REGISTRY_PATH: "sklearn/model_registry.yml"
+  LIGHTNING_REGISTRY_PATH: "lightning/lightning_registry.yml"
+  temporal:
+    enabled: true
+    # Source path lives under `data.timeseries` above.
+    time_column: "observation_date"
+    modality_prefix_map:
+      s2: "S2_"
+      s1: "S1_"
+      soil: "SOIL_"
+      ag: "AG_"
+      clim: "CLIM_"
+  MAIN_FILE_LOGGING_ENABLED: true
+  MLFLOW_EXPERIMENT_EXPORT_ENABLED: false
+  MLFLOW_EXPERIMENT_EXPORT_PATH: "mlflow_exports"

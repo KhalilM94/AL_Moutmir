@@ -1,0 +1,24 @@
+SPLIT_STRATEGY: "kfold" # "groupkfold" or "kfold"
+SKLEARN_FILE_LOGGING_ENABLED: true
+MIN_FEATURE_COUNT: 10
+MAX_FEATURE_DROP_RATIO_WARNING: 0.9
+
+CLUSTERING_STRATEGY:
+  enabled: false
+  class_path: yg_eo_soilnet.clustering_utils.KMeansClusterStrategy # SpatialGridClusterStrategy / KMeansClusterStrategy
+  params:
+    n_clusters: 12
+    # cell_size_m: 5000
+
+COLUMNS_TO_TRANSFORM: []
+
+categorical:
+  TREE_CATEGORICAL_ENCODING: "onehot" # onehot | ordinal | auto
+  TREE_ONEHOT_MAX_CATEGORIES: 30
+
+  CATEGORICAL_FEATURES:
+    - SU_WRB1_PH
+
+  EXCLUDE_CATEGORICAL:
+    # - SU_WRB1_PH
+
