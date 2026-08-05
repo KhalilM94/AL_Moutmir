@@ -58,10 +58,13 @@ class FakeGridSearchCV:
 
 
 class FakeCVSplitter:
+    instances = []
+
     def __init__(self, cv_strategy, n_splits, random_state):
         self.cv_strategy = cv_strategy
         self.n_splits = n_splits
         self.random_state = random_state
+        FakeCVSplitter.instances.append(self)
 
     def create_splits(self, X, y=None, groups=None):
         return [(list(range(len(X) - 1)), [len(X) - 1])]
@@ -163,3 +166,170 @@ def test_train_skips_when_target_has_no_valid_rows(monkeypatch: pytest.MonkeyPat
     )
 
     assert trainer.logger.warning.called
+
+
+def test_train_warns_when_valid_rows_are_too_few(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = SimpleNamespace(
+        CATEGORICAL_FEATURES=[],
+        CLUSTERING_STRATEGY={"enabled": False, "params": {}},
+        MIN_FEATURE_COUNT=5,
+    )
+    trainer = ModelTrainer(config=config, logger=MagicMock())
+
+    monkeypatch.setattr(trainer_module, "ChildRunLogger", lambda: FakeChildLogger())
+    monkeypatch.setattr(trainer_module, "CVSplitter", FakeCVSplitter)
+    monkeypatch.setattr(trainer_module, "GridSearchCV", FakeGridSearchCV)
+    monkeypatch.setattr(trainer_module, "clone", lambda obj: obj)
+    monkeypatch.setattr(trainer_module.PipelineBuilder, "build", lambda self, *args, **kwargs: FakePipeline())
+
+    data = {
+        "X_train": pd.DataFrame({"lat": [0, 1, 2], "lon": [1, 2, 3], "num": [1, 2, 3]}),
+        "X_test": pd.DataFrame({"lat": [3], "lon": [4], "num": [4]}),
+        "y_train": pd.DataFrame({"target_a": [1.0, 2.0, 3.0]}),
+        "y_test": pd.DataFrame({"target_a": [4.0]}),
+    }
+
+    trainer.train(
+        target="target_a",
+        data=data,
+        model_pipelines={"linear": {"model": object(), "params": {}, "modeltype": "ml"}},
+    )
+
+    warning_messages = [call.args[0] for call in trainer.logger.warning.call_args_list]
+    assert any("only 3 valid training rows" in message for message in warning_messages)
+
+
+def test_train_uses_per_model_random_seed_for_cv(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeGridSearchCV.instances.clear()
+    FakeCVSplitter.instances.clear()
+
+    config = SimpleNamespace(CATEGORICAL_FEATURES=[], CLUSTERING_STRATEGY={"enabled": False, "params": {}})
+    trainer = ModelTrainer(
+        config=config,
+        columns_to_transform=[],
+        enable_clustering=False,
+        split_strategy="kfold",
+        seed=42,
+        n_splits=2,
+        logger=MagicMock(),
+    )
+
+    monkeypatch.setattr(trainer_module, "ChildRunLogger", lambda: FakeChildLogger())
+    monkeypatch.setattr(trainer_module, "CVSplitter", FakeCVSplitter)
+    monkeypatch.setattr(trainer_module, "GridSearchCV", FakeGridSearchCV)
+    monkeypatch.setattr(trainer_module, "clone", lambda obj: obj)
+    monkeypatch.setattr(trainer_module.PipelineBuilder, "build", lambda self, *args, **kwargs: FakePipeline())
+
+    class LinearRegressionModel:
+        pass
+
+    LinearRegressionModel.__module__ = "sklearn.linear_model"
+
+    data = {
+        "X_train": pd.DataFrame({"lat": [0, 1, 2], "lon": [10, 11, 12], "num": [1, 2, 3]}),
+        "X_test": pd.DataFrame({"lat": [3], "lon": [13], "num": [4]}),
+        "y_train": pd.DataFrame({"target_a": [1.0, 2.0, 3.0]}),
+        "y_test": pd.DataFrame({"target_a": [4.0]}),
+    }
+
+    trainer.train(
+        target="target_a",
+        data=data,
+        model_pipelines={
+            "linear": {
+                "model": LinearRegressionModel(),
+                "params": {"model__alpha": [0.1]},
+                "modeltype": "ml",
+                "random_seed": 99,
+            }
+        },
+    )
+
+    assert FakeCVSplitter.instances
+    assert FakeCVSplitter.instances[0].random_state == 99
+
+
+def test_model_trainer_falls_back_to_sklearn_file_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    class FakeTrainingLogger:
+        def __init__(self, *args, **kwargs):
+            captured["kwargs"] = kwargs
+
+        def get_logger(self):
+            return MagicMock()
+
+    monkeypatch.setattr(trainer_module, "TrainingLogger", FakeTrainingLogger)
+
+    config = SimpleNamespace(SKLEARN_FILE_LOGGING_ENABLED=False)
+    ModelTrainer(config=config, logger=None)
+
+    assert captured["kwargs"]["enable_file_logging"] is False
+
+# --- failure policy and dtype handling --------------------------------------
+
+
+def _minimal_trainer(**config_overrides) -> ModelTrainer:
+    defaults = dict(
+        MIN_FEATURE_COUNT=1, CATEGORICAL_FEATURES=[], EXCLUDE_CATEGORICAL=[],
+        FAIL_ON_MODEL_ERROR=False, FAIL_IF_ALL_MODELS_FAIL_FOR_TARGET=True,
+        TREE_CATEGORICAL_ENCODING="ordinal", TREE_ONEHOT_MAX_CATEGORIES=None,
+    )
+    defaults.update(config_overrides)
+    return ModelTrainer(
+        config=SimpleNamespace(**defaults), columns_to_transform=[], enable_clustering=False,
+        split_strategy="kfold", seed=42, logger=MagicMock(),
+    )
+
+
+def _int_data():
+    return {
+        "X_train": pd.DataFrame({"i": pd.Series([1, 2, 3, 4], dtype="int64"), "f": [1.0, 2.0, 3.0, 4.0]}),
+        "y_train": pd.DataFrame({"t": [1.0, 2.0, 3.0, 4.0]}),
+        "X_test": pd.DataFrame({"i": pd.Series([5, 6], dtype="int64"), "f": [5.0, 6.0]}),
+        "y_test": pd.DataFrame({"t": [5.0, 6.0]}),
+    }
+
+
+def test_x_test_integer_columns_are_cast_to_float(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cast keyed off X_train's already-converted dtypes, so X_test stayed int64."""
+    seen = []
+    original = trainer_module.TargetNanFilter
+
+    class _Capture(original):
+        def transform(self, X, y=None, groups=None):
+            seen.append(dict(X.dtypes))
+            return original.transform(self, X, y, groups)
+
+    monkeypatch.setattr(trainer_module, "TargetNanFilter", _Capture)
+    trainer = _minimal_trainer(FAIL_IF_ALL_MODELS_FAIL_FOR_TARGET=False)
+    trainer.train(target="t", data=_int_data(), model_pipelines={})
+
+    assert len(seen) == 2, "expected X_train and X_test to both reach the filter"
+    x_train_dtypes, x_test_dtypes = seen
+    assert str(x_train_dtypes["i"]) == "float64"
+    assert str(x_test_dtypes["i"]) == "float64"   # int64 before the fix
+
+
+def test_all_models_failing_raises_when_configured() -> None:
+    """A target where every model errored used to exit 0 with an empty MLflow run."""
+    trainer = _minimal_trainer(FAIL_IF_ALL_MODELS_FAIL_FOR_TARGET=True)
+    pipelines = {"boom": {"model": object(), "params": {}, "modeltype": "ml"}}
+
+    with pytest.raises(RuntimeError, match="All 1 model\\(s\\) failed to train for target 't'"):
+        trainer.train(target="t", data=_int_data(), model_pipelines=pipelines)
+
+
+def test_all_models_failing_is_tolerated_when_flag_is_off() -> None:
+    trainer = _minimal_trainer(FAIL_IF_ALL_MODELS_FAIL_FOR_TARGET=False)
+    pipelines = {"boom": {"model": object(), "params": {}, "modeltype": "ml"}}
+
+    trainer.train(target="t", data=_int_data(), model_pipelines=pipelines)   # must not raise
+
+
+def test_fail_on_model_error_reraises_immediately() -> None:
+    trainer = _minimal_trainer(FAIL_ON_MODEL_ERROR=True)
+    pipelines = {"boom": {"model": object(), "params": {}, "modeltype": "ml"}}
+
+    with pytest.raises(Exception):
+        trainer.train(target="t", data=_int_data(), model_pipelines=pipelines)

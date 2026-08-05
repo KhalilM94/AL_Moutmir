@@ -1,0 +1,272 @@
+# Static covariates + one CNN per modality over a rasterised (years x months) calendar grid.
+#
+# Convolution needs a regular lattice, so the model scatters each ragged, date-stamped reading into
+# the (year, month) cell its date names. Rows are counted back from each point's OWN latest
+# observation and columns are calendar months, so nothing is tied to a date range. grid_years is
+# inferred from the data, and adaptive pooling means no weight depends on it.
+soil_cnn:
+  enabled: true
+  modeltype: dl
+  input_kind: sequence
+  import_path: yg_eo_soilnet.models.lightningmodules.soil_cnn_lightning_module.SoilCNNLightningModule
+  datamodule_import_path: yg_eo_soilnet.datamodules.sequence.sequence_datamodule.SoilSequenceDataModule
+  init_args:
+    static_dim: auto
+    target_dim: auto
+    modality_dims: auto
+    grid_years: auto                    # inferred: 9 on this dataset, 1 on a one-year dataset
+
+    # dilated_tempcnn : Conv1d(k=3,d=1) then Conv1d(k=3,pad=12,d=12), month t <-> month t-12
+    # annual_grid2d   : Conv2d((1,3)) across months, then Conv2d((3,1)) across years
+    temporal_encoder: dilated_tempcnn
+    cnn_hidden_dim: 64                  # scalar, or a per-modality mapping
+    modality_embed_dim: 64              # scalar, or a per-modality mapping
+    num_blocks: 1                       # repeat the conv pair this many times
+    cnn_norm: batch                     # batch | group | none (group avoids empty-cell pollution)
+    pool: masked_avg                    # masked_avg | avg  (avg = the literal AdaptiveAvgPool)
+    month_positional: true              # sin/cos month channels; without them pooling loses position
+    use_validity_channels: true         # per-channel measured-vs-median-filled flags
+
+    static_hidden_dim: 64
+    head_hidden_dims: [64]         # LayerNorm + GELU per block
+    head_norm_final: false              # true restores LayerNorm on the block feeding the readout
+    dropout: 0.2
+
+    loss_name: mse                      # mse | huber | smooth_l1
+    huber_delta: 1.0
+    learning_rate: 0.001
+    temporal_enabled: true
+    optimizer_name: adamw
+    weight_decay: 0.0001
+    scheduler_type: plateau
+    scheduler_factor: 0.5
+    scheduler_patience: 20              # counted in EPOCHS
+    scheduler_min_lr: 1.0e-06
+    scheduler_monitor: val_loss
+  datamodule_init_args:
+    batch_size: 32
+    val_size: 0.3
+    test_size: 0.15                     # splits apply sequentially
+    target_transform: log1p             # null | log1p (log1p also standardizes in transformed space)
+    num_workers: 11
+    pin_memory: false
+    persistent_workers: false
+    seed: 42
+    shuffle: true
+    max_sequence_length: null
+  trainer_args:
+    max_epochs: 500
+    accelerator: cuda
+    devices: 1
+    precision: 32-true
+    accumulate_grad_batches: 1
+    gradient_clip_val: 1.0
+    log_every_n_steps: 5
+    enable_checkpointing: true
+    deterministic: true
+  callbacks:
+    early_stopping:
+      monitor: val_loss
+      mode: min
+      patience: 30
+    checkpoint:
+      monitor: val_loss
+      mode: min
+      save_top_k: 1
+  tags:
+    framework: lightning
+    family: regression
+    architecture: calendar-grid-cnn
+
+# Static covariates + one sequence encoder per modality, blended by a learned gate. No graph.
+#
+# Sequences are ragged and date-stamped: each point carries only its real observations, padded per
+# batch. Nothing here is tied to a number of steps or to a date range, so a trained checkpoint runs
+# on any future window with different lengths and a different cadence.
+soil_sequence:
+  enabled: true
+  modeltype: dl
+  input_kind: sequence
+  import_path: yg_eo_soilnet.models.lightningmodules.soil_sequence_lightning_module.SoilSequenceLightningModule
+  datamodule_import_path: yg_eo_soilnet.datamodules.sequence.sequence_datamodule.SoilSequenceDataModule
+  init_args:
+    static_dim: auto
+    target_dim: auto
+    modality_dims: auto
+    # No temporal_steps and no edge_attr_dim on purpose: the model is length-agnostic and graph-free,
+    # and the sequence datamodule exposes neither, so the factory cannot inject them.
+
+    temporal_encoder: time_transformer   # time_transformer | time_lstm
+    modality_embed_dim: 64               # scalar, or a per-modality mapping like lstm_hidden_dim
+    fusion_dim: 64
+    static_hidden_dim: 64
+
+    # --- time_transformer branch: Time2Vec positions + [CLS] pooling ---
+    d_model: 48                          # must be divisible by nhead
+    nhead: 4
+    num_layers: 2
+    time2vec_dim: 8
+    # --- time_lstm branch: calendar/gap channels + masked pooling ---
+    lstm_hidden_dim: 64
+    lstm_num_layers: 1
+    lstm_bidirectional: false
+    temporal_pooling: mean_max_last      # mean_max_last | last | attention
+
+    span_cap_years: 8.0                  # relative-age saturation, NOT a date range
+    delta_cap_months: 24.0               # gap saturation
+    dropout: 0.1
+
+    # --- post-fusion depth: 0 = single Linear(fusion -> target) ---
+    head_num_layers: 1
+    head_hidden_dim: 64                  # halves per layer, floored at head_min_hidden_dim: 64 -> 64 -> 32 -> 1
+    head_min_hidden_dim: 16
+    use_layer_norm: true
+    # batch | layer | none. BatchNorm1d normalizes per feature across the batch and preserves the
+    # per-sample magnitude a regressor needs; LayerNorm here erases it and caps how far predictions
+    # can move from the target mean.
+    fusion_norm_type: batch
+
+    loss_name: mse                       # mse | huber | smooth_l1
+    huber_delta: 1.0
+    learning_rate: 0.01
+    temporal_enabled: true
+    optimizer_name: adamw
+    weight_decay: 0.005
+    scheduler_type: plateau
+    scheduler_factor: 0.5
+    scheduler_patience: 20               # counted in EPOCHS
+    scheduler_min_lr: 1.0e-06
+    scheduler_monitor: val_loss
+  datamodule_init_args:
+    batch_size: 32
+    val_size: 0.3
+    test_size: 0.15                      # splits apply sequentially
+    target_transform: log1p              # null | log1p (log1p also standardizes in transformed space)
+    num_workers: 11
+    pin_memory: false
+    persistent_workers: false
+    seed: 42
+    shuffle: true
+    max_sequence_length: null            # tail-truncate very long series; null keeps everything
+  trainer_args:
+    max_epochs: 500
+    accelerator: cuda
+    devices: 1
+    precision: 32-true
+    accumulate_grad_batches: 1
+    gradient_clip_val: 1.0
+    log_every_n_steps: 5
+    enable_checkpointing: true
+    deterministic: true
+  callbacks:
+    early_stopping:
+      monitor: val_loss
+      mode: min
+      patience: 30
+    checkpoint:
+      monitor: val_loss
+      mode: min
+      save_top_k: 1
+  tags:
+    framework: lightning
+    family: regression
+    architecture: static-dynamic-sequence
+
+# Superseded by soil_sequence. Kept enabled:false so the dense-axis baseline stays reproducible -
+# see lightning_logs/version_79 for the R2 ~= 0.20 reference run.
+soil_graph:
+  enabled: false
+  modeltype: dl
+  input_kind: graph
+  import_path: yg_eo_soilnet.models.lightningmodules.soil_graph_lightning_module.SoilGraphLightningModule
+  datamodule_import_path: yg_eo_soilnet.datamodules.lightning.lightning_graph.SingleNodeGraphDataModule
+  init_args:
+    static_dim: auto
+    target_dim: auto
+    modality_dims: auto
+    temporal_steps: auto
+    edge_attr_dim: auto
+    num_graph_layers: 1              # spatial_graph_enabled is false, so these blocks never run
+
+    # --- per-branch width: size each branch to its own channel count ---
+    static_hidden_dim: 32            # 13 covariates -> 11   (was 11 -> 64, a 5.8x blow-up)
+    temporal_lstm_num_layers: 1
+    temporal_lstm_dropout: 0.1       # was 0.0; active since temporal_lstm_num_layers > 1
+    temporal_lstm_bidirectional: false
+    temporal_pooling: last
+    temporal_lstm_hidden_dim:        # a scalar here applies one width to every modality
+      s2: 48                         # 10 channels
+      s1: 32                         #  8 channels
+      soil: 16                       #  3 channels  (was 3 -> 64, a 21x blow-up)
+      ag: 16                         #  3 channels
+      clim: 16                       #  3 channels
+    # fused vector: 11 + (48+32+16+16+16) = 139   (was 384)
+
+    # --- post-concat depth: 0 = single Linear(fusion -> target) ---
+    head_num_layers: 3
+    head_hidden_dim: 64             # halves per layer, floored at head_min_hidden_dim:
+    head_min_hidden_dim: 32          #   139 -> 128 -> 64 -> 1
+                                     # The block feeding the readout carries no norm/dropout, so the
+                                     # final Linear still sees an unnormalized vector.
+
+    # --- normalization (static encoder, head, graph blocks) ---
+    use_layer_norm: true
+    # batch | layer | none. BatchNorm1d normalizes per feature across the batch and preserves the
+    # per-sample magnitude a regressor needs; LayerNorm here erases it and caps how far predictions
+    # can move from the target mean.
+    fusion_norm_type: batch
+
+    # --- loss: mse | huber | smooth_l1 (huber_delta is the Huber delta / SmoothL1 beta) ---
+    loss_name: mse
+    huber_delta: 1.0
+
+    dropout: 0.1                     # was 0.0
+    learning_rate: 0.001
+    temporal_enabled: true
+    spatial_graph_enabled: false
+    optimizer_name: adamw
+    weight_decay: 0.0001
+    scheduler_type: plateau
+    scheduler_factor: 0.5
+    scheduler_patience: 20          # counted in EPOCHS; at ~23 steps/epoch that is ~460 steps
+    scheduler_min_lr: 1.0e-06
+    scheduler_monitor: val_loss
+  datamodule_init_args:
+    batch_size: 32                 # 512 over ~2.9k train nodes was only 6 optimizer steps/epoch
+    val_size: 0.3
+    test_size: 0.15                 # splits apply sequentially: without this, train was 0.7*0.7=0.49
+    target_transform: log1p          # null | log1p  (log1p also standardizes in transformed space)
+    num_workers: 11                 # collate pickles the whole datamodule per worker
+    pin_memory: false
+    persistent_workers: false
+    seed: 42
+    shuffle: true
+  graph_data_args:
+    convert_coordinates_to_utm: true
+    coordinate_crs: EPSG:4326
+    spatial_radius: 5000
+    baseline_method: knn
+    baseline_k_neighbors: 20
+  trainer_args:
+    max_epochs: 500                 # the last run stopped after 420 optimizer steps, still improving
+    accelerator: cuda
+    devices: 1
+    precision: 32-true
+    accumulate_grad_batches: 1
+    gradient_clip_val: 1.0          # 3-layer LSTMs over 108 steps were running unclipped
+    log_every_n_steps: 5
+    enable_checkpointing: true
+    deterministic: true
+  callbacks:
+    early_stopping:
+      monitor: val_loss
+      mode: min
+      patience: 30                  # 10 fired on ties/noise while train_loss was still falling
+    checkpoint:
+      monitor: val_loss
+      mode: min
+      save_top_k: 1
+  tags:
+    framework: lightning
+    family: regression
+    architecture: single-node-graph

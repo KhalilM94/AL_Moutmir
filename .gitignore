@@ -13,6 +13,8 @@ htmlcov/
 
 # ML / training artifacts
 mlruns/
+lightning_logs/
+mlflow_exports/
 
 # Build artifacts
 build/
@@ -22,3 +24,7 @@ dist/
 # OS / editor noise
 .DS_Store
 .vscode/
+
+# Datasets
+*.csv
+*.png

@@ -2,6 +2,134 @@ from yg_eo_soilnet.utils import rpiq_score
 from sklearn.metrics import r2_score, root_mean_squared_error
 import numpy as np
 import seaborn as sns
+def _normalise_target_names(values):
+    if values is None:
+        return []
+    if isinstance(values, str):
+        return [values]
+    try:
+        return [value for value in values if value is not None and str(value) != ""]
+    except TypeError:
+        return [values]
+
+
+def _resolve_prediction_column(df, target_name=None, target_index=None):
+    candidates = []
+    if target_name:
+        candidates.extend(
+            [
+                f"prediction_{target_name}",
+                f"prediction_{str(target_name).replace(' ', '_')}",
+                f"pred_{target_name}",
+            ]
+        )
+    if target_index is not None:
+        candidates.append(f"prediction_{target_index}")
+    candidates.append("prediction")
+
+    for column_name in candidates:
+        if column_name in df.columns:
+            return column_name
+
+    prediction_columns = [column_name for column_name in df.columns if column_name.startswith("prediction_")]
+    if target_index is not None and target_index < len(prediction_columns):
+        return prediction_columns[target_index]
+    if prediction_columns:
+        return prediction_columns[0]
+    return None
+
+
+def _create_parent_pred_obs_multitarget(eval_dfs):
+    if not eval_dfs:
+        return None
+
+    prepared_frames = []
+    target_names = []
+
+    for eval_df in eval_dfs:
+        if eval_df is None or eval_df.empty:
+            continue
+        frame = eval_df.copy()
+        frame_targets = _normalise_target_names(frame["target_name"].dropna().unique()) if "target_name" in frame.columns else []
+        if not frame_targets:
+            frame_targets = [None]
+        frame["_resolved_target_name"] = frame["target_name"] if "target_name" in frame.columns else None
+        prepared_frames.append((frame, frame_targets))
+        for target_name in frame_targets:
+            if target_name is not None and target_name not in target_names:
+                target_names.append(target_name)
+
+    if not prepared_frames:
+        return None
+
+    if not target_names:
+        target_names = [None]
+
+    import math
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    n_targets = len(target_names)
+    n_cols = min(2, n_targets) if n_targets > 1 else 1
+    n_rows = math.ceil(n_targets / n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False)
+
+    for target_index, target_name in enumerate(target_names):
+        axis = axes[target_index // n_cols][target_index % n_cols]
+        axis.set_title(str(target_name) if target_name is not None else "Predicted vs observed")
+        axis.set_xlabel("Observed")
+        axis.set_ylabel("Predicted")
+
+        all_values = []
+        for frame, frame_targets in prepared_frames:
+            resolved_target_name = target_name if target_name is not None else (frame_targets[0] if frame_targets else None)
+            prediction_column = _resolve_prediction_column(frame, resolved_target_name, target_index)
+            if prediction_column is None:
+                continue
+
+            observed_column = None
+            for candidate in (
+                resolved_target_name,
+                "target",
+                "y_true",
+                "obs",
+                "observation",
+                "actual",
+            ):
+                if candidate is not None and candidate in frame.columns:
+                    observed_column = candidate
+                    break
+
+            if observed_column is None:
+                numeric_candidates = [column_name for column_name in frame.columns if column_name not in {"model_name", "target_name"}]
+                if numeric_candidates:
+                    observed_column = numeric_candidates[0]
+                else:
+                    continue
+
+            x_values = frame[observed_column].to_numpy()
+            y_values = frame[prediction_column].to_numpy()
+            valid_mask = np.isfinite(x_values) & np.isfinite(y_values)
+            if not valid_mask.any():
+                continue
+
+            model_name = frame["model_name"].iloc[0] if "model_name" in frame.columns and not frame["model_name"].empty else "model"
+            axis.scatter(x_values[valid_mask], y_values[valid_mask], alpha=0.5, s=18, label=str(model_name))
+            all_values.extend([x_values[valid_mask], y_values[valid_mask]])
+
+        if all_values:
+            combined = np.concatenate(all_values)
+            min_value = np.nanmin(combined)
+            max_value = np.nanmax(combined)
+            axis.plot([min_value, max_value], [min_value, max_value], linestyle="--", color="black", linewidth=1)
+        axis.legend(loc="best")
+
+    for axis in axes.flatten()[n_targets:]:
+        axis.set_visible(False)
+
+    fig.tight_layout()
+    return fig
+
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -208,7 +336,10 @@ def create_pred_obs_plot(eval_df, builtin_metrics, artifacts_dir):
     ax.set_axisbelow(True)
     # --- Panel 3: KDE density plot ---
     ax = axes[2]
-    sns.kdeplot(x=y_test, y=y_pred, fill=True, cmap="gnuplot2", thresh=0.005, levels=200, ax=ax)
+    if np.std(y_test) > 0 and np.std(y_pred) > 0 and np.corrcoef(y_test, y_pred)[0, 1] != 1:
+        sns.kdeplot(x=y_test, y=y_pred, fill=True, cmap="gnuplot2", thresh=0.005, levels=200, ax=ax)
+    else:
+        ax.scatter(y_test, y_pred, alpha=0.6, edgecolor='k')
     ax.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
     ax.set_xlabel("Actual")
     ax.set_ylabel("Predicted")
@@ -222,55 +353,7 @@ def create_pred_obs_plot(eval_df, builtin_metrics, artifacts_dir):
     return {"obs_pred_and_residual_plot": plot_path}
 
 def create_parent_pred_obs(eval_dfs):
-    """
-    Create a multi-panel parent run plot:
-    Each row = target, each column = model (Pred vs Obs + Residuals).
-    """
-    # Unique targets + models
-    targets = sorted(set(df["target_name"].iloc[0] for df in eval_dfs))
-    models = sorted(set(df["model_name"].iloc[0] for df in eval_dfs))
-
-    n_rows = len(targets)
-    n_cols = len(models)
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 5*n_rows))
-    
-    # Normalize axes shape → always 2D array (n_rows, n_cols)
-    if n_rows == 1 and n_cols == 1:
-        axes = np.array([[axes]])
-    elif n_rows == 1:
-        axes = np.array([axes])  # shape (1, n_cols)
-    elif n_cols == 1:
-        axes = axes[:, np.newaxis]  # shape (n_rows, 1)
-
-    for i, target in enumerate(targets):
-        for j, model in enumerate(models):
-            # Subset the correct eval_df
-            df = next(df for df in eval_dfs if df["target_name"].iloc[0] == target and df["model_name"].iloc[0] == model)
-            y_test = df[target]
-            y_pred = df["prediction"]
-
-            # Panel 1: Predicted vs Actual
-            ax1 = axes[i, j]
-            sns.regplot(x=y_test, y=y_pred, ax=ax1,
-                        scatter_kws={'alpha': 0.6, 'edgecolor': 'k'},
-                        line_kws={'color': 'blue'})
-            ax1.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
-            ax1.set_xlabel("Actual")
-            ax1.set_ylabel("Predicted")
-            ax1.set_title(f"{target} | {model}\nPredicted vs Actual")
-
-            ax1.text(0.05, 0.95,
-                     f"RMSE={root_mean_squared_error(y_test, y_pred):.2f}\n"
-                     f"R²={r2_score(y_test, y_pred):.2f}\n"
-                     f"RPIQ={rpiq_score(y_test, y_pred):.2f}",
-                     transform=ax1.transAxes,
-                     verticalalignment='top',
-                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-
-    fig.suptitle("Summary Predicted Error plots", fontsize=18)
-    fig.tight_layout()
-    return fig
+    return _create_parent_pred_obs_multitarget(eval_dfs)
 
 def plot_leaderboard_scatter(leaderboard_df, metric_x="rmse_test", metric_y="r2_test",
                                         label_col="model", hue_col="target"):
@@ -278,6 +361,24 @@ def plot_leaderboard_scatter(leaderboard_df, metric_x="rmse_test", metric_y="r2_
     Create a scatter subplot for each target showing model performance,
     with average RMSE and R² lines per target.
     """
+    if leaderboard_df is None or leaderboard_df.empty:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.text(0.5, 0.5, "No leaderboard rows available", ha="center", va="center")
+        ax.axis("off")
+        return fig
+
+    if metric_x not in leaderboard_df.columns or metric_y not in leaderboard_df.columns:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(
+            0.5,
+            0.5,
+            f"Skipping leaderboard scatter: missing metric columns '{metric_x}' or '{metric_y}'",
+            ha="center",
+            va="center",
+        )
+        ax.axis("off")
+        return fig
+
     # Defensive checks
     if leaderboard_df is None or len(leaderboard_df) == 0:
         fig, ax = plt.subplots(figsize=(3, 3))

@@ -5,7 +5,7 @@ from typing import Optional, List, Dict
 import traceback
 
 from yg_eo_soilnet.logger import ChildRunLogger, TrainingLogger
-from yg_eo_soilnet.trainer_utils import (CVSplitter, PipelineBuilder, TargetNanFilter)
+from yg_eo_soilnet.datamodules.scikit.scikit_trainer_utils import (CVSplitter, PipelineBuilder, TargetNanFilter)
 from yg_eo_soilnet.utils import LogTransformer
 
 class ModelTrainer:
@@ -26,9 +26,17 @@ class ModelTrainer:
         self.split_strategy = split_strategy
         self.seed = seed
         self.n_splits = n_splits
-        self.logger = logger or TrainingLogger().get_logger()
+        if logger is not None:
+            self.logger = logger
+        else:
+            self.logger = TrainingLogger(
+                enable_file_logging=getattr(config, 'SKLEARN_FILE_LOGGING_ENABLED', True),
+            ).get_logger()
         self.tuning_verbose = tuning_verbose
-        self.pipeline_builder = PipelineBuilder()
+        self.pipeline_builder = PipelineBuilder(
+            tree_categorical_encoding=getattr(config, "TREE_CATEGORICAL_ENCODING", "ordinal"),
+            tree_onehot_max_categories=getattr(config, "TREE_ONEHOT_MAX_CATEGORIES", None),
+        )
         
         self.log_transformer = LogTransformer()
 
@@ -46,8 +54,10 @@ class ModelTrainer:
         X_train = data['X_train']
         X_train = X_train.astype({col: 'float64' for col in X_train.select_dtypes(include=['int64', 'int32']).columns})
         y_train = data['y_train'][target]
-        X_test = data['X_test'] 
-        X_test = X_test.astype({col: 'float64' for col in X_train.select_dtypes(include=['int64', 'int32']).columns})
+        X_test = data['X_test']
+        # Must read X_test's own dtypes: X_train was already converted above, so keying off it
+        # produced an empty mapping and left X_test integer-typed.
+        X_test = X_test.astype({col: 'float64' for col in X_test.select_dtypes(include=['int64', 'int32']).columns})
         y_test = data['y_test'][target]
         groups_train = data['groups_train'] if self.enable_clustering else None
 
@@ -58,16 +68,36 @@ class ModelTrainer:
         else:
             X_test, y_test = None, None
 
+        min_feature_count = int(getattr(self.config, "MIN_FEATURE_COUNT", 10))
+        min_valid_rows = max(5, min_feature_count, int(X_train.shape[1]))
+        if y_train is not None and not y_train.empty and len(y_train) < min_valid_rows:
+            self.logger.warning(
+                f"Target {target} has only {len(y_train)} valid training rows after NaN filtering; "
+                f"minimum recommended is {min_valid_rows} for {X_train.shape[1]} features."
+            )
+        if y_test is not None and hasattr(y_test, 'empty') and not y_test.empty and len(y_test) < min_valid_rows:
+            self.logger.warning(
+                f"Target {target} has only {len(y_test)} valid test rows after NaN filtering; "
+                f"minimum recommended is {min_valid_rows} for {X_train.shape[1]} features."
+            )
+
         if not self._should_skip_target(y_train, y_test, target):
 
             is_log_target = target in self.columns_to_transform
             mlflow_logger = ChildRunLogger()
 
+            trained_models = 0
             for model_name, config in model_pipelines.items():
                 try:
                     self.logger.info(f"Training {model_name} for {target}")
 
-                    cv_splitter = CVSplitter(cv_strategy=self.split_strategy, n_splits=self.n_splits, random_state=self.seed)
+                    model_seed = int(config.get("random_seed", self.seed))
+
+                    cv_splitter = CVSplitter(
+                        cv_strategy=self.split_strategy,
+                        n_splits=self.n_splits,
+                        random_state=model_seed,
+                    )
                     splits = cv_splitter.create_splits(X_train, y_train, groups_train)
 
                     model = config["model"]
@@ -147,13 +177,21 @@ class ModelTrainer:
                                 "categorical_encoding": categorical_encoding,
                             },
                             )
-                    elif modeltype == "dl":
-                        continue
                     else:
                         raise ValueError(f"Unknown modeltype: {modeltype}")
+                    trained_models += 1
                 except Exception as e:
                     self.logger.warning(f"Training failed for {model_name} on {target}: {e}")
-                    print(f"Exception caught:\n{traceback.format_exc()}")
+                    self.logger.debug(traceback.format_exc())
+                    if getattr(self.config, "FAIL_ON_MODEL_ERROR", False):
+                        raise
+
+            # Without this, a target where every model failed still exits 0 with an empty MLflow run.
+            if trained_models == 0 and getattr(self.config, "FAIL_IF_ALL_MODELS_FAIL_FOR_TARGET", True):
+                raise RuntimeError(
+                    f"All {len(model_pipelines)} model(s) failed to train for target {target!r}; "
+                    "see the warnings above. Set FAIL_IF_ALL_MODELS_FAIL_FOR_TARGET: false to continue anyway."
+                )
 
         else:
             self.logger.warning(f"Skipping training for target {target} due to insufficient data.")

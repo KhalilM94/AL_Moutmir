@@ -2,7 +2,8 @@ from sklearn.base import BaseEstimator, TransformerMixin
 import numpy as np
 import geopandas as gpd
 from shapely.geometry import box
-from pyproj import CRS
+from shapely.ops import transform as shapely_transform
+from pyproj import CRS, Transformer
 from sklearn.metrics import make_scorer, root_mean_squared_error
 from mlflow.models import make_metric
 
@@ -27,7 +28,7 @@ def assign_grid_ids(df, cell_size_m, lon_col='lon', lat_col='lat'):
         if gdf_wgs.crs is None:
             gdf_wgs.set_crs('EPSG:4326', inplace=True)
         elif gdf_wgs.crs.to_epsg() != 4326:
-            gdf_wgs = gdf_wgs.to_crs(4326)
+            gdf_wgs = gdf_wgs.to_crs(epsg=4326)
     else:
         gdf_wgs = gpd.GeoDataFrame(
             df.copy(),
@@ -35,8 +36,22 @@ def assign_grid_ids(df, cell_size_m, lon_col='lon', lat_col='lat'):
             crs='EPSG:4326'
         )
 
-    utm_crs = _infer_utm_crs(gdf_wgs[lon_col], gdf_wgs[lat_col])
-    gdf_utm = gdf_wgs.to_crs(utm_crs)
+    lon_mean = float(gdf_wgs[lon_col].mean())
+    lat_mean = float(gdf_wgs[lat_col].mean())
+    utm_epsg = 32600 + int((lon_mean + 180) // 6) + 1 if lat_mean >= 0 else 32700 + int((lon_mean + 180) // 6) + 1
+    utm_crs = CRS.from_epsg(utm_epsg)
+
+    if gdf_wgs.crs is None:
+        raise ValueError("Input GeoDataFrame must have a CRS to reproject")
+
+    transformer = Transformer.from_crs(gdf_wgs.crs, utm_crs, always_xy=True)
+    gdf_utm = gdf_wgs.copy()
+    gdf_utm.geometry = gdf_utm.geometry.apply(
+        lambda geom: shapely_transform(lambda x, y, z=None: transformer.transform(x, y), geom)
+        if geom is not None
+        else None
+    )
+    gdf_utm = gdf_utm.set_crs(utm_crs, allow_override=True)
 
     xmin, ymin, xmax, ymax = gdf_utm.total_bounds
     width, height = xmax - xmin, ymax - ymin
@@ -86,7 +101,4 @@ def rpiq_score(predictions, targets):
     return iqr / rmse
 
 # Create sklearn scorers
-rpd = make_scorer(rpd_score, greater_is_better=True)
-rpiq = make_scorer(rpiq_score, greater_is_better=True)
-mlflow_rpd_score = make_metric(eval_fn=rpd_score, greater_is_better=True, name="rpd_score")
 mlflow_rpiq_score = make_metric(eval_fn=rpiq_score, greater_is_better=True, name="rpiq_score")

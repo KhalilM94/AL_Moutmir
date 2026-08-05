@@ -2,10 +2,10 @@
 authors = [{name = "KhalilM94", email = "khalil.misbah@protonmail.com"}]
 license = "MIT"
 name = "yg-eo-soilnet"
-requires-python = ">= 3.10"
+requires-python = ">= 3.12,<3.13"
 version = "0.1.0"
 readme = "README.md"
-dependencies = ["mlflow==3.14.*", "psutil>=7.2.2,<8", "pip>=26.1.2,<27"]
+dependencies = ["mlflow==3.14.*", "psutil>=7.2.2,<8", "pip>=26.1.2,<27", "ipykernel>=7.3.0,<8"]
 
 [project.urls]
 Homepage = "https://github.com/KhalilM94/yg-eo-soilnet"
@@ -27,21 +27,20 @@ version = "0.1.0"
 [tool.pixi.pypi-dependencies]
 yg_eo_soilnet = { path = ".", editable = true }
 
-[tool.pixi.tasks]
-mlflow = { cmd = "mlflow ui", env = { MLFLOW_ALLOW_FILE_STORE = "true" } }
-
 [tool.pixi.feature.prod-core.dependencies]
-python = ">=3.11,<3.13"
+python = ">=3.12,<3.13"
 scikit-learn = ">=1.9.0,<2"
-shap = ">=0.50.0,<0.53"
+shap = "*"
 pyproj = ">=3.7.2,<4"
-numpy = ">=2.4.6,<3"
+numpy = ">=2.0,<2.3"
 geopandas = ">=1.1.4,<2"
 matplotlib = ">=3.11.0,<4"
-scipy = ">=1.18.0,<2"
+scipy = ">=1.13.0,<2"
 pandas = "<3"
 pytorch = ">=2.12.1,<3"
+lightning = ">=2.4.0,<3"
 seaborn = ">=0.13.2,<0.14"
+xarray = ">=2024.3.0,<2026"
 
 [tool.pixi.feature.gpu-backend.system-requirements]
 cuda = "12.0"
@@ -56,11 +55,13 @@ xgboost = ">=3.3.0, <4"
 core = { features = ["prod-core", "cpu-backend"], solve-group = "default" }
 core-gpu = { features = ["prod-core", "gpu-backend"], solve-group = "default" }
 dev = { features = ["prod-core", "gpu-backend", "dev"], solve-group = "core-gpu" }
-explore = { features = ["prod-core", "cpu-backend", "explore"], solve-group = "core" }
+explore = { features = ["prod-core", "cpu-backend", "explore"]}
 
 [tool.pixi.feature.dev.tasks]
 dev-env = "pixi shell -e dev"
+mlflow = { cmd = "mlflow ui", env = { MLFLOW_ALLOW_FILE_STORE = "true" } }
 test = "pytest ./tests"
+test-with-cov = "pytest --cov=yg_eo_soilnet tests/"
 lint = "ruff lint"
 
 [tool.pixi.feature.explore.tasks]
@@ -70,8 +71,23 @@ notebook = "jupyter lab"
 py-xgboost = ">=3.3.0,<4"
 
 [dependency-groups]
-explore = ["jupyterlab"]
+explore = ["jupyterlab", "scikit-gstat", "pykrige", "xarray"]
 test = ["pytest", "ruff", "pytest-cov"]
 docs = ["sphinx"]
 dev = [{include-group = "test"}, {include-group = "docs"}]
 
+
+[tool.pytest.ini_options]
+# Warnings are errors so a new one from our own code fails the suite instead of scrolling past.
+# Each ignore below is a third-party warning we cannot act on; keep the reason with the pattern.
+filterwarnings = [
+    "error",
+    # Lightning: the checkpoint tests pin accelerator="cpu" deliberately on a CUDA box.
+    'ignore:GPU available but not used:',
+    # Lightning internals still call the deprecated pytree LeafSpec API.
+    'ignore:.*LeafSpec.*:',
+    # Perf hint only; the tiny test datamodules intentionally use num_workers=0.
+    'ignore:.*does not have many workers.*:',
+    # torch probing CUDA in this environment.
+    "ignore:Can't initialize NVML:",
+]

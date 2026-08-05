@@ -3,7 +3,7 @@ import pytest
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 
-from yg_eo_soilnet.trainer_utils import CVSplitter, PipelineBuilder, TargetNanFilter
+from yg_eo_soilnet.datamodules.scikit.scikit_trainer_utils import CVSplitter, PipelineBuilder, TargetNanFilter
 
 
 def test_cv_splitter_kfold_and_groupkfold() -> None:
