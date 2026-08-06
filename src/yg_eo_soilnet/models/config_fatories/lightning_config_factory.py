@@ -215,11 +215,20 @@ class LightningConfigFactory:
             # Calendar-grid span, inferred from the data by the sequence datamodule. Only the CNN
             # rasterises, so only it declares this argument.
             "grid_years": getattr(datamodule, "grid_years", None),
+            # Entity-embedding contract, fitted train-only by the datamodule's setup(). The
+            # vocabularies travel into the model's hyper_parameters so the checkpoint carries its
+            # own label->index mapping instead of re-deriving one from whatever frame it is given.
+            "categorical_cardinalities": getattr(datamodule, "categorical_cardinalities", None),
+            "categorical_vocabularies": getattr(datamodule, "categorical_vocabularies", None),
+            "categorical_feature_names": getattr(datamodule, "categorical_feature_names", None),
         }
+        # An empty list is "this dataset has no categoricals", not data worth offering - without it
+        # in the sentinel set a model would be handed [] as though it were a real shape.
+        unset = (None, 0, "auto", {}, [])
         for key, value in shape_args.items():
             if key in init_args and init_args[key] in (None, 0, "auto", {}):
                 init_args[key] = value
-            elif key not in init_args and value not in (None, 0, "auto", {}):
+            elif key not in init_args and value not in unset:
                 offer(key, value)
 
         if "temporal_enabled" in init_args and init_args["temporal_enabled"] in (None, "auto"):

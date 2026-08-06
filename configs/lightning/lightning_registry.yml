@@ -5,16 +5,28 @@
 # observation and columns are calendar months, so nothing is tied to a date range. grid_years is
 # inferred from the data, and adaptive pooling means no weight depends on it.
 soil_cnn:
-  enabled: true
+  enabled: false
   modeltype: dl
   input_kind: sequence
   import_path: yg_eo_soilnet.models.lightningmodules.soil_cnn_lightning_module.SoilCNNLightningModule
   datamodule_import_path: yg_eo_soilnet.datamodules.sequence.sequence_datamodule.SoilSequenceDataModule
   init_args:
-    static_dim: auto
+    static_dim: auto                    # CONTINUOUS covariates only; categoricals are embedded
     target_dim: auto
     modality_dims: auto
     grid_years: auto                    # inferred: 9 on this dataset, 1 on a one-year dataset
+
+    # --- categorical covariates: learned entity embeddings ---
+    # Declared by CATEGORICAL_FEATURES in data_spec.yml. The vocabulary is fitted on the TRAIN split
+    # only and travels in the checkpoint, so an unseen category at inference lands on the reserved
+    # index 0 rather than silently taking some other category's row.
+    categorical_cardinalities: auto     # len(train vocabulary) + 1 per feature
+    categorical_vocabularies: auto      # carried into hparams: makes the checkpoint self-describing
+    categorical_feature_names: auto
+    embedding_dims: auto                # auto = min(embedding_max_dim, (cardinality + 1) // 2)
+    embedding_max_dim: 50               # the cap in that heuristic
+    embedding_dropout: 0.0              # dropout on the CONCATENATED embedding vector
+    continuous_norm: none               # none | batch | layer, on the continuous block pre-concat
 
     # dilated_tempcnn : Conv1d(k=3,d=1) then Conv1d(k=3,pad=12,d=12), month t <-> month t-12
     # annual_grid2d   : Conv2d((1,3)) across months, then Conv2d((3,1)) across years
@@ -84,17 +96,29 @@ soil_cnn:
 # batch. Nothing here is tied to a number of steps or to a date range, so a trained checkpoint runs
 # on any future window with different lengths and a different cadence.
 soil_sequence:
-  enabled: true
+  enabled: false
   modeltype: dl
   input_kind: sequence
   import_path: yg_eo_soilnet.models.lightningmodules.soil_sequence_lightning_module.SoilSequenceLightningModule
   datamodule_import_path: yg_eo_soilnet.datamodules.sequence.sequence_datamodule.SoilSequenceDataModule
   init_args:
-    static_dim: auto
+    static_dim: auto                     # CONTINUOUS covariates only; categoricals are embedded
     target_dim: auto
     modality_dims: auto
     # No temporal_steps and no edge_attr_dim on purpose: the model is length-agnostic and graph-free,
     # and the sequence datamodule exposes neither, so the factory cannot inject them.
+
+    # --- categorical covariates: learned entity embeddings ---
+    # Declared by CATEGORICAL_FEATURES in data_spec.yml. The vocabulary is fitted on the TRAIN split
+    # only and travels in the checkpoint, so an unseen category at inference lands on the reserved
+    # index 0 rather than silently taking some other category's row.
+    categorical_cardinalities: auto      # len(train vocabulary) + 1 per feature
+    categorical_vocabularies: auto       # carried into hparams: makes the checkpoint self-describing
+    categorical_feature_names: auto
+    embedding_dims: auto                 # auto = min(embedding_max_dim, (cardinality + 1) // 2)
+    embedding_max_dim: 50                # the cap in that heuristic
+    embedding_dropout: 0.0               # dropout on the CONCATENATED embedding vector
+    continuous_norm: none                # none | batch | layer, on the continuous block pre-concat
 
     temporal_encoder: time_transformer   # time_transformer | time_lstm
     modality_embed_dim: 64               # scalar, or a per-modality mapping like lstm_hidden_dim
@@ -171,6 +195,77 @@ soil_sequence:
     framework: lightning
     family: regression
     architecture: static-dynamic-sequence
+
+# Static covariates only - no temporal branch. The control for "what does the time series buy?",
+# sharing the datamodule, the loss and the optimizer with the two models above so the difference is
+# the temporal pathway and nothing else. enabled:false by default; turn it on to measure.
+soil_tabular:
+  enabled: true
+  modeltype: dl
+  input_kind: sequence
+  import_path: yg_eo_soilnet.models.lightningmodules.soil_tabular_lightning_module.SoilTabularLightningModule
+  datamodule_import_path: yg_eo_soilnet.datamodules.sequence.sequence_datamodule.SoilSequenceDataModule
+  init_args:
+    static_dim: auto                     # CONTINUOUS covariates only; categoricals are embedded
+    target_dim: auto
+
+    categorical_cardinalities: auto
+    categorical_vocabularies: auto
+    categorical_feature_names: auto
+    embedding_dims: auto                 # auto = min(embedding_max_dim, (cardinality + 1) // 2)
+    embedding_max_dim: 50
+    embedding_dropout: 0.0
+    continuous_norm: none                # none | batch | layer
+
+    static_hidden_dim: 64
+    head_hidden_dims: [64, 32]
+    dropout: 0.1
+    activation: relu                     # relu | gelu
+    use_layer_norm: true
+
+    loss_name: mse
+    huber_delta: 1.0
+    learning_rate: 0.001
+    optimizer_name: adamw
+    weight_decay: 0.0001
+    scheduler_type: plateau
+    scheduler_factor: 0.5
+    scheduler_patience: 20
+    scheduler_min_lr: 1.0e-06
+    scheduler_monitor: val_loss
+  datamodule_init_args:
+    batch_size: 32
+    val_size: 0.3
+    test_size: 0.15
+    target_transform: log1p
+    num_workers: 11
+    pin_memory: false
+    persistent_workers: false
+    seed: 42
+    shuffle: true
+  trainer_args:
+    max_epochs: 500
+    accelerator: cuda
+    devices: 1
+    precision: 32-true
+    accumulate_grad_batches: 1
+    gradient_clip_val: 1.0
+    log_every_n_steps: 5
+    enable_checkpointing: true
+    deterministic: true
+  callbacks:
+    early_stopping:
+      monitor: val_loss
+      mode: min
+      patience: 30
+    checkpoint:
+      monitor: val_loss
+      mode: min
+      save_top_k: 1
+  tags:
+    framework: lightning
+    family: regression
+    architecture: tabular-entity-embeddings
 
 # Superseded by soil_sequence. Kept enabled:false so the dense-axis baseline stays reproducible -
 # see lightning_logs/version_79 for the R2 ~= 0.20 reference run.

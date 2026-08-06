@@ -365,6 +365,97 @@ def test_a_model_taking_kwargs_still_receives_everything() -> None:
     assert model.kwargs["grid_years"] == 9
 
 
+# --- categorical / entity-embedding contract ------------------------------
+
+
+class FakeCategoricalDataModule(FakeSequenceDataModule):
+    """A sequence datamodule whose setup() has fitted a train-only vocabulary."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.categorical_cardinalities = [7, 13]
+        self.categorical_vocabularies = [["cl", "lo"], ["peak", "valley"]]
+        self.categorical_feature_names = ["texture_20cm", "landform_class"]
+
+
+class FakeEmbeddingModel:
+    """Declares the categorical contract; stands in for the real Lightning modules."""
+
+    def __init__(
+        self,
+        static_dim=None,
+        target_dim=None,
+        categorical_cardinalities=None,
+        categorical_vocabularies=None,
+        categorical_feature_names=None,
+    ):
+        self.kwargs = {
+            "static_dim": static_dim,
+            "target_dim": target_dim,
+            "categorical_cardinalities": categorical_cardinalities,
+            "categorical_vocabularies": categorical_vocabularies,
+            "categorical_feature_names": categorical_feature_names,
+        }
+
+
+def test_categorical_contract_is_injected_into_a_model_that_declares_it() -> None:
+    factory = _factory({})
+    datamodule = FakeCategoricalDataModule(sequence_bundle={})
+
+    model = factory._build_model(
+        {"import_path": f"{__name__}.FakeEmbeddingModel", "init_args": {}}, datamodule
+    )
+
+    assert model.kwargs["categorical_cardinalities"] == [7, 13]
+    assert model.kwargs["categorical_feature_names"] == ["texture_20cm", "landform_class"]
+    # The vocabulary travels into hparams so the checkpoint carries its own label->index mapping.
+    assert model.kwargs["categorical_vocabularies"] == [["cl", "lo"], ["peak", "valley"]]
+
+
+def test_auto_categorical_placeholders_are_resolved_from_the_datamodule() -> None:
+    factory = _factory({})
+    datamodule = FakeCategoricalDataModule(sequence_bundle={})
+
+    model = factory._build_model(
+        {
+            "import_path": f"{__name__}.FakeEmbeddingModel",
+            "init_args": {"categorical_cardinalities": "auto", "categorical_vocabularies": "auto"},
+        },
+        datamodule,
+    )
+
+    assert model.kwargs["categorical_cardinalities"] == [7, 13]
+    assert model.kwargs["categorical_vocabularies"] == [["cl", "lo"], ["peak", "valley"]]
+
+
+def test_categorical_contract_is_not_injected_into_a_model_that_ignores_it() -> None:
+    factory = _factory({})
+    datamodule = FakeCategoricalDataModule(sequence_bundle={})
+
+    model = factory._build_model(
+        {"import_path": f"{__name__}.FakeGridFreeModel", "init_args": {}}, datamodule
+    )
+
+    assert "categorical_cardinalities" not in model.kwargs
+    assert model.kwargs["static_dim"] == 3
+
+
+def test_an_empty_categorical_list_is_not_offered_as_data() -> None:
+    """A dataset with no categoricals must not hand [] over as though it were a real shape."""
+    factory = _factory({})
+    datamodule = FakeSequenceDataModule(sequence_bundle={})
+    datamodule.categorical_cardinalities = []
+    datamodule.categorical_vocabularies = []
+    datamodule.categorical_feature_names = []
+
+    model = factory._build_model(
+        {"import_path": f"{__name__}.FakeModel", "init_args": {}}, datamodule
+    )
+
+    assert "categorical_cardinalities" not in model.kwargs
+    assert "categorical_vocabularies" not in model.kwargs
+
+
 def test_an_unknown_key_written_in_init_args_still_fails_loudly() -> None:
     """Filtering must not swallow a typo the user actually wrote in the registry."""
     factory = _factory({})

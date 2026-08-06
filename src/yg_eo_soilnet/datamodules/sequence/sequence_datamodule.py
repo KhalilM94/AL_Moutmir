@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from lightning.pytorch import LightningDataModule
 
+from yg_eo_soilnet.datamodules.categorical import CategoricalEncoder
 from yg_eo_soilnet.datamodules.sequence.sequence_bundle import SoilSequenceBundle
 
 
@@ -88,6 +89,11 @@ class SoilSequenceDataModule(LightningDataModule):
         # Standardization statistics, fitted on the train split only in setup().
         self.static_mean_: Optional[np.ndarray] = None
         self.static_scale_: Optional[np.ndarray] = None
+        # Categorical vocabulary, fitted on the train split only in setup() for the same reason the
+        # scaler is: a category seen only in validation or test must reach the model as "unknown",
+        # exactly as an unseen category would at inference time.
+        self.categorical_encoder_: Optional[CategoricalEncoder] = None
+        self.categorical_codes_: Optional[np.ndarray] = None
         self.sequence_mean_: dict[str, np.ndarray] = {}
         self.sequence_scale_: dict[str, np.ndarray] = {}
         self.target_mean_: Optional[np.ndarray] = None
@@ -99,6 +105,12 @@ class SoilSequenceDataModule(LightningDataModule):
         self.static_dim = int(np.asarray(self.sequence_bundle.static_features).shape[1])
         self.target_dim = int(np.asarray(self.sequence_bundle.targets).shape[1])
         self.static_feature_names = list(self.sequence_bundle.static_feature_names)
+        # Categorical shape contract. The names are known now, but the cardinalities are not: they
+        # depend on the vocabulary, which depends on the train split, which setup() decides. The
+        # config factory reads these AFTER calling setup(), so by then they are filled in.
+        self.categorical_feature_names = list(self.sequence_bundle.categorical_feature_names)
+        self.categorical_cardinalities: list[int] = []
+        self.categorical_vocabularies: list[list[str]] = []
         self.target_names = list(self.sequence_bundle.target_names)
         self.modality_dims = dict(self.sequence_bundle.modality_dims)
         self.temporal_enabled = bool(self.sequence_bundle.temporal_enabled and self.modality_dims)
@@ -139,6 +151,7 @@ class SoilSequenceDataModule(LightningDataModule):
 
         train_idx, val_idx, test_idx = self._split_indices(self.sequence_bundle.num_points)
         self._fit_normalization(train_idx)
+        self._fit_categoricals(train_idx)
         self.train_idx_, self.val_idx_, self.test_idx_ = train_idx, val_idx, test_idx
         self._is_setup = True
 
@@ -245,6 +258,34 @@ class SoilSequenceDataModule(LightningDataModule):
             self.sequence_mean_[modality_name] = mean.astype(np.float32)
             self.sequence_scale_[modality_name] = self._safe_scale(np.sqrt(variance))
 
+    def _fit_categoricals(self, train_idx: np.ndarray) -> None:
+        """Fit the vocabulary on the train split, then encode every point against it.
+
+        Encoding the full array against a train-only vocabulary is the point: a category that occurs
+        only in validation or test is not in the vocabulary, so it lands on the reserved index and
+        the model meets it exactly as it will meet a genuinely new category at inference.
+        """
+        raw = np.asarray(self.sequence_bundle.static_categoricals, dtype=object)
+        names = self.categorical_feature_names
+        if raw.ndim != 2 or raw.shape[1] == 0 or not names:
+            self.categorical_encoder_ = None
+            self.categorical_codes_ = np.zeros((raw.shape[0] if raw.ndim == 2 else 0, 0), dtype=np.int64)
+            self.categorical_cardinalities = []
+            self.categorical_vocabularies = []
+            return
+
+        indices = np.asarray(train_idx, dtype=np.int64)
+        # With no train split there is nothing to fit a vocabulary from; an empty one sends every
+        # category to the reserved index, which is the correct degenerate behaviour rather than an
+        # excuse to fall back on the full frame.
+        fit_rows = raw[indices] if indices.size else raw[:0]
+
+        encoder = CategoricalEncoder().fit(fit_rows, names)
+        self.categorical_encoder_ = encoder
+        self.categorical_codes_ = encoder.transform(raw)
+        self.categorical_cardinalities = encoder.cardinalities
+        self.categorical_vocabularies = encoder.vocabularies
+
     def _standardize_static(self, values: np.ndarray) -> np.ndarray:
         if self.static_mean_ is None or values.size == 0:
             return self._finite(values).astype(np.float32)
@@ -294,8 +335,16 @@ class SoilSequenceDataModule(LightningDataModule):
             (indices.size, 0), dtype=np.float32
         )
 
+        # Indices, never scaled: they address an embedding table rather than measuring anything.
+        # Always well-shaped, so a dataset with no categoricals needs no None branch downstream.
+        if self.categorical_codes_ is not None and self.categorical_codes_.shape[1]:
+            x_categorical = self.categorical_codes_[indices]
+        else:
+            x_categorical = np.zeros((indices.size, 0), dtype=np.int64)
+
         batch: dict[str, Any] = {
             "x_static": torch.as_tensor(x_static, dtype=torch.float32),
+            "x_categorical": torch.as_tensor(x_categorical, dtype=torch.long),
             "y": torch.as_tensor(y, dtype=torch.float32),
             "point_ids": [bundle.point_ids[index] for index in indices.tolist()],
             "target_names": list(bundle.target_names),

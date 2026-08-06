@@ -5,9 +5,12 @@ from typing import Any, Mapping, Optional
 import numpy as np
 import pandas as pd
 
+from yg_eo_soilnet.datamodules.categorical import (
+    resolve_categorical_columns,
+    split_feature_blocks,
+)
 from yg_eo_soilnet.datamodules.frame_cleaning import (
     drop_non_finite_rows,
-    encode_categorical_features,
     sanitize_numeric_columns,
 )
 from yg_eo_soilnet.datamodules.sequence.sequence_bundle import SoilSequenceBundle
@@ -65,9 +68,13 @@ class SoilSequenceBuilder:
             raise KeyError(f"Missing target columns in static CSV: {', '.join(missing_targets)}")
 
         feature_frame = self.data_manager.filter_schema(static_df, target_columns)
-        static_df, feature_columns = encode_categorical_features(
-            static_df, feature_frame.columns, logger=self.logger
+        blocks = resolve_categorical_columns(
+            self.config, static_df, feature_frame.columns, logger=self.logger
         )
+        feature_columns = list(blocks.continuous_columns)
+        # Only the continuous block is checked for finiteness. A missing category is no longer a
+        # reason to delete the point: it becomes the reserved embedding index instead, so a blank
+        # texture costs one covariate rather than the whole soil sample.
         static_df = drop_non_finite_rows(
             static_df,
             logger=self.logger,
@@ -76,11 +83,7 @@ class SoilSequenceBuilder:
             numeric_columns=[*feature_columns, *target_columns],
         )
 
-        static_features = (
-            static_df[feature_columns].to_numpy(dtype=np.float32)
-            if feature_columns
-            else np.empty((len(static_df), 0), dtype=np.float32)
-        )
+        static_features, static_categoricals = split_feature_blocks(static_df, blocks)
         targets = static_df[target_columns].to_numpy(dtype=np.float32)
         point_ids = (
             static_df[point_col].tolist() if point_col in static_df.columns else list(range(len(static_df)))
@@ -101,6 +104,8 @@ class SoilSequenceBuilder:
             point_ids=point_ids,
             static_features=static_features,
             static_feature_names=feature_columns,
+            static_categoricals=static_categoricals,
+            categorical_feature_names=list(blocks.categorical_columns),
             targets=targets,
             target_names=target_columns,
             sequences=sequences,

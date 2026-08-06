@@ -16,10 +16,12 @@ import pytest
 import torch
 
 from yg_eo_soilnet.data_manager import DataManager
+from yg_eo_soilnet.datamodules.categorical import CategoricalEncoder
 from yg_eo_soilnet.datamodules.sequence.sequence_bundle import SoilSequenceBundle
 from yg_eo_soilnet.datamodules.sequence.sequence_builder import SoilSequenceBuilder, to_decimal_year
 from yg_eo_soilnet.datamodules.sequence.sequence_datamodule import SoilSequenceDataModule
 from yg_eo_soilnet.models.lightningmodules.soil_sequence_lightning_module import SoilSequenceLightningModule
+from yg_eo_soilnet.models.lightningmodules.soil_tabular_lightning_module import SoilTabularLightningModule
 from yg_eo_soilnet.models.lightningmodules.temporal_encoders import (
     TemporalTransformerEncoder,
     TimeAwareLSTMEncoder,
@@ -33,7 +35,7 @@ ENCODERS = ["time_transformer", "time_lstm"]
 # --- fixtures --------------------------------------------------------------
 
 
-def _write_csvs(tmp_path: Path, *, year_offset: int = 0, dates_by_point=None):
+def _write_csvs(tmp_path: Path, *, year_offset: int = 0, dates_by_point=None, with_categoricals=False):
     """Static + time-series CSVs where each point deliberately has a different observation count."""
     static_df = pd.DataFrame(
         {
@@ -45,6 +47,12 @@ def _write_csvs(tmp_path: Path, *, year_offset: int = 0, dates_by_point=None):
             "static_2": [20.0, 21.0, 22.0, 23.0, 24.0, 25.0],
         }
     )
+    if with_categoricals:
+        # A unique texture per point, so whatever the split, some categories exist only outside the
+        # train split - which is the case a fitted vocabulary has to handle. Point 6 is blank: under
+        # the old float encoding that NaN deleted the whole point.
+        static_df["texture"] = ["lo", "cl", "salo", "sicllo", "sacllo", ""]
+        static_df["landform"] = ["valley", "peak", "valley", "upper", "valley", "valley"]
 
     if dates_by_point is None:
         # Ragged on purpose: 6, 4 and 2 observations, with gaps and non-zero starts.
@@ -79,7 +87,9 @@ def _write_csvs(tmp_path: Path, *, year_offset: int = 0, dates_by_point=None):
     return static_path, timeseries_path
 
 
-def _config(tmp_path: Path, static_path: Path, timeseries_path: Path) -> SimpleNamespace:
+def _config(
+    tmp_path: Path, static_path: Path, timeseries_path: Path, categorical_features=()
+) -> SimpleNamespace:
     return SimpleNamespace(
         DATA_FOLDER=str(tmp_path),
         DATA_FILE="static.csv",
@@ -100,7 +110,7 @@ def _config(tmp_path: Path, static_path: Path, timeseries_path: Path) -> SimpleN
         PREDICTOR_COLUMNS=[],
         IGNORED_COLUMNS=["point_id", "lat", "lon"],
         ELIMINATED_FEATURES=["point_id", "lat", "lon"],
-        CATEGORICAL_FEATURES=[],
+        CATEGORICAL_FEATURES=list(categorical_features),
         EXCLUDE_CATEGORICAL=False,
         EXISTING_HS_FEATURES={"enabled": False},
         RANDOM_SEED=42,
@@ -117,11 +127,17 @@ def _config(tmp_path: Path, static_path: Path, timeseries_path: Path) -> SimpleN
     )
 
 
-def _build_bundle(tmp_path: Path, logger, **kwargs) -> SoilSequenceBundle:
+def _build_bundle(tmp_path: Path, logger, *, categorical_features=(), **kwargs) -> SoilSequenceBundle:
     static_path, timeseries_path = _write_csvs(tmp_path, **kwargs)
-    config = _config(tmp_path, static_path, timeseries_path)
+    config = _config(tmp_path, static_path, timeseries_path, categorical_features)
     data_manager = DataManager(config, logger)
     return SoilSequenceBuilder(config, logger, data_manager).build()
+
+
+def _categorical_bundle(tmp_path: Path, logger) -> SoilSequenceBundle:
+    return _build_bundle(
+        tmp_path, logger, with_categoricals=True, categorical_features=["texture", "landform"]
+    )
 
 
 def _synthetic_batch(batch_size=4, length=10, channels=3, seed=0, start_year=2018.0):
@@ -369,6 +385,205 @@ def test_encoders_zero_a_point_with_no_observations(encoder_cls) -> None:
     assert torch.isfinite(embedding).all()
     assert bool((embedding[0] == 0).all())
     assert not bool((embedding[1] == 0).all())
+
+
+# --- categorical covariates and entity embeddings --------------------------
+
+
+def test_bundle_keeps_categoricals_out_of_the_continuous_block(tmp_path: Path, logger) -> None:
+    """The categorical columns must not reach the scaler; a category code is not a magnitude."""
+    bundle = _categorical_bundle(tmp_path, logger)
+
+    assert bundle.static_feature_names == ["static_1", "static_2"]
+    assert bundle.static_features.shape == (6, 2)
+    assert bundle.categorical_feature_names == ["texture", "landform"]
+    assert bundle.static_categoricals.shape == (6, 2)
+    # Raw labels, not codes: encoding needs a vocabulary and the split does not exist yet.
+    assert bundle.static_categoricals[0].tolist() == ["lo", "valley"]
+
+
+def test_a_missing_category_no_longer_deletes_the_point(tmp_path: Path, logger) -> None:
+    """Point 6 has a blank texture. Under the old float encoding its NaN dropped the whole row."""
+    bundle = _categorical_bundle(tmp_path, logger)
+
+    assert bundle.num_points == 6
+    assert 6 in bundle.point_ids
+
+
+def test_vocabulary_is_fitted_on_the_train_split_only(tmp_path: Path, logger) -> None:
+    """The leak this replaces: pd.factorize saw every split, so held-out categories got real codes."""
+    bundle = _categorical_bundle(tmp_path, logger)
+    datamodule = SoilSequenceDataModule(bundle, batch_size=2, val_size=0.25, test_size=0.25, seed=3)
+    datamodule.setup("fit")
+
+    raw = np.asarray(bundle.static_categoricals, dtype=object)
+    train_textures = {
+        label for label in raw[datamodule.train_idx_, 0].tolist() if label not in (None, "")
+    }
+    assert datamodule.categorical_vocabularies[0] == sorted(train_textures)
+    assert datamodule.categorical_cardinalities[0] == len(train_textures) + 1
+
+    # Every point outside the train split carries a texture the vocabulary never saw, so it must
+    # land on the reserved index rather than borrowing another category's row.
+    holdout = np.concatenate([datamodule.val_idx_, datamodule.test_idx_])
+    assert (datamodule.categorical_codes_[holdout, 0] == 0).all()
+    assert (datamodule.categorical_codes_[datamodule.train_idx_, 0] > 0).all()
+
+
+def test_datamodule_exports_the_categorical_contract(tmp_path: Path, logger) -> None:
+    bundle = _categorical_bundle(tmp_path, logger)
+    datamodule = SoilSequenceDataModule(bundle, batch_size=2, val_size=0.25, test_size=0.25, seed=3)
+    datamodule.setup("fit")
+
+    # static_dim counts the CONTINUOUS covariates only - this is what the factory injects.
+    assert datamodule.static_dim == 2
+    assert datamodule.categorical_feature_names == ["texture", "landform"]
+    assert len(datamodule.categorical_cardinalities) == 2
+    assert all(
+        len(vocabulary) + 1 == cardinality
+        for vocabulary, cardinality in zip(
+            datamodule.categorical_vocabularies, datamodule.categorical_cardinalities
+        )
+    )
+
+
+def test_batch_carries_categorical_indices_in_range(tmp_path: Path, logger) -> None:
+    bundle = _categorical_bundle(tmp_path, logger)
+    datamodule = SoilSequenceDataModule(bundle, batch_size=6, val_size=0.0, test_size=0.0, seed=7)
+    datamodule.setup("fit")
+
+    batch = next(iter(datamodule.train_dataloader()))
+
+    assert batch["x_categorical"].dtype == torch.int64
+    assert batch["x_categorical"].shape == (6, 2)
+    assert batch["x_static"].shape == (6, 2)
+    for column, cardinality in enumerate(datamodule.categorical_cardinalities):
+        assert int(batch["x_categorical"][:, column].min()) >= 0
+        assert int(batch["x_categorical"][:, column].max()) < cardinality
+
+
+def test_batch_has_a_well_shaped_categorical_key_with_no_categoricals(tmp_path: Path, logger) -> None:
+    """No None branch downstream: the key is always present, just empty."""
+    datamodule = SoilSequenceDataModule(_build_bundle(tmp_path, logger), batch_size=6, val_size=0.0, test_size=0.0)
+    datamodule.setup("fit")
+
+    batch = next(iter(datamodule.train_dataloader()))
+
+    assert batch["x_categorical"].shape == (6, 0)
+    assert batch["x_categorical"].dtype == torch.int64
+
+
+@pytest.mark.parametrize("encoder", ENCODERS)
+def test_end_to_end_training_step_with_embeddings(tmp_path: Path, logger, encoder: str) -> None:
+    bundle = _categorical_bundle(tmp_path, logger)
+    datamodule = SoilSequenceDataModule(bundle, batch_size=6, val_size=0.0, test_size=0.0, seed=7)
+    datamodule.setup("fit")
+    batch = next(iter(datamodule.train_dataloader()))
+
+    torch.manual_seed(0)
+    module = SoilSequenceLightningModule(
+        static_dim=datamodule.static_dim,
+        target_dim=datamodule.target_dim,
+        categorical_cardinalities=datamodule.categorical_cardinalities,
+        categorical_vocabularies=datamodule.categorical_vocabularies,
+        categorical_feature_names=datamodule.categorical_feature_names,
+        modality_dims=datamodule.modality_dims,
+        temporal_encoder=encoder,
+    )
+
+    predictions = module(batch)
+    assert predictions.shape == (6, 1)
+
+    module.loss_fn(predictions, batch["y"]).backward()
+    tables = module.static_encoder.embeddings.embeddings
+    assert len(tables) == 2
+    assert all(table.weight.grad is not None for table in tables)
+    assert any(table.weight.grad.abs().sum() > 0 for table in tables)
+
+
+def test_embedding_widths_follow_the_heuristic(tmp_path: Path, logger) -> None:
+    bundle = _categorical_bundle(tmp_path, logger)
+    datamodule = SoilSequenceDataModule(bundle, batch_size=6, val_size=0.0, test_size=0.0, seed=7)
+    datamodule.setup("fit")
+
+    module = SoilSequenceLightningModule(
+        static_dim=datamodule.static_dim,
+        target_dim=1,
+        categorical_cardinalities=datamodule.categorical_cardinalities,
+        modality_dims=datamodule.modality_dims,
+    )
+
+    expected = [min(50, (c + 1) // 2) for c in datamodule.categorical_cardinalities]
+    assert module.static_encoder.embedding_dims == expected
+    assert module.static_encoder.input_dim == datamodule.static_dim + sum(expected)
+
+
+def test_checkpoint_carries_the_vocabulary_under_weights_only(tmp_path: Path, logger) -> None:
+    """The portability fix: the label->index mapping travels with the weights.
+
+    Without it a checkpoint re-derives its mapping from whatever frame it is handed, so the same
+    category means a different embedding row and the model silently predicts nonsense.
+    """
+    bundle = _categorical_bundle(tmp_path, logger)
+    datamodule = SoilSequenceDataModule(bundle, batch_size=6, val_size=0.0, test_size=0.0, seed=7)
+    datamodule.setup("fit")
+
+    module = SoilSequenceLightningModule(
+        static_dim=datamodule.static_dim,
+        target_dim=1,
+        categorical_cardinalities=datamodule.categorical_cardinalities,
+        categorical_vocabularies=datamodule.categorical_vocabularies,
+        categorical_feature_names=datamodule.categorical_feature_names,
+        modality_dims=datamodule.modality_dims,
+    )
+    path = tmp_path / "module.ckpt"
+    torch.save({"hyper_parameters": dict(module.hparams), "state_dict": module.state_dict()}, path)
+
+    # weights_only=True is the PyTorch >= 2.6 default; anything but plain builtins breaks it.
+    loaded = torch.load(path, weights_only=True)
+    hparams = loaded["hyper_parameters"]
+
+    assert hparams["categorical_vocabularies"] == datamodule.categorical_vocabularies
+    assert hparams["categorical_feature_names"] == ["texture", "landform"]
+    # And the mapping can be rebuilt from it without touching the training data.
+    restored = CategoricalEncoder.from_vocabularies(
+        hparams["categorical_feature_names"], hparams["categorical_vocabularies"]
+    )
+    assert restored.cardinalities == datamodule.categorical_cardinalities
+    assert restored.transform(bundle.static_categoricals).tolist() == datamodule.categorical_codes_.tolist()
+
+
+def test_an_undeclared_non_numeric_column_fails_loudly(tmp_path: Path, logger) -> None:
+    """Silently factorizing it into a magnitude is the behaviour this replaces."""
+    with pytest.raises(ValueError, match="texture"):
+        _build_bundle(tmp_path, logger, with_categoricals=True, categorical_features=["landform"])
+
+
+def test_a_declared_column_absent_from_the_data_fails_loudly(tmp_path: Path, logger) -> None:
+    with pytest.raises(KeyError, match="SU_WRB1_PH"):
+        _build_bundle(tmp_path, logger, categorical_features=["SU_WRB1_PH"])
+
+
+def test_tabular_module_runs_on_the_same_batch(tmp_path: Path, logger) -> None:
+    """The static-only baseline shares the datamodule and ignores every sequence key."""
+    bundle = _categorical_bundle(tmp_path, logger)
+    datamodule = SoilSequenceDataModule(bundle, batch_size=6, val_size=0.0, test_size=0.0, seed=7)
+    datamodule.setup("fit")
+    batch = next(iter(datamodule.train_dataloader()))
+
+    torch.manual_seed(0)
+    module = SoilTabularLightningModule(
+        static_dim=datamodule.static_dim,
+        target_dim=datamodule.target_dim,
+        categorical_cardinalities=datamodule.categorical_cardinalities,
+        categorical_feature_names=datamodule.categorical_feature_names,
+    )
+
+    predictions = module(batch)
+    assert predictions.shape == (6, 1)
+
+    module.loss_fn(predictions, batch["y"]).backward()
+    assert module.static_encoder.embeddings.embeddings[0].weight.grad is not None
 
 
 # --- lightning module ------------------------------------------------------

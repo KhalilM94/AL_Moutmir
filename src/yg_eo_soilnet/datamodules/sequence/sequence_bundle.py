@@ -25,6 +25,11 @@ class SoilSequenceBundle:
     point_ids: list[Any] = field(default_factory=list)
     static_features: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
     static_feature_names: list[str] = field(default_factory=list)
+    # Categorical covariates as RAW LABELS, (n_points, n_categorical) object dtype. Deliberately not
+    # encoded here: a vocabulary must be fitted on the training split alone, and at build time the
+    # split does not exist yet. The datamodule fits it in setup(), beside the scaler.
+    static_categoricals: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=object))
+    categorical_feature_names: list[str] = field(default_factory=list)
     targets: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
     target_names: list[str] = field(default_factory=list)
     # modality -> one (n_i, C_m) array per point, in static point order
@@ -103,6 +108,22 @@ class SoilSequenceBundle:
             raise ValueError(
                 f"static_features has {self.static_features.shape[0]} row(s) but there are {num_points} point(s)"
             )
+
+        # Categorical labels are raw and unencoded, so there is no finiteness to check here - a
+        # missing label is legitimate and becomes the reserved index once the vocabulary is fitted.
+        # Only the alignment matters.
+        categoricals = np.asarray(self.static_categoricals)
+        if categoricals.ndim == 2 and categoricals.shape[1]:
+            if categoricals.shape[0] != num_points:
+                raise ValueError(
+                    f"static_categoricals has {categoricals.shape[0]} row(s) but there are "
+                    f"{num_points} point(s)"
+                )
+            if categoricals.shape[1] != len(self.categorical_feature_names):
+                raise ValueError(
+                    f"static_categoricals has {categoricals.shape[1]} column(s) but "
+                    f"{len(self.categorical_feature_names)} categorical feature name(s)"
+                )
         if self.targets.size and self.targets.shape[0] != num_points:
             raise ValueError(f"targets has {self.targets.shape[0]} row(s) but there are {num_points} point(s)")
 

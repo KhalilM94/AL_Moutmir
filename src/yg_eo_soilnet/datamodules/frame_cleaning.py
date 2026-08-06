@@ -69,6 +69,10 @@ def encode_categorical_features(
 ) -> Tuple[pd.DataFrame, list[str]]:
     """Ordinal-encode non-numeric static features so every model sees them.
 
+    LEGACY - kept only for the graph path. New code should use
+    :mod:`yg_eo_soilnet.datamodules.categorical`, which fits a real vocabulary on the training split,
+    reserves an index for unknown and missing, and produces embedding lookups rather than magnitudes.
+
     Without this the numeric-dtype filter silently dropped every categorical covariate, giving the
     network fewer predictors than the sklearn path. Codes are assigned over the whole column, so
     category identity is global; the values are standardized train-only downstream by the

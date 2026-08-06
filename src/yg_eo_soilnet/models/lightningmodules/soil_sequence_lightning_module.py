@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
 from torch import nn
@@ -10,6 +10,7 @@ from yg_eo_soilnet.models.lightningmodules._regression_base import (
     as_float_list,
     batch_get,
 )
+from yg_eo_soilnet.models.lightningmodules.tabular_encoders import TabularStaticEncoder
 from yg_eo_soilnet.models.lightningmodules.temporal_encoders import (
     GatedFusion,
     TemporalTransformerEncoder,
@@ -42,6 +43,13 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         self,
         static_dim: int,
         target_dim: int,
+        categorical_cardinalities: Optional[Sequence[int]] = None,
+        categorical_vocabularies: Optional[Sequence[Sequence[str]]] = None,
+        categorical_feature_names: Optional[Sequence[str]] = None,
+        embedding_dims: Any = None,
+        embedding_dropout: float = 0.0,
+        embedding_max_dim: int = 50,
+        continuous_norm: str = "none",
         modality_dims: Optional[Mapping[str, int]] = None,
         temporal_enabled: bool = True,
         temporal_encoder: str = "time_transformer",
@@ -84,6 +92,14 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         # weights_only=True default (PyTorch >= 2.6).
         target_mean = as_float_list(target_mean)
         target_scale = as_float_list(target_scale)
+        # Same reason: plain builtins only in hyper_parameters. The vocabularies live here rather
+        # than in the datamodule so the checkpoint carries its own label->index mapping and can be
+        # applied to a frame it has never seen.
+        categorical_cardinalities = [int(value) for value in (categorical_cardinalities or [])]
+        categorical_vocabularies = [
+            [str(category) for category in vocabulary] for vocabulary in (categorical_vocabularies or [])
+        ]
+        categorical_feature_names = [str(name) for name in (categorical_feature_names or [])]
         self.save_hyperparameters()
 
         self._init_regression_targets(
@@ -103,9 +119,20 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
             scheduler_monitor=scheduler_monitor,
         )
 
+        # static_dim counts the CONTINUOUS covariates only; the categorical ones arrive separately as
+        # indices and contribute their embedding widths instead.
         self.static_dim = int(static_dim)
         self.fusion_dim = int(fusion_dim)
         self.static_hidden_dim = int(static_hidden_dim)
+        # A checkpoint may carry vocabularies without cardinalities; they are redundant by
+        # construction (cardinality == len(vocabulary) + 1), so derive rather than demand both.
+        if not categorical_cardinalities and categorical_vocabularies:
+            categorical_cardinalities = [len(vocabulary) + 1 for vocabulary in categorical_vocabularies]
+        self.categorical_cardinalities = list(categorical_cardinalities)
+        self.categorical_vocabularies = list(categorical_vocabularies)
+        self.categorical_feature_names = list(categorical_feature_names) or [
+            f"categorical_{index}" for index in range(len(self.categorical_cardinalities))
+        ]
         self.use_layer_norm = bool(use_layer_norm)
         self.temporal_encoder_name = str(temporal_encoder).lower()
         if self.temporal_encoder_name not in {"time_transformer", "time_lstm"}:
@@ -125,7 +152,13 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         self._modality_embed_dim = modality_embed_dim
         self._lstm_hidden_dim = lstm_hidden_dim
 
-        self.static_encoder = self._build_static_encoder(dropout)
+        self.static_encoder = self._build_static_encoder(
+            dropout,
+            embedding_dims=embedding_dims,
+            embedding_dropout=embedding_dropout,
+            embedding_max_dim=embedding_max_dim,
+            continuous_norm=continuous_norm,
+        )
 
         self.temporal_encoders = nn.ModuleDict()
         if self.temporal_enabled:
@@ -224,14 +257,36 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
             delta_cap_months=delta_cap_months,
         )
 
-    def _build_static_encoder(self, dropout: float) -> nn.Module:
-        if self.static_dim <= 0:
+    @property
+    def has_static_features(self) -> bool:
+        return self.static_dim > 0 or bool(self.categorical_cardinalities)
+
+    def _build_static_encoder(
+        self,
+        dropout: float,
+        *,
+        embedding_dims: Any,
+        embedding_dropout: float,
+        embedding_max_dim: int,
+        continuous_norm: str,
+    ) -> nn.Module:
+        if not self.has_static_features:
             return nn.Identity()
-        layers: list[nn.Module] = [nn.Linear(self.static_dim, self.static_hidden_dim)]
-        if self.use_layer_norm:
-            layers.append(nn.LayerNorm(self.static_hidden_dim))
-        layers += [nn.ReLU(), nn.Dropout(dropout), nn.Linear(self.static_hidden_dim, self.fusion_dim)]
-        return nn.Sequential(*layers)
+        # Projects to fusion_dim, because the gate blends static against temporal at a shared width.
+        return TabularStaticEncoder(
+            num_continuous=self.static_dim,
+            hidden_dim=self.static_hidden_dim,
+            output_dim=self.fusion_dim,
+            cardinalities=self.categorical_cardinalities,
+            embedding_dims=embedding_dims,
+            embedding_dropout=embedding_dropout,
+            embedding_max_dim=embedding_max_dim,
+            feature_names=self.categorical_feature_names,
+            dropout=dropout,
+            activation="relu",
+            use_layer_norm=self.use_layer_norm,
+            continuous_norm=continuous_norm,
+        )
 
     def _build_fusion_norm(self) -> nn.Module:
         if self.fusion_norm_type == "none":
@@ -270,12 +325,14 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
 
     # --- forward -----------------------------------------------------------
 
-    def _encode_static(self, x_static: torch.Tensor) -> torch.Tensor:
-        if self.static_dim <= 0:
+    def _encode_static(
+        self, x_static: torch.Tensor, x_categorical: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        if not self.has_static_features:
             return torch.zeros(
                 (x_static.size(0), self.fusion_dim), device=x_static.device, dtype=x_static.dtype
             )
-        return self.static_encoder(x_static)
+        return self.static_encoder(x_static, x_categorical)
 
     def _encode_temporal(self, batch: Any, device, dtype) -> Optional[torch.Tensor]:
         if not self.temporal_encoders:
@@ -315,8 +372,11 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         reference = next(self.parameters())
         device, dtype = reference.device, reference.dtype
         x_static = x_static.to(device=device, dtype=dtype)
+        x_categorical = batch_get(batch, "x_categorical")
+        if x_categorical is not None:
+            x_categorical = x_categorical.to(device=device)
 
-        static_features = self._encode_static(x_static)
+        static_features = self._encode_static(x_static, x_categorical)
         temporal_features = self._encode_temporal(batch, device=device, dtype=dtype)
 
         fused = static_features if self.fusion is None else self.fusion(static_features, temporal_features)
