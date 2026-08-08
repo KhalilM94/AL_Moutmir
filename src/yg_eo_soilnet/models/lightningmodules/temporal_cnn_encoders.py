@@ -16,7 +16,7 @@ Two properties are preserved from the sequence path and are load-bearing:
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 from torch import nn
@@ -245,6 +245,22 @@ class _MaskedConvStack(nn.Module):
         return features
 
 
+def _validate_hidden_dims(hidden_dims: Sequence[int], owner: str) -> list[int]:
+    """One width per block, walked in order. The list IS the stack - there is no separate count.
+
+    A conv stack conventionally widens as it pools, which a single shared width could not express;
+    `[64, 128]` can. An empty list is refused rather than treated as zero blocks: that would pool the
+    raw rasterized channels straight into the projection, which is a different model, not a smaller
+    one.
+    """
+    widths = [int(width) for width in hidden_dims]
+    if not widths:
+        raise ValueError(f"{owner} needs at least one hidden width; got an empty hidden_dims.")
+    if any(width <= 0 for width in widths):
+        raise ValueError(f"{owner} hidden_dims must all be positive, got {widths}.")
+    return widths
+
+
 def _conv_stages(conv_factory, hidden_dim: int, norm: str, dropout: float, dims: int) -> list[nn.Module]:
     first, second = conv_factory()
     return [
@@ -265,8 +281,7 @@ class DilatedTempCNNEncoder(nn.Module):
         self,
         num_channels: int,
         output_dim: int,
-        hidden_dim: int = 32,
-        num_blocks: int = 1,
+        hidden_dims: Sequence[int] = (32,),
         dropout: float = 0.1,
         norm: str = "batch",
         pool: str = "masked_avg",
@@ -277,32 +292,32 @@ class DilatedTempCNNEncoder(nn.Module):
         if self.pool not in {"masked_avg", "avg"}:
             raise ValueError(f"pool must be 'masked_avg' or 'avg', got {pool!r}")
 
-        hidden_dim = int(hidden_dim)
+        hidden_dims = _validate_hidden_dims(hidden_dims, type(self).__name__)
         stages: list[nn.Module] = []
         in_channels = int(num_channels)
-        for _ in range(max(1, int(num_blocks))):
-            channels = in_channels
+        for width in hidden_dims:
             stages += _conv_stages(
-                lambda c=channels: (
+                lambda c=in_channels, w=width: (
                     # Short-term structure: adjacent months, i.e. within-quarter trend.
-                    nn.Conv1d(c, hidden_dim, kernel_size=3, padding=1, dilation=1),
+                    nn.Conv1d(c, w, kernel_size=3, padding=1, dilation=1),
                     # Year-over-year: month t wired directly to month t-12.
                     nn.Conv1d(
-                        hidden_dim,
-                        hidden_dim,
+                        w,
+                        w,
                         kernel_size=3,
                         padding=MONTHS_PER_YEAR,
                         dilation=MONTHS_PER_YEAR,
                     ),
                 ),
-                hidden_dim,
+                width,
                 norm,
                 dropout,
                 dims=1,
             )
-            in_channels = hidden_dim
+            in_channels = width
+        self.hidden_dims = hidden_dims
         self.blocks = _MaskedConvStack(stages, mask_between=mask_between_blocks)
-        self.projection = nn.Linear(hidden_dim, int(output_dim))
+        self.projection = nn.Linear(hidden_dims[-1], int(output_dim))
         self.output_dim = int(output_dim)
 
     def forward(self, grid: torch.Tensor, cell_mask: torch.Tensor) -> torch.Tensor:
@@ -327,8 +342,7 @@ class AnnualGrid2DEncoder(nn.Module):
         self,
         num_channels: int,
         output_dim: int,
-        hidden_dim: int = 32,
-        num_blocks: int = 1,
+        hidden_dims: Sequence[int] = (32,),
         dropout: float = 0.1,
         norm: str = "batch",
         pool: str = "masked_avg",
@@ -339,26 +353,26 @@ class AnnualGrid2DEncoder(nn.Module):
         if self.pool not in {"masked_avg", "avg"}:
             raise ValueError(f"pool must be 'masked_avg' or 'avg', got {pool!r}")
 
-        hidden_dim = int(hidden_dim)
+        hidden_dims = _validate_hidden_dims(hidden_dims, type(self).__name__)
         stages: list[nn.Module] = []
         in_channels = int(num_channels)
-        for _ in range(max(1, int(num_blocks))):
-            channels = in_channels
+        for width in hidden_dims:
             stages += _conv_stages(
-                lambda c=channels: (
+                lambda c=in_channels, w=width: (
                     # Intra-annual: slides across the 12 calendar months, one year at a time.
-                    nn.Conv2d(c, hidden_dim, kernel_size=(1, 3), padding=(0, 1)),
+                    nn.Conv2d(c, w, kernel_size=(1, 3), padding=(0, 1)),
                     # Inter-annual: slides across years, one calendar month at a time.
-                    nn.Conv2d(hidden_dim, hidden_dim, kernel_size=(3, 1), padding=(1, 0)),
+                    nn.Conv2d(w, w, kernel_size=(3, 1), padding=(1, 0)),
                 ),
-                hidden_dim,
+                width,
                 norm,
                 dropout,
                 dims=2,
             )
-            in_channels = hidden_dim
+            in_channels = width
+        self.hidden_dims = hidden_dims
         self.blocks = _MaskedConvStack(stages, mask_between=mask_between_blocks)
-        self.projection = nn.Linear(hidden_dim, int(output_dim))
+        self.projection = nn.Linear(hidden_dims[-1], int(output_dim))
         self.output_dim = int(output_dim)
 
     def forward(self, grid: torch.Tensor, cell_mask: torch.Tensor) -> torch.Tensor:

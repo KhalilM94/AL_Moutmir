@@ -214,7 +214,7 @@ def test_masked_pool_zeroes_a_fully_empty_grid() -> None:
 
 def test_dilated_conv_reaches_exactly_twelve_months_back() -> None:
     """The point of dilation=12: a spike must resurface 12 cells either side of where it landed."""
-    encoder = DilatedTempCNNEncoder(num_channels=1, output_dim=4, hidden_dim=2, norm="none").eval()
+    encoder = DilatedTempCNNEncoder(num_channels=1, output_dim=4, hidden_dims=[2], norm="none").eval()
     near_conv, far_conv = encoder.blocks.stages[0][0], encoder.blocks.stages[1][0]
     assert (near_conv.kernel_size, near_conv.dilation, near_conv.padding) == ((3,), (1,), (1,))
     assert (far_conv.kernel_size, far_conv.dilation, far_conv.padding) == ((3,), (12,), (12,))
@@ -238,7 +238,7 @@ def test_dilated_conv_reaches_exactly_twelve_months_back() -> None:
 @pytest.mark.parametrize("encoder_cls", ENCODER_CLASSES)
 @pytest.mark.parametrize("grid_years", [1, 3, 9, 15])
 def test_encoders_accept_any_grid_span(encoder_cls, grid_years: int) -> None:
-    encoder = encoder_cls(num_channels=4, output_dim=8, hidden_dim=6).eval()
+    encoder = encoder_cls(num_channels=4, output_dim=8, hidden_dims=[6]).eval()
     grid = torch.randn(2, 4, grid_years, 12)
     cell_mask = torch.ones(2, grid_years, 12, dtype=torch.bool)
 
@@ -255,7 +255,7 @@ def test_masked_pooling_makes_extra_empty_years_free(encoder_cls) -> None:
 
     This is what allows grid_years to be inferred rather than frozen into the checkpoint.
     """
-    encoder = encoder_cls(num_channels=3, output_dim=5, hidden_dim=4, norm="none").eval()
+    encoder = encoder_cls(num_channels=3, output_dim=5, hidden_dims=[4], norm="none").eval()
     torch.manual_seed(0)
     payload = torch.randn(1, 3, 2, 12)
     payload_mask = torch.ones(1, 2, 12, dtype=torch.bool)
@@ -396,7 +396,7 @@ def test_module_supports_any_number_of_modalities() -> None:
         target_dim=1,
         modality_dims=modality_dims,
         grid_years=9,
-        cnn_hidden_dim={"s2": 48, "s1": 32, "soil": 16, "ag": 16, "clim": 16},
+        cnn_hidden_dims={"s2": [48], "s1": [32], "soil": [16], "ag": [16], "clim": [16]},
         modality_embed_dim=16,
     ).eval()
 
@@ -417,9 +417,9 @@ def test_module_supports_any_number_of_modalities() -> None:
 
 
 def test_module_rejects_a_per_modality_mapping_that_omits_a_modality() -> None:
-    with pytest.raises(ValueError, match="no width in cnn_hidden_dim"):
+    with pytest.raises(ValueError, match="no entry in cnn_hidden_dims"):
         SoilCNNLightningModule(
-            static_dim=4, target_dim=1, modality_dims={"s1": 3, "s2": 4}, cnn_hidden_dim={"s1": 16}
+            static_dim=4, target_dim=1, modality_dims={"s1": 3, "s2": 4}, cnn_hidden_dims={"s1": [16]}
         )
 
 
@@ -624,3 +624,69 @@ def test_builder_to_cnn_module_end_to_end(tmp_path: Path, logger) -> None:
     predicted = torch.cat(trainer.predict(module, datamodule=datamodule)).reshape(-1)
     assert len(predicted) == len(datamodule.y_test_frame_)
     assert torch.isfinite(predicted).all()
+
+
+# --- per-block conv widths ---------------------------------------------------
+
+
+@pytest.mark.parametrize("encoder_cls", [DilatedTempCNNEncoder, AnnualGrid2DEncoder])
+def test_a_repeated_width_reproduces_the_old_num_blocks_stack(encoder_cls) -> None:
+    """`hidden_dims=[64, 64]` must be exactly what `hidden_dim=64, num_blocks=2` built."""
+    encoder = encoder_cls(num_channels=7, output_dim=8, hidden_dims=[64, 64])
+    convs = [m for m in encoder.blocks.modules() if isinstance(m, (torch.nn.Conv1d, torch.nn.Conv2d))]
+
+    # Two conv stages per block, and the first of each block reads the previous block's width.
+    assert [(c.in_channels, c.out_channels) for c in convs] == [
+        (7, 64), (64, 64),      # block 1: raw channels in, then the dilated/inter-annual pass
+        (64, 64), (64, 64),     # block 2
+    ]
+    assert encoder.projection.in_features == 64
+
+
+@pytest.mark.parametrize("encoder_cls", [DilatedTempCNNEncoder, AnnualGrid2DEncoder])
+def test_the_conv_stack_can_widen_across_blocks(encoder_cls) -> None:
+    """The shape a single shared width could not express, and the conventional one for convs."""
+    encoder = encoder_cls(num_channels=7, output_dim=8, hidden_dims=[32, 64, 128])
+    convs = [m for m in encoder.blocks.modules() if isinstance(m, (torch.nn.Conv1d, torch.nn.Conv2d))]
+
+    assert [(c.in_channels, c.out_channels) for c in convs] == [
+        (7, 32), (32, 32),
+        (32, 64), (64, 64),
+        (64, 128), (128, 128),
+    ]
+    assert encoder.projection.in_features == 128
+
+
+@pytest.mark.parametrize("encoder_cls", [DilatedTempCNNEncoder, AnnualGrid2DEncoder])
+def test_a_widening_stack_still_runs_end_to_end(encoder_cls) -> None:
+    encoder = encoder_cls(num_channels=4, output_dim=8, hidden_dims=[8, 16], norm="none").eval()
+    grid = torch.randn(2, 4, 3, 12)
+    cell_mask = torch.ones(2, 3, 12, dtype=torch.bool)
+
+    assert encoder(grid, cell_mask).shape == (2, 8)
+
+
+@pytest.mark.parametrize("encoder_cls", [DilatedTempCNNEncoder, AnnualGrid2DEncoder])
+def test_an_empty_conv_width_list_is_refused(encoder_cls) -> None:
+    """Zero blocks would pool the raw rasterized channels: a different model, not a smaller one."""
+    with pytest.raises(ValueError, match="at least one hidden width"):
+        encoder_cls(num_channels=4, output_dim=8, hidden_dims=[])
+
+
+def test_a_scalar_cnn_width_still_means_one_block() -> None:
+    """`cnn_hidden_dims: 64` in a config is the same as `[64]`, so old spellings keep working."""
+    module = _module("dilated_tempcnn", cnn_hidden_dims=64)
+
+    encoder = module.temporal_encoders["m"]
+    assert encoder.hidden_dims == [64]
+
+
+def test_a_per_modality_mapping_may_carry_a_width_list_each() -> None:
+    module = _module(
+        "dilated_tempcnn",
+        modality_dims={"s2": 3, "s1": 2},
+        cnn_hidden_dims={"s2": [16, 32], "s1": [8]},
+    )
+
+    assert module.temporal_encoders["s2"].hidden_dims == [16, 32]
+    assert module.temporal_encoders["s1"].hidden_dims == [8]

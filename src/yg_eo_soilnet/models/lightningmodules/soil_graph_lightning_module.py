@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
 from torch import nn
 
 from lightning.pytorch import LightningModule
+
+from yg_eo_soilnet.models.lightningmodules.mlp import build_mlp_stack
 
 
 def _batch_get(batch: Any, key: str, default=None):
@@ -75,10 +77,8 @@ class SoilGraphLightningModule(LightningModule):
         dropout: float = 0.1,
         learning_rate: float = 1e-3,
         temporal_enabled: bool = True,
-        static_hidden_dim: Optional[int] = None,
-        head_num_layers: int = 0,
-        head_hidden_dim: Optional[int] = None,
-        head_min_hidden_dim: int = 16,
+        static_hidden_dims: Optional[Sequence[int]] = None,
+        head_hidden_dims: Sequence[int] = (),
         use_layer_norm: bool = True,
         fusion_norm_type: str = "batch",
         temporal_lstm_hidden_dim: Optional[Any] = None,
@@ -109,6 +109,8 @@ class SoilGraphLightningModule(LightningModule):
         # weights_only=True default (PyTorch >= 2.6).
         target_mean = _as_float_list(target_mean)
         target_scale = _as_float_list(target_scale)
+        head_hidden_dims = [int(width) for width in head_hidden_dims]
+        static_hidden_dims = None if static_hidden_dims is None else [int(w) for w in static_hidden_dims]
         if hasattr(self, "save_hyperparameters"):
             self.save_hyperparameters()
 
@@ -120,10 +122,11 @@ class SoilGraphLightningModule(LightningModule):
         self.learning_rate = float(learning_rate)
         self.temporal_enabled = bool(temporal_enabled)
         self.temporal_steps = temporal_steps
-        self.static_hidden_dim = int(static_hidden_dim or hidden_dim)
-        self.head_num_layers = max(0, int(head_num_layers))
-        self.head_hidden_dim = int(head_hidden_dim or hidden_dim)
-        self.head_min_hidden_dim = max(1, int(head_min_hidden_dim))
+        # None falls back to the model's generic width, as the scalar spelling used to.
+        self.static_hidden_dims = [int(w) for w in (static_hidden_dims or [self.hidden_dim])]
+        # The fused vector is sized off the static branch's OUTPUT width, its last block.
+        self.static_hidden_dim = self.static_hidden_dims[-1]
+        self.head_hidden_dims = list(head_hidden_dims)
         self.use_layer_norm = bool(use_layer_norm)
         self.fusion_norm_type = str(fusion_norm_type).lower()
         if self.fusion_norm_type not in {"batch", "layer", "none"}:
@@ -179,7 +182,7 @@ class SoilGraphLightningModule(LightningModule):
             persistent=True,
         )
 
-        self.static_encoder = self._build_static_encoder(self.static_dim, self.static_hidden_dim, dropout)
+        self.static_encoder = self._build_static_encoder(self.static_dim, self.static_hidden_dims, dropout)
 
         self.modality_dims = {
             str(name).lower(): int(dim)
@@ -228,8 +231,12 @@ class SoilGraphLightningModule(LightningModule):
                 for _ in range(max(1, int(num_graph_layers)))
             ]
         )
-        self.output_head = self._build_output_head(
-            fusion_input_dim, self.head_hidden_dim, self.target_dim, self.head_num_layers, dropout
+        self.output_head = build_mlp_stack(
+            fusion_input_dim,
+            self.head_hidden_dims,
+            self.target_dim,
+            dropout=dropout,
+            use_layer_norm=self.use_layer_norm,
         )
         # NOTE: val_loss is only comparable across runs that share loss_name - it is the monitor for
         # early stopping, checkpoint selection and the LR scheduler.
@@ -270,41 +277,18 @@ class SoilGraphLightningModule(LightningModule):
             return nn.BatchNorm1d(fusion_input_dim)
         return nn.LayerNorm(fusion_input_dim)
 
-    def _build_static_encoder(self, input_dim: int, hidden_dim: int, dropout: float):
+    def _build_static_encoder(self, input_dim: int, hidden_dims: Sequence[int], dropout: float):
         if input_dim <= 0:
             return nn.Identity()
-        layers = [nn.Linear(input_dim, hidden_dim)]
-        if self.use_layer_norm:
-            layers.append(nn.LayerNorm(hidden_dim))
-        layers += [nn.ReLU(), nn.Dropout(dropout)]
-        return nn.Sequential(*layers)
-
-    def _build_output_head(self, input_dim: int, hidden_dim: int, target_dim: int, num_layers: int, dropout: float):
-        """Fusion -> target. `num_layers=0` keeps the original single linear readout."""
-        if num_layers <= 0:
-            return nn.Linear(input_dim, target_dim)
-
-        layers: list[nn.Module] = []
-        dim = input_dim
-        for index in range(num_layers):
-            # Halve each layer, but never below the floor - an unbounded taper collapses a deep
-            # head to a handful of dimensions and undoes the depth it is adding.
-            width = max(self.head_min_hidden_dim, hidden_dim // (2 ** index))
-            layers.append(nn.Linear(dim, width))
-            is_last_block = index == num_layers - 1
-            # No LayerNorm or Dropout on the block feeding the readout. LayerNorm there forces the
-            # penultimate vector to unit variance, leaving the final Linear only its direction - and
-            # magnitude is what a regressor needs to reach the tails. Dropout on the same vector is
-            # minimized under MSE by shrinking the readout toward its bias, i.e. the target mean.
-            if not is_last_block:
-                if self.use_layer_norm:
-                    layers.append(nn.LayerNorm(width))
-                layers += [nn.ReLU(), nn.Dropout(dropout)]
-            else:
-                layers.append(nn.ReLU())
-            dim = width
-        layers.append(nn.Linear(dim, target_dim))
-        return nn.Sequential(*layers)
+        # Every block full, including the last: this branch feeds the fusion, not the readout.
+        return build_mlp_stack(
+            input_dim,
+            hidden_dims,
+            dropout=dropout,
+            use_layer_norm=self.use_layer_norm,
+            norm_final=True,
+            dropout_final=True,
+        )
 
     def _encode_static(self, x_static):
         if self.static_dim <= 0:

@@ -10,6 +10,7 @@ from yg_eo_soilnet.models.lightningmodules._regression_base import (
     as_float_list,
     batch_get,
 )
+from yg_eo_soilnet.models.lightningmodules.mlp import build_mlp_stack
 from yg_eo_soilnet.models.lightningmodules.tabular_encoders import TabularStaticEncoder
 from yg_eo_soilnet.models.lightningmodules.temporal_encoders import (
     GatedFusion,
@@ -55,7 +56,7 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         temporal_encoder: str = "time_transformer",
         modality_embed_dim: Any = 32,
         fusion_dim: int = 64,
-        static_hidden_dim: int = 64,
+        static_hidden_dims: Sequence[int] = (64,),
         d_model: int = 48,
         nhead: int = 4,
         num_layers: int = 2,
@@ -67,9 +68,7 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         span_cap_years: float = 8.0,
         delta_cap_months: float = 24.0,
         dropout: float = 0.1,
-        head_num_layers: int = 2,
-        head_hidden_dim: int = 64,
-        head_min_hidden_dim: int = 32,
+        head_hidden_dims: Sequence[int] = (64, 32),
         use_layer_norm: bool = True,
         fusion_norm_type: str = "batch",
         loss_name: str = "mse",
@@ -92,6 +91,8 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         # weights_only=True default (PyTorch >= 2.6).
         target_mean = as_float_list(target_mean)
         target_scale = as_float_list(target_scale)
+        head_hidden_dims = [int(width) for width in head_hidden_dims]
+        static_hidden_dims = [int(width) for width in static_hidden_dims]
         # Same reason: plain builtins only in hyper_parameters. The vocabularies live here rather
         # than in the datamodule so the checkpoint carries its own label->index mapping and can be
         # applied to a frame it has never seen.
@@ -123,7 +124,7 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         # indices and contribute their embedding widths instead.
         self.static_dim = int(static_dim)
         self.fusion_dim = int(fusion_dim)
-        self.static_hidden_dim = int(static_hidden_dim)
+        self.static_hidden_dims = list(static_hidden_dims)
         # A checkpoint may carry vocabularies without cardinalities; they are redundant by
         # construction (cardinality == len(vocabulary) + 1), so derive rather than demand both.
         if not categorical_cardinalities and categorical_vocabularies:
@@ -195,8 +196,12 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         # the overall level of the vector - two points differing by a global offset become
         # identical, which caps how far predictions can move from the target mean.
         self.fusion_norm = self._build_fusion_norm()
-        self.output_head = self._build_output_head(
-            head_hidden_dim, head_num_layers, max(1, int(head_min_hidden_dim)), dropout
+        self.output_head = build_mlp_stack(
+            self.fusion_dim,
+            head_hidden_dims,
+            self.target_dim,
+            dropout=dropout,
+            use_layer_norm=self.use_layer_norm,
         )
 
     # --- construction helpers ----------------------------------------------
@@ -275,7 +280,7 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         # Projects to fusion_dim, because the gate blends static against temporal at a shared width.
         return TabularStaticEncoder(
             num_continuous=self.static_dim,
-            hidden_dim=self.static_hidden_dim,
+            hidden_dims=self.static_hidden_dims,
             output_dim=self.fusion_dim,
             cardinalities=self.categorical_cardinalities,
             embedding_dims=embedding_dims,
@@ -294,34 +299,6 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         if self.fusion_norm_type == "batch":
             return nn.BatchNorm1d(self.fusion_dim)
         return nn.LayerNorm(self.fusion_dim)
-
-    def _build_output_head(
-        self, hidden_dim: int, num_layers: int, min_hidden_dim: int, dropout: float
-    ) -> nn.Module:
-        if num_layers <= 0:
-            return nn.Linear(self.fusion_dim, self.target_dim)
-
-        layers: list[nn.Module] = []
-        dim = self.fusion_dim
-        for index in range(num_layers):
-            # Halve each layer, but never below the floor - an unbounded taper collapses a deep head
-            # to a handful of dimensions and undoes the depth it is adding.
-            width = max(min_hidden_dim, int(hidden_dim) // (2**index))
-            layers.append(nn.Linear(dim, width))
-            is_last_block = index == num_layers - 1
-            # No LayerNorm or Dropout on the block feeding the readout. LayerNorm there forces the
-            # penultimate vector to unit variance, leaving the final Linear only its direction - and
-            # magnitude is what a regressor needs to reach the tails. Dropout on the same vector is
-            # minimized under MSE by shrinking the readout toward its bias, i.e. the target mean.
-            if not is_last_block:
-                if self.use_layer_norm:
-                    layers.append(nn.LayerNorm(width))
-                layers += [nn.ReLU(), nn.Dropout(dropout)]
-            else:
-                layers.append(nn.ReLU())
-            dim = width
-        layers.append(nn.Linear(dim, self.target_dim))
-        return nn.Sequential(*layers)
 
     # --- forward -----------------------------------------------------------
 

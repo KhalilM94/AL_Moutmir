@@ -292,7 +292,7 @@ def test_embedding_dropout_is_inactive_in_eval():
 
 
 def test_static_encoder_concatenates_continuous_and_embedded_blocks():
-    encoder = TabularStaticEncoder(num_continuous=11, hidden_dim=64, cardinalities=[7, 13])
+    encoder = TabularStaticEncoder(num_continuous=11, hidden_dims=[64], cardinalities=[7, 13])
 
     assert encoder.embedding_dims == [4, 7]
     assert encoder.input_dim == 22  # 11 continuous + 4 + 7
@@ -304,22 +304,22 @@ def test_static_encoder_concatenates_continuous_and_embedded_blocks():
 
 def test_static_encoder_projects_to_output_dim_when_asked():
     """The sequence model projects to fusion_dim; the CNN model does not."""
-    projected = TabularStaticEncoder(num_continuous=11, hidden_dim=64, output_dim=32, cardinalities=[7])
-    unprojected = TabularStaticEncoder(num_continuous=11, hidden_dim=64, cardinalities=[7])
+    projected = TabularStaticEncoder(num_continuous=11, hidden_dims=[64], output_dim=32, cardinalities=[7])
+    unprojected = TabularStaticEncoder(num_continuous=11, hidden_dims=[64], cardinalities=[7])
 
     assert projected(torch.randn(4, 11), torch.zeros((4, 1), dtype=torch.long)).shape == (4, 32)
     assert unprojected(torch.randn(4, 11), torch.zeros((4, 1), dtype=torch.long)).shape == (4, 64)
 
 
 def test_static_encoder_works_with_no_categoricals():
-    encoder = TabularStaticEncoder(num_continuous=11, hidden_dim=16)
+    encoder = TabularStaticEncoder(num_continuous=11, hidden_dims=[16])
 
     assert encoder.input_dim == 11
     assert encoder(torch.randn(3, 11)).shape == (3, 16)
 
 
 def test_static_encoder_works_with_no_continuous_features():
-    encoder = TabularStaticEncoder(num_continuous=0, hidden_dim=16, cardinalities=[7, 13])
+    encoder = TabularStaticEncoder(num_continuous=0, hidden_dims=[16], cardinalities=[7, 13])
 
     assert encoder.input_dim == 11
     assert encoder(torch.zeros((3, 0)), torch.zeros((3, 2), dtype=torch.long)).shape == (3, 16)
@@ -327,12 +327,12 @@ def test_static_encoder_works_with_no_continuous_features():
 
 def test_static_encoder_raises_when_it_would_have_no_input():
     with pytest.raises(ValueError, match="at least one feature"):
-        TabularStaticEncoder(num_continuous=0, hidden_dim=16)
+        TabularStaticEncoder(num_continuous=0, hidden_dims=[16])
 
 
 def test_static_encoder_raises_when_categoricals_are_missing_from_the_batch():
     encoder = TabularStaticEncoder(
-        num_continuous=11, hidden_dim=16, cardinalities=[7], feature_names=["texture_20cm"]
+        num_continuous=11, hidden_dims=[16], cardinalities=[7], feature_names=["texture_20cm"]
     )
 
     with pytest.raises(KeyError, match="texture_20cm"):
@@ -344,7 +344,7 @@ def test_static_encoder_raises_when_categoricals_are_missing_from_the_batch():
 def test_static_encoder_variants_build_and_run(activation, continuous_norm):
     encoder = TabularStaticEncoder(
         num_continuous=6,
-        hidden_dim=8,
+        hidden_dims=[8],
         cardinalities=[4],
         activation=activation,
         continuous_norm=continuous_norm,
@@ -358,17 +358,53 @@ def test_static_encoder_variants_build_and_run(activation, continuous_norm):
 
 def test_static_encoder_rejects_an_unknown_activation():
     with pytest.raises(ValueError, match="activation"):
-        TabularStaticEncoder(num_continuous=4, hidden_dim=8, activation="swish")
+        TabularStaticEncoder(num_continuous=4, hidden_dims=[8], activation="swish")
 
 
 def test_static_encoder_rejects_an_unknown_continuous_norm():
     with pytest.raises(ValueError, match="continuous_norm"):
-        TabularStaticEncoder(num_continuous=4, hidden_dim=8, continuous_norm="instance")
+        TabularStaticEncoder(num_continuous=4, hidden_dims=[8], continuous_norm="instance")
 
 
 def test_static_encoder_backprops_into_the_embedding_tables():
-    encoder = TabularStaticEncoder(num_continuous=3, hidden_dim=8, cardinalities=[5])
+    encoder = TabularStaticEncoder(num_continuous=3, hidden_dims=[8], cardinalities=[5])
 
     encoder(torch.randn(4, 3), torch.tensor([[1], [2], [1], [3]], dtype=torch.long)).sum().backward()
 
     assert encoder.embeddings.embeddings[0].weight.grad.abs().sum() > 0
+
+
+# --- static encoder depth ----------------------------------------------------
+
+
+def test_a_single_width_reproduces_the_old_hand_built_stack() -> None:
+    """`hidden_dims=[64]` must be exactly what `hidden_dim=64` built before it took a list."""
+    from torch import nn
+
+    encoder = TabularStaticEncoder(num_continuous=11, hidden_dims=[64], cardinalities=[7])
+
+    assert [type(m) for m in encoder.encoder] == [nn.Linear, nn.LayerNorm, nn.ReLU, nn.Dropout]
+    assert encoder.output_dim == 64
+
+
+def test_the_static_branch_can_be_deepened() -> None:
+    from torch import nn
+
+    encoder = TabularStaticEncoder(num_continuous=11, hidden_dims=[128, 64], cardinalities=[7])
+    widths = [layer.out_features for layer in encoder.encoder if isinstance(layer, nn.Linear)]
+
+    assert widths == [128, 64]
+    assert encoder.output_dim == 64  # the fusion is sized off the LAST block
+
+
+def test_a_deep_static_branch_still_projects_to_the_requested_width() -> None:
+    encoder = TabularStaticEncoder(num_continuous=11, hidden_dims=[128, 64], output_dim=32, cardinalities=[7])
+
+    assert encoder.output_dim == 32
+    assert encoder(torch.randn(4, 11), torch.zeros(4, 1, dtype=torch.long)).shape == (4, 32)
+
+
+def test_an_empty_static_width_list_is_refused() -> None:
+    """A zero-layer static branch feeds the raw concatenation into the fusion - a different model."""
+    with pytest.raises(ValueError, match="at least one hidden width"):
+        TabularStaticEncoder(num_continuous=11, hidden_dims=[], cardinalities=[7])

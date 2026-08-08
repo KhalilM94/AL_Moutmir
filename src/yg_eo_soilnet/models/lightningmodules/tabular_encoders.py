@@ -18,6 +18,8 @@ from typing import Any, Mapping, Optional, Sequence
 import torch
 from torch import nn
 
+from yg_eo_soilnet.models.lightningmodules.mlp import build_mlp_stack
+
 
 #: Widest embedding the heuristic will produce, regardless of cardinality.
 DEFAULT_EMBEDDING_MAX_DIM = 50
@@ -157,14 +159,6 @@ class EntityEmbeddingBlock(nn.Module):
         return self.dropout(torch.cat(embedded, dim=-1))
 
 
-def _build_activation(name: str) -> nn.Module:
-    activations = {"relu": nn.ReLU, "gelu": nn.GELU}
-    key = str(name).lower()
-    if key not in activations:
-        raise ValueError(f"activation must be one of {sorted(activations)}, got {name!r}")
-    return activations[key]()
-
-
 def _build_continuous_norm(kind: str, num_features: int) -> nn.Module:
     key = str(kind).lower()
     if key == "none":
@@ -183,14 +177,19 @@ class TabularStaticEncoder(nn.Module):
     The two differ only in activation family and in whether they project to a separate fusion width,
     both of which are parameters here, so each keeps its current output shape exactly.
 
-    ``output_dim=None`` means "no projection": the representation is ``hidden_dim`` wide. Passing an
-    int appends a final ``Linear`` to that width.
+    ``output_dim=None`` means "no projection": the representation is ``hidden_dims[-1]`` wide. Passing
+    an int appends a final ``Linear`` to that width.
+
+    ``hidden_dims`` is a list because this block is an MLP like any other, not a fixed projection: a
+    single width is ``[64]``, and a deeper static branch is ``[128, 64]``. Every block here carries
+    its norm and its dropout, including the last - unlike an output head, nothing downstream is a
+    readout whose magnitude they would erase.
     """
 
     def __init__(
         self,
         num_continuous: int,
-        hidden_dim: int,
+        hidden_dims: Sequence[int],
         *,
         output_dim: Optional[int] = None,
         cardinalities: Sequence[int] = (),
@@ -208,7 +207,13 @@ class TabularStaticEncoder(nn.Module):
         if self.num_continuous < 0:
             raise ValueError(f"num_continuous must be non-negative, got {num_continuous}")
 
-        self.hidden_dim = int(hidden_dim)
+        self.hidden_dims = [int(width) for width in hidden_dims]
+        if not self.hidden_dims:
+            raise ValueError(
+                "TabularStaticEncoder needs at least one hidden width. A zero-layer static branch "
+                "would feed the raw concatenation straight into the fusion, which is a different "
+                "model rather than a smaller one."
+            )
         self.embeddings = EntityEmbeddingBlock(
             cardinalities,
             embedding_dims,
@@ -233,15 +238,20 @@ class TabularStaticEncoder(nn.Module):
             else nn.Identity()
         )
 
-        layers: list[nn.Module] = [nn.Linear(self.input_dim, self.hidden_dim)]
-        if use_layer_norm:
-            layers.append(nn.LayerNorm(self.hidden_dim))
-        layers += [_build_activation(activation), nn.Dropout(float(dropout))]
-        if output_dim is not None:
-            layers.append(nn.Linear(self.hidden_dim, int(output_dim)))
-        self.encoder = nn.Sequential(*layers)
+        self.encoder = build_mlp_stack(
+            self.input_dim,
+            self.hidden_dims,
+            output_dim,
+            dropout=float(dropout),
+            use_layer_norm=use_layer_norm,
+            activation=activation,
+            # Every block is a full block: this branch feeds a fusion, not a readout, so there is no
+            # magnitude for a trailing norm or dropout to strip.
+            norm_final=True,
+            dropout_final=True,
+        )
 
-        self.output_dim = self.hidden_dim if output_dim is None else int(output_dim)
+        self.output_dim = self.hidden_dims[-1] if output_dim is None else int(output_dim)
 
     @property
     def embedding_dims(self) -> list[int]:

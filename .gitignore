@@ -15,6 +15,7 @@ htmlcov/
 mlruns/
 lightning_logs/
 mlflow_exports/
+optuna_studies/
 
 # Build artifacts
 build/

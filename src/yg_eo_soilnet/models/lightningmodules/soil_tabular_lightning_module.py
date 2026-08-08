@@ -3,13 +3,13 @@ from __future__ import annotations
 from typing import Any, Optional, Sequence
 
 import torch
-from torch import nn
 
 from yg_eo_soilnet.models.lightningmodules._regression_base import (
     SoilRegressionLightningBase,
     as_float_list,
     batch_get,
 )
+from yg_eo_soilnet.models.lightningmodules.mlp import build_mlp_stack
 from yg_eo_soilnet.models.lightningmodules.tabular_encoders import TabularStaticEncoder
 
 
@@ -39,7 +39,7 @@ class SoilTabularLightningModule(SoilRegressionLightningBase):
         embedding_dropout: float = 0.0,
         embedding_max_dim: int = 50,
         continuous_norm: str = "none",
-        static_hidden_dim: int = 64,
+        static_hidden_dims: Sequence[int] = (64,),
         head_hidden_dims: Sequence[int] = (64, 32),
         dropout: float = 0.1,
         activation: str = "relu",
@@ -65,6 +65,7 @@ class SoilTabularLightningModule(SoilRegressionLightningBase):
         target_mean = as_float_list(target_mean)
         target_scale = as_float_list(target_scale)
         head_hidden_dims = [int(width) for width in head_hidden_dims]
+        static_hidden_dims = [int(width) for width in static_hidden_dims]
         categorical_cardinalities = [int(value) for value in (categorical_cardinalities or [])]
         categorical_vocabularies = [
             [str(category) for category in vocabulary] for vocabulary in (categorical_vocabularies or [])
@@ -106,7 +107,7 @@ class SoilTabularLightningModule(SoilRegressionLightningBase):
 
         self.static_encoder = TabularStaticEncoder(
             num_continuous=self.static_dim,
-            hidden_dim=int(static_hidden_dim),
+            hidden_dims=static_hidden_dims,
             cardinalities=self.categorical_cardinalities,
             embedding_dims=embedding_dims,
             embedding_dropout=embedding_dropout,
@@ -117,33 +118,13 @@ class SoilTabularLightningModule(SoilRegressionLightningBase):
             use_layer_norm=use_layer_norm,
             continuous_norm=continuous_norm,
         )
-        self.output_head = self._build_output_head(
-            self.static_encoder.output_dim, head_hidden_dims, use_layer_norm, dropout
+        self.output_head = build_mlp_stack(
+            self.static_encoder.output_dim,
+            head_hidden_dims,
+            self.target_dim,
+            dropout=dropout,
+            use_layer_norm=use_layer_norm,
         )
-
-    def _build_output_head(
-        self, input_dim: int, hidden_dims: Sequence[int], use_layer_norm: bool, dropout: float
-    ) -> nn.Module:
-        if not hidden_dims:
-            return nn.Linear(input_dim, self.target_dim)
-
-        layers: list[nn.Module] = []
-        dim = input_dim
-        for index, width in enumerate(hidden_dims):
-            width = int(width)
-            layers.append(nn.Linear(dim, width))
-            # No norm or dropout on the block feeding the readout, matching the other two models:
-            # normalizing there leaves the final Linear only a direction, and magnitude is what a
-            # regressor needs to reach the tails.
-            if index < len(hidden_dims) - 1:
-                if use_layer_norm:
-                    layers.append(nn.LayerNorm(width))
-                layers += [nn.ReLU(), nn.Dropout(dropout)]
-            else:
-                layers.append(nn.ReLU())
-            dim = width
-        layers.append(nn.Linear(dim, self.target_dim))
-        return nn.Sequential(*layers)
 
     def forward(self, batch: Any) -> torch.Tensor:
         x_static = batch_get(batch, "x_static")

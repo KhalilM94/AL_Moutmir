@@ -4,7 +4,7 @@ import importlib
 import inspect
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, MutableMapping
 
 import numpy as np
 
@@ -23,11 +23,24 @@ class LightningModelBundle:
 
 
 class LightningConfigFactory:
-    def __init__(self, registry: Mapping[str, dict], config: Any, logger: Any = None, data_manager: Any = None):
+    def __init__(
+        self,
+        registry: Mapping[str, dict],
+        config: Any,
+        logger: Any = None,
+        data_manager: Any = None,
+        datamodule_cache: MutableMapping[Any, Any] | None = None,
+    ):
         self.registry = registry
         self.config = config
         self.logger = logger
         self.data_manager = data_manager
+        # Opt-in reuse of datamodules across factories, keyed by the arguments that built them.
+        # Off by default, so every existing call site behaves exactly as before. The hyperparameter
+        # search turns it on: SoilSequenceDataModule deep-copies the whole bundle in __init__ and
+        # re-fits normalization and vocabularies in setup(), which dominates the cost of a short
+        # trial. Sharing is safe because setup() is idempotent and a datamodule holds no model state.
+        self.datamodule_cache = datamodule_cache
 
     @staticmethod
     def _dynamic_import(import_path: str):
@@ -127,19 +140,31 @@ class LightningConfigFactory:
         )
         datamodule_kwargs.setdefault("seed", fallback_seed)
 
+        # Built before the payload is attached: the payload is a whole dataset, so it is identified
+        # by object identity rather than by value.
+        cache_key = (spec["datamodule_import_path"], repr(sorted(datamodule_kwargs.items())))
+
         if input_kind == "graph":
-            spatiotemporal_graph = data.get("spatiotemporal_graph")
-            if spatiotemporal_graph is None:
-                spatiotemporal_graph = self._build_spatiotemporal_graph(spec)
-            datamodule_kwargs["spatiotemporal_graph"] = spatiotemporal_graph
+            payload = data.get("spatiotemporal_graph")
+            if payload is None:
+                payload = self._build_spatiotemporal_graph(spec)
+            datamodule_kwargs["spatiotemporal_graph"] = payload
         else:
-            sequence_bundle = data.get("sequence_bundle")
-            if sequence_bundle is None:
-                sequence_bundle = self._build_sequence_bundle(spec)
-            datamodule_kwargs["sequence_bundle"] = sequence_bundle
+            payload = data.get("sequence_bundle")
+            if payload is None:
+                payload = self._build_sequence_bundle(spec)
+            datamodule_kwargs["sequence_bundle"] = payload
+
+        if self.datamodule_cache is not None:
+            cache_key = (*cache_key, id(payload))
+            cached = self.datamodule_cache.get(cache_key)
+            if cached is not None:
+                return cached
 
         datamodule = datamodule_cls(**datamodule_kwargs)
         datamodule.setup("fit")
+        if self.datamodule_cache is not None:
+            self.datamodule_cache[cache_key] = datamodule
         return datamodule
 
     def _build_sequence_bundle(self, spec: Mapping[str, Any]) -> Any:
@@ -280,7 +305,13 @@ class LightningConfigFactory:
             },
         }
 
-        if spec.get("callbacks"):
-            callbacks.update(deepcopy(spec["callbacks"]))
+        # Merged group by group, not `callbacks.update(...)`. Replacing a whole group meant an entry
+        # that named only `early_stopping: {patience: 3}` silently lost monitor and mode, i.e. lost
+        # the config.LIGHTNING_EARLY_STOPPING_* defaults this dict was just built from.
+        for group, overrides in deepcopy(spec.get("callbacks") or {}).items():
+            if isinstance(overrides, Mapping) and isinstance(callbacks.get(group), MutableMapping):
+                callbacks[group].update(overrides)
+            else:
+                callbacks[group] = overrides
 
         return callbacks

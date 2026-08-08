@@ -816,7 +816,7 @@ def _model(**overrides):
 
 
 def test_scalar_temporal_hidden_dim_applies_one_width_to_every_modality() -> None:
-    model = _model(temporal_lstm_hidden_dim=64, static_hidden_dim=64)
+    model = _model(temporal_lstm_hidden_dim=64, static_hidden_dims=[64])
 
     assert {name: enc.hidden_size for name, enc in model.temporal_encoders.items()} == {
         "s2": 64, "s1": 64, "soil": 64
@@ -826,7 +826,7 @@ def test_scalar_temporal_hidden_dim_applies_one_width_to_every_modality() -> Non
 
 def test_dict_temporal_hidden_dim_sizes_each_modality_independently() -> None:
     model = _model(
-        static_hidden_dim=24,
+        static_hidden_dims=[24],
         temporal_lstm_hidden_dim={"s2": 48, "s1": 32, "soil": 16},
     )
 
@@ -850,7 +850,7 @@ def test_output_head_is_a_bare_linear_by_default() -> None:
 def test_output_head_becomes_a_tapering_mlp_when_enabled() -> None:
     torch = pytest.importorskip("torch")
 
-    model = _model(head_num_layers=2, head_hidden_dim=64, static_hidden_dim=24,
+    model = _model(head_hidden_dims=[64, 32], static_hidden_dims=[24],
                    temporal_lstm_hidden_dim={"s2": 48, "s1": 32, "soil": 16})
 
     assert isinstance(model.output_head, torch.nn.Sequential)
@@ -896,7 +896,7 @@ def test_static_fallback_width_matches_the_fusion_dim_when_there_are_no_static_f
     torch = pytest.importorskip("torch")
 
     model = _model(
-        static_dim=0, static_hidden_dim=24, hidden_dim=64,
+        static_dim=0, static_hidden_dims=[24], hidden_dim=64,
         temporal_lstm_hidden_dim={"s2": 48, "s1": 32, "soil": 16},
     )
     assert model.fusion_input_dim == 24 + 48 + 32 + 16
@@ -913,16 +913,22 @@ def test_static_fallback_width_matches_the_fusion_dim_when_there_are_no_static_f
     assert model(batch).shape == (5, 1)
 
 
-def test_head_taper_never_falls_below_the_floor() -> None:
+def test_head_widths_are_built_exactly_as_listed() -> None:
+    """No shape rule hides in the model: the config names every width the head has.
+
+    The taper used to be implicit - head_num_layers + a halving hidden_dim floored at a minimum -
+    and every registry comment describing one of these heads had drifted from what it built. The
+    pyramid is now drawn in hpo/constraints.py and arrives here as an ordinary list.
+    """
     torch = pytest.importorskip("torch")
 
     model = _model(
-        head_num_layers=5, head_hidden_dim=128, head_min_hidden_dim=16,
-        static_hidden_dim=24, temporal_lstm_hidden_dim={"s2": 48, "s1": 32, "soil": 16},
+        head_hidden_dims=[128, 64, 32, 16, 16],
+        static_hidden_dims=[24], temporal_lstm_hidden_dim={"s2": 48, "s1": 32, "soil": 16},
     )
 
     widths = [layer.out_features for layer in model.output_head if isinstance(layer, torch.nn.Linear)]
-    assert widths == [128, 64, 32, 16, 16, 1]  # unfloored this would end ... 16 -> 8 -> 1
+    assert widths == [128, 64, 32, 16, 16, 1]
 
 
 def test_unsized_modality_raises_instead_of_silently_inheriting_a_default() -> None:
@@ -1054,7 +1060,7 @@ def test_temporal_encoder_reads_observations_past_the_observed_count() -> None:
         spatial_graph_enabled=False,
         temporal_pooling="attention",
         temporal_lstm_hidden_dim=4,
-        head_num_layers=0,
+        head_hidden_dims=[],
         dropout=0.0,
     )
     model.eval()
@@ -1130,7 +1136,7 @@ def test_output_head_leaves_the_readout_input_unnormalized() -> None:
     """LayerNorm before the readout strips the magnitude a regressor needs to reach the tails."""
     torch = pytest.importorskip("torch")
 
-    head = _model(head_num_layers=3, head_hidden_dim=64, use_layer_norm=True).output_head
+    head = _model(head_hidden_dims=[64, 32, 32], use_layer_norm=True).output_head
     modules = list(head)
     last_hidden_linear = max(i for i, m in enumerate(modules[:-1]) if isinstance(m, torch.nn.Linear))
     tail = modules[last_hidden_linear + 1 : -1]
@@ -1232,7 +1238,7 @@ def test_shared_step_logs_the_real_batch_size() -> None:
     """Lightning weights the epoch mean by batch_size; a constant 1 let the tail batch dominate."""
     torch = pytest.importorskip("torch")
 
-    model = _model(head_num_layers=0, dropout=0.0)
+    model = _model(head_hidden_dims=[], dropout=0.0)
     model.eval()
     recorded = {}
     model.log = lambda name, value, **kwargs: recorded.setdefault(name, kwargs)

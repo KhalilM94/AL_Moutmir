@@ -10,6 +10,7 @@ from yg_eo_soilnet.models.lightningmodules._regression_base import (
     as_float_list,
     batch_get,
 )
+from yg_eo_soilnet.models.lightningmodules.mlp import build_mlp_stack
 from yg_eo_soilnet.models.lightningmodules.tabular_encoders import TabularStaticEncoder
 from yg_eo_soilnet.models.lightningmodules.temporal_cnn_encoders import (
     AnnualGrid2DEncoder,
@@ -17,6 +18,13 @@ from yg_eo_soilnet.models.lightningmodules.temporal_cnn_encoders import (
     ConcatGatedFusion,
     DilatedTempCNNEncoder,
 )
+
+
+def _as_width_list(value: Any) -> list[int]:
+    """`64` and `[64]` both mean one 64-wide block, so a scalar in the config still works."""
+    if isinstance(value, (list, tuple)):
+        return [int(width) for width in value]
+    return [int(value)]
 
 
 class SoilCNNLightningModule(SoilRegressionLightningBase):
@@ -54,14 +62,13 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         temporal_enabled: bool = True,
         grid_years: Optional[int] = None,
         temporal_encoder: str = "dilated_tempcnn",
-        cnn_hidden_dim: Any = 32,
+        cnn_hidden_dims: Any = (32,),
         modality_embed_dim: Any = 32,
-        num_blocks: int = 1,
         cnn_norm: str = "batch",
         pool: str = "masked_avg",
         month_positional: bool = True,
         use_validity_channels: bool = True,
-        static_hidden_dim: int = 64,
+        static_hidden_dims: Sequence[int] = (64,),
         head_hidden_dims: Sequence[int] = (128, 64),
         head_norm_final: bool = False,
         dropout: float = 0.1,
@@ -86,6 +93,7 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         target_mean = as_float_list(target_mean)
         target_scale = as_float_list(target_scale)
         head_hidden_dims = [int(width) for width in head_hidden_dims]
+        static_hidden_dims = [int(width) for width in static_hidden_dims]
         # Same reason: plain builtins only in hyper_parameters. The vocabularies live here rather
         # than in the datamodule so the checkpoint carries its own label->index mapping and can be
         # applied to a frame it has never seen.
@@ -116,7 +124,9 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         # static_dim counts the CONTINUOUS covariates only; the categorical ones arrive separately as
         # indices and contribute their embedding widths instead.
         self.static_dim = int(static_dim)
-        self.static_hidden_dim = int(static_hidden_dim)
+        self.static_hidden_dims = list(static_hidden_dims)
+        # The fused vector is sized off the static branch's OUTPUT width, which is its last block.
+        self.static_hidden_dim = self.static_hidden_dims[-1]
         # A checkpoint may carry vocabularies without cardinalities; they are redundant by
         # construction (cardinality == len(vocabulary) + 1), so derive rather than demand both.
         if not categorical_cardinalities and categorical_vocabularies:
@@ -143,7 +153,7 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
             if dim is not None and int(dim) > 0
         }
         self.temporal_enabled = bool(temporal_enabled) and bool(self.modality_dims)
-        self._cnn_hidden_dim = cnn_hidden_dim
+        self._cnn_hidden_dims = cnn_hidden_dims
         self._modality_embed_dim = modality_embed_dim
 
         self.static_encoder = self._build_static_encoder(
@@ -172,11 +182,14 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
                 )
                 self.temporal_encoders[modality_name] = encoder_cls(
                     num_channels=rasterizer.output_channels,
-                    output_dim=self._per_modality_value(
-                        self._modality_embed_dim, modality_name, "modality_embed_dim"
+                    output_dim=int(
+                        self._per_modality_value(
+                            self._modality_embed_dim, modality_name, "modality_embed_dim"
+                        )
                     ),
-                    hidden_dim=self._per_modality_value(self._cnn_hidden_dim, modality_name, "cnn_hidden_dim"),
-                    num_blocks=num_blocks,
+                    hidden_dims=_as_width_list(
+                        self._per_modality_value(self._cnn_hidden_dims, modality_name, "cnn_hidden_dims")
+                    ),
                     dropout=dropout,
                     norm=cnn_norm,
                     pool=pool,
@@ -186,26 +199,35 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         # fixed shape regardless of whether covariates are present.
         temporal_dim = sum(encoder.output_dim for encoder in self.temporal_encoders.values())
         self.fusion = ConcatGatedFusion(self.static_hidden_dim, temporal_dim)
-        self.output_head = self._build_output_head(
-            self.fusion.output_dim, head_hidden_dims, bool(head_norm_final), dropout
+        self.output_head = build_mlp_stack(
+            self.fusion.output_dim,
+            head_hidden_dims,
+            self.target_dim,
+            dropout=dropout,
+            activation="gelu",
+            norm_final=bool(head_norm_final),
         )
 
     # --- construction helpers ----------------------------------------------
 
-    def _per_modality_value(self, setting: Any, modality_name: str, label: str) -> int:
-        """A scalar applies one width everywhere; a Mapping must name every modality."""
+    def _per_modality_value(self, setting: Any, modality_name: str, label: str) -> Any:
+        """One setting for every modality, or a Mapping that must name every modality.
+
+        Returns the raw value; callers coerce. `cnn_hidden_dims` is a *list* per modality, so
+        coercing to int here would be wrong for it.
+        """
         if isinstance(setting, Mapping):
             value = setting.get(modality_name, setting.get(str(modality_name).lower()))
             if value is None:
                 # Silently defaulting here would hand a newly added modality the old width,
                 # undoing the per-branch sizing without any signal.
                 raise ValueError(
-                    f"Modality {modality_name!r} has no width in {label} "
-                    f"(configured: {sorted(setting)}). Add an entry for it, or use a scalar value "
-                    "to apply one width to every modality."
+                    f"Modality {modality_name!r} has no entry in {label} "
+                    f"(configured: {sorted(setting)}). Add one for it, or use a single value "
+                    "to apply the same setting to every modality."
                 )
-            return int(value)
-        return int(setting)
+            return value
+        return setting
 
     @property
     def has_static_features(self) -> bool:
@@ -222,11 +244,11 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
     ) -> nn.Module:
         if not self.has_static_features:
             return nn.Identity()
-        # No output projection: this branch keeps its full static_hidden_dim width, because
-        # ConcatGatedFusion gates the concatenation rather than interpolating at a shared width.
+        # No output projection: this branch keeps its full final width, because ConcatGatedFusion
+        # gates the concatenation rather than interpolating at a shared width.
         return TabularStaticEncoder(
             num_continuous=self.static_dim,
-            hidden_dim=self.static_hidden_dim,
+            hidden_dims=self.static_hidden_dims,
             cardinalities=self.categorical_cardinalities,
             embedding_dims=embedding_dims,
             embedding_dropout=embedding_dropout,
@@ -237,32 +259,6 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
             use_layer_norm=True,
             continuous_norm=continuous_norm,
         )
-
-    def _build_output_head(
-        self, input_dim: int, hidden_dims: Sequence[int], norm_final: bool, dropout: float
-    ) -> nn.Module:
-        if not hidden_dims:
-            return nn.Linear(input_dim, self.target_dim)
-
-        layers: list[nn.Module] = []
-        dim = input_dim
-        for index, width in enumerate(hidden_dims):
-            width = int(width)
-            layers.append(nn.Linear(dim, width))
-            is_last_block = index == len(hidden_dims) - 1
-            # LayerNorm + GELU per block, except on the block feeding the readout unless asked for.
-            # Normalising there forces the penultimate vector to unit variance, leaving the final
-            # Linear only its direction - and magnitude is what a regressor needs to reach the
-            # tails. Dropout there is likewise minimized under MSE by shrinking the readout toward
-            # its bias, i.e. toward the target mean.
-            if not is_last_block or norm_final:
-                layers.append(nn.LayerNorm(width))
-            layers.append(nn.GELU())
-            if not is_last_block:
-                layers.append(nn.Dropout(dropout))
-            dim = width
-        layers.append(nn.Linear(dim, self.target_dim))
-        return nn.Sequential(*layers)
 
     # --- forward -----------------------------------------------------------
 

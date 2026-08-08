@@ -412,3 +412,93 @@ def test_both_timeseries_key_spellings_resolve(base_config_paths: dict, key: str
     config = Config(**_write_config(base_config_paths, content))
 
     assert config.TIMESERIES_SOURCE == "base_folder/ts.csv"
+
+
+# --- lightning registry `defaults:` -------------------------------------------------------------
+
+REGISTRY_WITH_DEFAULTS = """
+defaults:
+  modeltype: dl
+  trainer_args:
+    max_epochs: 500
+    accelerator: cuda
+    deterministic: true
+  callbacks:
+    early_stopping: {monitor: val_loss, mode: min, patience: 30}
+    checkpoint: {monitor: val_loss, mode: min, save_top_k: 1}
+  datamodule_init_args:
+    batch_size: 32
+    num_workers: 11
+
+inheritor:
+  enabled: true
+
+overrider:
+  enabled: false
+  trainer_args:
+    max_epochs: 150
+  callbacks:
+    early_stopping: {patience: 3}
+  datamodule_init_args:
+    batch_size: 64
+    max_sequence_length: null
+"""
+
+
+def _registry(base_config_paths: dict, content: str) -> Config:
+    Path(base_config_paths["lightning_registry_path"]).write_text(content.strip())
+    return Config(**base_config_paths)
+
+
+def test_registry_defaults_are_merged_into_every_entry(base_config_paths: dict) -> None:
+    registry = _registry(base_config_paths, REGISTRY_WITH_DEFAULTS).LIGHTNING_MODEL_REGISTRY
+
+    assert registry["inheritor"]["modeltype"] == "dl"
+    assert registry["inheritor"]["trainer_args"] == {
+        "max_epochs": 500, "accelerator": "cuda", "deterministic": True
+    }
+    assert registry["inheritor"]["callbacks"]["checkpoint"]["save_top_k"] == 1
+
+
+def test_an_entry_overriding_one_key_keeps_the_rest_of_the_block(base_config_paths: dict) -> None:
+    """The whole point of merging per key: `max_epochs: 150` must not drop the accelerator."""
+    registry = _registry(base_config_paths, REGISTRY_WITH_DEFAULTS).LIGHTNING_MODEL_REGISTRY
+
+    assert registry["overrider"]["trainer_args"] == {
+        "max_epochs": 150, "accelerator": "cuda", "deterministic": True
+    }
+    assert registry["overrider"]["datamodule_init_args"] == {
+        "batch_size": 64, "num_workers": 11, "max_sequence_length": None
+    }
+
+
+def test_merging_recurses_into_a_callback_group(base_config_paths: dict) -> None:
+    """`early_stopping: {patience: 3}` keeps monitor and mode rather than replacing the group."""
+    registry = _registry(base_config_paths, REGISTRY_WITH_DEFAULTS).LIGHTNING_MODEL_REGISTRY
+
+    assert registry["overrider"]["callbacks"]["early_stopping"] == {
+        "monitor": "val_loss", "mode": "min", "patience": 3
+    }
+
+
+def test_defaults_is_not_itself_a_registry_entry(base_config_paths: dict) -> None:
+    registry = _registry(base_config_paths, REGISTRY_WITH_DEFAULTS).LIGHTNING_MODEL_REGISTRY
+
+    assert set(registry) == {"inheritor", "overrider"}
+
+
+def test_a_registry_without_defaults_is_unchanged(base_config_paths: dict) -> None:
+    """Tuned files exported by tune.py carry no `defaults:` key, so for them this is a no-op."""
+    registry = _registry(
+        base_config_paths, "solo:\n  enabled: true\n  modeltype: dl\n  trainer_args: {max_epochs: 7}\n"
+    ).LIGHTNING_MODEL_REGISTRY
+
+    assert registry == {"solo": {"enabled": True, "modeltype": "dl", "trainer_args": {"max_epochs": 7}}}
+
+
+def test_an_entry_cannot_mutate_the_defaults_for_the_next_one(base_config_paths: dict) -> None:
+    """Deep copies, not shared references: mutating one entry's block must not reach another's."""
+    registry = _registry(base_config_paths, REGISTRY_WITH_DEFAULTS).LIGHTNING_MODEL_REGISTRY
+    registry["overrider"]["callbacks"]["checkpoint"]["save_top_k"] = 99
+
+    assert registry["inheritor"]["callbacks"]["checkpoint"]["save_top_k"] == 1

@@ -1,0 +1,177 @@
+# Optuna search spaces, keyed by the entry name in lightning_registry.yml.
+#
+# Parameters are addressed by a dotted prefix naming the registry section they land in:
+#   model.<key>                 -> init_args
+#   datamodule.<key>            -> datamodule_init_args
+#   trainer.<key>               -> trainer_args
+#   callbacks.<group>.<key>     -> callbacks[group]
+#
+# Blocks:
+#   objective  what to optimize; the early-stopping monitor is rewritten to match it
+#   fixed      applied verbatim to every trial, not searched
+#   params     the search space; `when:` makes a parameter conditional on an earlier draw
+#   derive     named hooks from hpo/constraints.py for couplings YAML cannot express. Write a bare
+#              name, or `{name: {option: value}}` to give the hook its arguments.
+#
+# LAYER WIDTHS. Every stack in the models - the head, the static branch, the conv blocks - is a list
+# of per-layer widths, and the list is the depth. Optuna stores a categorical's choices in the study
+# database, so they must be scalars and no single distribution can draw a list. Three ways to set one:
+#
+#   1. search it   derive: [{dims_pyramid: {key: model.head_hidden_dims, max_depth: 3,
+#                                           widths: [32, 64, 128], taper: 0.5, floor: 16}}]
+#                  draws <name>_depth and <name>_width, then scales by taper per layer:
+#                    taper 0.5 halves    128 -> [128, 64, 32]     a classic head
+#                    taper 1.0 constant  128 -> [128, 128, 128]   a shared-width conv stack
+#                    taper 2.0 widens     32 -> [32, 64, 128]     the conventional conv shape
+#                  min_depth: 0 makes a bare projection reachable (an empty list).
+#   2. pin it      fixed: {model.head_hidden_dims: [64, 32]}   - applied verbatim, not searched
+#   3. leave it    omit it entirely and the registry's own value stands
+#
+# Every OTHER width and depth is a scalar and belongs in `params` as usual: modality_embed_dim,
+# fusion_dim, d_model, nhead, num_layers, time2vec_dim, lstm_hidden_dim, lstm_num_layers.
+#
+# Editing anything in here changes the space's fingerprint, and so the default study name: the next
+# `python tune.py` starts a clean study instead of appending to a leaderboard it is no longer
+# comparable with. Sampler and pruner are excluded from that digest, so retuning those resumes.
+#
+# Two classes of key are refused (see hpo/overrides.py):
+#   - anything the factory resolves from the datamodule (static_dim, target_dim, categorical_*,
+#     grid_years, target_mean/scale/transform, ...) - overriding it breaks the shape contract
+#   - val_size / test_size / seed under `params` - varying the split re-fits the scaler, the
+#     vocabulary and target_mean_/target_scale_, so trials stop being comparable
+
+# --- static covariates + entity embeddings; no temporal branch -------------------------------
+soil_tabular:
+  objective:
+    metric: val_r2                     # val_r2 is scale-free, so it survives tuning loss_name
+    direction: maximize
+  sampler: {name: tpe, seed: 42}
+  pruner: {name: median, n_startup_trials: 5, n_warmup_steps: 10}
+
+  fixed:
+    trainer.max_epochs: 150            # 500 is for the final run; trials rely on pruning
+    datamodule.num_workers: 4          # 11 is for a production run; trials do not need the width
+    # false on purpose. Persistent workers keep the DataLoader's iterator alive for its whole life,
+    # so every later fork in the trial inherits it, and those workers assert on exit
+    # ("can only test a child process") - and pin worker processes across the study. Respawning per
+    # epoch is cheap here: _PointDataset holds only an index array and fork is copy-on-write.
+    datamodule.persistent_workers: false
+    callbacks.early_stopping.patience: 20
+
+  params:
+    model.learning_rate: {type: float, low: 1.0e-4, high: 1.0e-2, log: true}
+    model.weight_decay: {type: float, low: 1.0e-6, high: 1.0e-2, log: true}
+    model.dropout: {type: float, low: 0.0, high: 0.5, step: 0.05}
+    model.embedding_dropout: {type: float, low: 0.0, high: 0.3, step: 0.05}
+    model.embedding_dims: {type: categorical, choices: ["auto", 8, 16, 32]}
+    model.embedding_max_dim: {type: int, low: 8, high: 64, step: 8}
+    model.continuous_norm: {type: categorical, choices: [none, batch, layer]}
+    model.activation: {type: categorical, choices: [relu, gelu]}
+    model.use_layer_norm: {type: categorical, choices: [true, false]}
+    model.scheduler_patience: {type: int, low: 5, high: 30, step: 5}
+    model.scheduler_factor: {type: float, low: 0.2, high: 0.8, step: 0.1}
+    datamodule.batch_size: {type: categorical, choices: [16, 32, 64, 128]}
+
+  derive:
+    - dims_pyramid: {key: model.head_hidden_dims,   min_depth: 0, max_depth: 3,
+                     widths: [32, 64, 128, 256], taper: 0.5, floor: 8}
+    - dims_pyramid: {key: model.static_hidden_dims, min_depth: 1, max_depth: 2,
+                     widths: [32, 64, 128, 256], taper: 1.0}
+
+# --- static covariates + one sequence encoder per modality, blended by a learned gate ---------
+soil_sequence:
+  objective:
+    metric: val_r2
+    direction: maximize
+  sampler: {name: tpe, seed: 42}
+  pruner: {name: median, n_startup_trials: 5, n_warmup_steps: 10}
+
+  fixed:
+    trainer.max_epochs: 150
+    datamodule.num_workers: 4
+    datamodule.persistent_workers: true
+    callbacks.early_stopping.patience: 20
+
+  params:
+    model.learning_rate: {type: float, low: 1.0e-4, high: 1.0e-2, log: true}
+    model.weight_decay: {type: float, low: 1.0e-6, high: 1.0e-2, log: true}
+    model.dropout: {type: float, low: 0.0, high: 0.4, step: 0.05}
+    model.embedding_dropout: {type: float, low: 0.0, high: 0.3, step: 0.05}
+    model.continuous_norm: {type: categorical, choices: [none, batch, layer]}
+    model.modality_embed_dim: {type: categorical, choices: [32, 64, 128]}
+    model.fusion_dim: {type: categorical, choices: [32, 64, 128]}
+    model.fusion_norm_type: {type: categorical, choices: [batch, layer, none]}
+    model.use_layer_norm: {type: categorical, choices: [true, false]}
+    model.scheduler_patience: {type: int, low: 5, high: 30, step: 5}
+    datamodule.batch_size: {type: categorical, choices: [16, 32, 64]}
+
+    # The two temporal branches are mutually exclusive; `when:` keeps each one's parameters out of
+    # the trials that do not use them. Optuna's TPE handles conditional spaces natively.
+    model.temporal_encoder: {type: categorical, choices: [time_transformer, time_lstm]}
+    model.nhead:
+      {type: categorical, choices: [2, 4, 8], when: {model.temporal_encoder: time_transformer}}
+    model.d_model:
+      {type: categorical, choices: [32, 48, 64, 96, 128], when: {model.temporal_encoder: time_transformer}}
+    model.num_layers:
+      {type: int, low: 1, high: 4, when: {model.temporal_encoder: time_transformer}}
+    model.time2vec_dim:
+      {type: categorical, choices: [4, 8, 16], when: {model.temporal_encoder: time_transformer}}
+    model.lstm_hidden_dim:
+      {type: categorical, choices: [32, 64, 128], when: {model.temporal_encoder: time_lstm}}
+    model.lstm_num_layers:
+      {type: int, low: 1, high: 3, when: {model.temporal_encoder: time_lstm}}
+    model.lstm_bidirectional:
+      {type: categorical, choices: [true, false], when: {model.temporal_encoder: time_lstm}}
+    model.temporal_pooling:
+      {type: categorical, choices: [mean_max_last, last, attention], when: {model.temporal_encoder: time_lstm}}
+
+  derive:
+    - d_model_divisible_by_nhead        # the transformer raises unless d_model % nhead == 0
+    # min_depth 0 keeps the bare Linear(fusion -> target) readout reachable.
+    - dims_pyramid: {key: model.head_hidden_dims,   min_depth: 0, max_depth: 3,
+                     widths: [32, 64, 128], taper: 0.5, floor: 16}
+    - dims_pyramid: {key: model.static_hidden_dims, min_depth: 1, max_depth: 2,
+                     widths: [32, 64, 128], taper: 1.0}
+
+# --- static covariates + one CNN per modality over a rasterised (years x months) grid ---------
+soil_cnn:
+  objective:
+    # val_loss, not "mse": nothing logs a metric by that name, so a study would prune every trial
+    # and yield nothing. With the registry's loss_name: mse, val_loss IS the mean squared error
+    # (measured in standardized, log1p space - see _regression_base).
+    metric: val_loss
+    direction: minimize
+  sampler: {name: tpe, seed: 42}
+  pruner: {name: median, n_startup_trials: 5, n_warmup_steps: 10}
+
+  fixed:
+    trainer.max_epochs: 150
+    datamodule.num_workers: 4
+    datamodule.persistent_workers: true
+    callbacks.early_stopping.patience: 20
+
+  params:
+    model.learning_rate: {type: float, low: 1.0e-4, high: 1.0e-2, log: true}
+    model.weight_decay: {type: float, low: 1.0e-6, high: 1.0e-2, log: true}
+    model.dropout: {type: float, low: 0.0, high: 0.5, step: 0.05}
+    model.embedding_dropout: {type: float, low: 0.0, high: 0.3, step: 0.05}
+    model.continuous_norm: {type: categorical, choices: [none, batch, layer]}
+    model.temporal_encoder: {type: categorical, choices: [dilated_tempcnn, annual_grid2d]}
+    model.modality_embed_dim: {type: categorical, choices: [32, 64, 128, 256]}
+    model.cnn_norm: {type: categorical, choices: [batch, group, none]}
+    model.pool: {type: categorical, choices: [masked_avg, avg]}
+    model.month_positional: {type: categorical, choices: [true, false]}
+    model.use_validity_channels: {type: categorical, choices: [true, false]}
+    model.head_norm_final: {type: categorical, choices: [true, false]}
+    model.scheduler_patience: {type: int, low: 5, high: 30, step: 5}
+    datamodule.batch_size: {type: categorical, choices: [16, 32, 64]}
+
+  derive:
+    - dims_pyramid: {key: model.head_hidden_dims,   min_depth: 0, max_depth: 3,
+                     widths: [32, 64, 128, 256], taper: 0.5, floor: 8}
+    - dims_pyramid: {key: model.static_hidden_dims, min_depth: 1, max_depth: 5,
+                     widths: [32, 64, 128, 256], taper: 1.0}
+    # taper 1.0 = every conv block the same width, which is exactly what the old
+    # num_blocks x cnn_hidden_dim sweep covered. Raise it to 2.0 to search a widening stack.
+    - dims_pyramid: {key: model.cnn_hidden_dims,    min_depth: 1, max_depth: 5,
+                     widths: [16, 32, 64, 128, 256], taper: 1.0}

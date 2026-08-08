@@ -2,7 +2,27 @@ import os
 import random
 import yaml
 import json
-from typing import Any, Optional
+from copy import deepcopy
+from typing import Any, Mapping, Optional
+
+# Reserved top-level key in the Lightning registry holding settings shared by every entry.
+LIGHTNING_REGISTRY_DEFAULTS_KEY = 'defaults'
+
+
+def deep_merge(base: Mapping, override: Mapping) -> dict:
+    """`override` on top of `base`, recursing into nested mappings.
+
+    A mapping on both sides merges key by key; anything else in `override` - a scalar, a list -
+    replaces. So an entry naming `trainer_args.max_epochs` keeps the rest of the shared trainer args,
+    while `head_hidden_dims: [64]` replaces the default list outright rather than merging into it.
+    """
+    merged = deepcopy(dict(base))
+    for key, value in override.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
 
 
 class Config:
@@ -219,11 +239,19 @@ class Config:
     def _load_lightning_model_registry(self):
         try:
             with open(self.lightning_registry_path, 'r') as f:
-                return yaml.safe_load(f) or {}
+                document = yaml.safe_load(f) or {}
         except FileNotFoundError:
             raise FileNotFoundError(
                 f"Lightning model registry YAML not found at {self.lightning_registry_path}. Stopping execution."
             )
+
+        # The trainer args and the callbacks were byte-identical on every entry, so they live once
+        # under `defaults:` and are merged in here. Merging at load time rather than in the factory
+        # means every consumer - LightningConfigFactory, tune.py, the HPO exporter, the tests - keeps
+        # seeing one fully materialized entry and needs to know nothing about this. A tuned file from
+        # configs/lightning/tuned/ carries no `defaults:` key, so for it this is a no-op.
+        defaults = document.pop(LIGHTNING_REGISTRY_DEFAULTS_KEY, None) or {}
+        return {name: deep_merge(defaults, spec or {}) for name, spec in document.items()}
 
     def _get_data_config(self, data_key: str, flat_key: str, default: Any) -> Any:
         """Read from the unified `data:` block, falling back to the legacy flat key."""
