@@ -5,6 +5,7 @@ import pytest
 
 from yg_eo_soilnet.hpo.objective import OVERRIDES_ATTR, ObjectiveContext, TrialObjective
 from yg_eo_soilnet.hpo.search_space import SearchSpace
+from yg_eo_soilnet.hpo.trial_runner import UnrecoverableAcceleratorError
 
 
 class FakeDataModule:
@@ -253,3 +254,70 @@ def test_each_trial_is_seeded_before_the_model_is_built(monkeypatch):
     _run_one_trial(objective, [0.1, 0.2])
 
     assert seeded == [7, 8]
+
+
+# --- a lost accelerator must stop the study, not kill the process -------------
+
+
+def test_a_dead_accelerator_during_seeding_aborts_the_study(monkeypatch):
+    """The gap that ended a 266-trial study: seed_everything sat outside every guard.
+
+    It reaches torch.cuda.manual_seed_all, so once the device is gone it raises before the runner
+    is ever entered - and the raw error escaped study.optimize and killed tune.py.
+    """
+    objective = _objective()
+    monkeypatch.setattr(
+        "yg_eo_soilnet.hpo.objective.seed_everything",
+        lambda seed: (_ for _ in ()).throw(RuntimeError("CUDA error: unknown error")),
+    )
+    monkeypatch.setattr("yg_eo_soilnet.hpo.trial_runner.cuda_context_is_dead", lambda: True)
+
+    with pytest.raises(UnrecoverableAcceleratorError, match="died during trial"):
+        objective(optuna.create_study(direction="maximize").ask())
+
+
+def test_a_live_accelerator_lets_a_seeding_failure_propagate_as_itself(monkeypatch):
+    """Only a dead device is special. Anything else keeps its own type and traceback."""
+    objective = _objective()
+    monkeypatch.setattr(
+        "yg_eo_soilnet.hpo.objective.seed_everything", lambda seed: (_ for _ in ()).throw(ValueError("bad seed"))
+    )
+    monkeypatch.setattr("yg_eo_soilnet.hpo.trial_runner.cuda_context_is_dead", lambda: False)
+
+    with pytest.raises(ValueError, match="bad seed"):
+        objective(optuna.create_study(direction="maximize").ask())
+
+
+def test_workers_are_still_released_when_seeding_fails(monkeypatch):
+    """The finally must survive the new except, or a dead trial leaks its DataLoader workers."""
+    released = []
+    objective = _objective()
+    monkeypatch.setattr(
+        "yg_eo_soilnet.hpo.objective.seed_everything", lambda seed: (_ for _ in ()).throw(ValueError("bad seed"))
+    )
+    monkeypatch.setattr("yg_eo_soilnet.hpo.trial_runner.cuda_context_is_dead", lambda: False)
+    monkeypatch.setattr(
+        "yg_eo_soilnet.hpo.objective.release_dataloader_workers", lambda: released.append(True)
+    )
+
+    with pytest.raises(ValueError):
+        objective(optuna.create_study(direction="maximize").ask())
+    assert released == [True]
+
+
+def test_a_pruned_trial_is_not_mistaken_for_a_device_failure(monkeypatch):
+    """TrialPruned must reach Optuna untouched, whatever the probe would have said."""
+    objective = _objective()
+    probed = []
+    monkeypatch.setattr(
+        "yg_eo_soilnet.hpo.trial_runner.cuda_context_is_dead", lambda: probed.append(True) or True
+    )
+    monkeypatch.setattr(
+        objective.runner,
+        "run",
+        lambda bundle, trial, report=True: (_ for _ in ()).throw(optuna.TrialPruned("pruned")),
+    )
+
+    with pytest.raises(optuna.TrialPruned):
+        objective(optuna.create_study(direction="maximize").ask())
+    assert probed == []

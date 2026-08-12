@@ -12,6 +12,7 @@ from __future__ import annotations
 import gc
 import importlib
 import logging
+import sys
 from dataclasses import dataclass
 
 import optuna
@@ -28,11 +29,58 @@ TRIAL_TRAINER_OVERRIDES = {
 }
 
 
+class UnrecoverableAcceleratorError(RuntimeError):
+    """The CUDA context is gone; no later trial in this process can succeed.
+
+    Distinct from every other trial failure on purpose. A bad corner of the search space - an OOM, an
+    architecture the model rejects - is one pruned trial and the study carries on. A dead device is
+    not: every remaining trial would fail in turn, each after a full data load, so the study must
+    stop and hand back what it has.
+    """
+
+
 @dataclass
 class TrialResult:
     value: float
     best_epoch: int | None
     epochs_run: int
+
+
+def cuda_context_is_dead() -> bool:
+    """One tiny allocation, run only on the failure path.
+
+    Probing beats matching on the message. ``cudaErrorUnknown`` is reported asynchronously, so the
+    exception names whatever CUDA call came next rather than the one that failed - in the run that
+    prompted this, a two-element ``torch.tensor`` in the rasterizer, then ``torch.cuda.manual_seed_all``
+    on the following trial. Neither says anything about the cause; the device either answers or it
+    does not.
+
+    ``is_initialized()`` gates the probe to processes that actually built a context, so a CPU run
+    never reports a dead accelerator.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None or not torch.cuda.is_initialized():
+        return False
+    try:
+        torch.zeros(1, device="cuda").add_(1).cpu()
+        return False
+    except Exception:
+        return True
+
+
+def raise_if_accelerator_is_dead(exc: BaseException, trial_number: int) -> None:
+    """Turn a device death into ``UnrecoverableAcceleratorError``; return quietly for anything else.
+
+    An OOM is handled correctly by doing nothing special: it leaves the context usable, so the probe
+    passes and the caller prunes the trial exactly as before.
+    """
+    if not cuda_context_is_dead():
+        return
+    raise UnrecoverableAcceleratorError(
+        f"The CUDA context died during trial {trial_number}, so no later trial in this process can "
+        f"succeed. Every completed trial is safe in the study storage. Restore the GPU and re-run - "
+        f"on WSL2 that means `wsl --shutdown` from Windows, then check `nvidia-smi` before starting."
+    ) from exc
 
 
 def release_dataloader_workers() -> None:
@@ -45,8 +93,15 @@ def release_dataloader_workers() -> None:
     `assert self._parent_pid == os.getpid()`, because is_alive() is only valid in the process that
     started the workers. Collecting here runs that finalization in the main process instead, where
     it is valid, and stops workers accumulating across a long study.
+
+    Also returns the trial's GPU blocks to the driver. Trials range from a one-block encoder to five
+    blocks of 256 channels per modality, so the caching allocator otherwise accumulates freed blocks
+    in shapes the next trial cannot use. A few milliseconds against a trial measured in minutes.
     """
     gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
 
 
 def silence_lightning() -> None:
@@ -104,6 +159,9 @@ class TrialRunner:
             except Exception as exc:
                 if self.fail_fast:
                     raise
+                # Before pruning: was it this configuration that failed, or the device? Pruning a
+                # dead GPU would spend the rest of the study reloading data to fail again.
+                raise_if_accelerator_is_dead(exc, trial.number)
                 # A single bad corner of the space - an OOM, a non-finite loss from _shared_step, an
                 # architecture combination the model rejects - must not end a long study.
                 if self.logger is not None:

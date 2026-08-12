@@ -17,7 +17,12 @@ import optuna
 
 from yg_eo_soilnet.hpo.overrides import apply_overrides
 from yg_eo_soilnet.hpo.search_space import SearchSpace
-from yg_eo_soilnet.hpo.trial_runner import TrialRunner, release_dataloader_workers
+from yg_eo_soilnet.hpo.trial_runner import (
+    TrialRunner,
+    UnrecoverableAcceleratorError,
+    raise_if_accelerator_is_dead,
+    release_dataloader_workers,
+)
 from yg_eo_soilnet.models.config_fatories.lightning_config_factory import LightningConfigFactory
 
 # The key an objective stores its resolved overrides under, so export does not have to replay the
@@ -107,13 +112,17 @@ class TrialObjective:
 
         values: list[float] = []
         for repeat in range(self.seed_repeats):
-            # Before the factory builds the model, not after. LightningTrainer._seed_for_bundle
-            # seeds inside train(), by which point the weights already exist - so on the factory
-            # path initialization is unseeded. Seeding here is what makes two trials differ by
-            # their hyperparameters and nothing else.
-            seed_everything(self.seed + repeat)
             bundle = None
             try:
+                # Before the factory builds the model, not after. LightningTrainer._seed_for_bundle
+                # seeds inside train(), by which point the weights already exist - so on the factory
+                # path initialization is unseeded. Seeding here is what makes two trials differ by
+                # their hyperparameters and nothing else.
+                #
+                # Inside the try, because seeding touches the accelerator: seed_everything reaches
+                # torch.cuda.manual_seed_all, which is where a study died on the trial after the GPU
+                # was lost - outside any guard, so it killed the process instead of stopping.
+                seed_everything(self.seed + repeat)
                 bundle = self.build_bundle(overrides)
                 # Only the first repeat reports intermediates: Optuna keeps one value per step, so a
                 # second curve would overwrite the first.
@@ -122,6 +131,13 @@ class TrialObjective:
                 if repeat == 0:
                     trial.set_user_attr("best_epoch", result.best_epoch)
                     trial.set_user_attr("epochs_run", result.epochs_run)
+            except (optuna.TrialPruned, UnrecoverableAcceleratorError):
+                raise
+            except Exception as exc:
+                # Seeding and model construction sit outside TrialRunner's guard, so this is the
+                # only place a lost device can be caught before it escapes the study.
+                raise_if_accelerator_is_dead(exc, trial.number)
+                raise
             finally:
                 # In a finally because a pruned trial raises out of run(), and the traceback keeps
                 # this frame - and so the bundle, the model and the Trainer behind it - alive.

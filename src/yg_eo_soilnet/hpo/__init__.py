@@ -25,7 +25,13 @@ from yg_eo_soilnet.hpo.study import (
     summarize,
 )
 from yg_eo_soilnet.hpo.tracker import ObjectiveTracker, TrialRecord, best_value_or_none
-from yg_eo_soilnet.hpo.trial_runner import TrialRunner, silence_lightning
+from yg_eo_soilnet.hpo.trial_runner import (
+    TrialRunner,
+    UnrecoverableAcceleratorError,
+    cuda_context_is_dead,
+    raise_if_accelerator_is_dead,
+    silence_lightning,
+)
 
 __all__ = [
     "CONSTRAINTS",
@@ -40,17 +46,20 @@ __all__ = [
     "TrialObjective",
     "TrialRecord",
     "TrialRunner",
+    "UnrecoverableAcceleratorError",
     "apply_overrides",
     "best_value_or_none",
     "build_lightning_input",
     "build_tuned_spec",
     "constraint",
+    "cuda_context_is_dead",
     "create_or_load_study",
     "default_study_name",
     "export_best_config",
     "metric_to_float",
     "optimization_history",
     "param_importances",
+    "raise_if_accelerator_is_dead",
     "reset_study",
     "resolve_mode",
     "run_study",

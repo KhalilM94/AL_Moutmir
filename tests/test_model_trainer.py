@@ -249,6 +249,44 @@ def test_train_uses_per_model_random_seed_for_cv(monkeypatch: pytest.MonkeyPatch
     assert FakeCVSplitter.instances[0].random_state == 99
 
 
+@pytest.mark.parametrize(
+    "spec_extra,expected_n_jobs",
+    [({"search_n_jobs": 1}, 1), ({}, -1)],
+    ids=["capped_by_entry", "defaults_to_all_cores"],
+)
+def test_train_honours_per_model_search_n_jobs(
+    monkeypatch: pytest.MonkeyPatch, spec_extra: dict, expected_n_jobs: int
+) -> None:
+    """Models that load a large checkpoint per worker cap GridSearchCV; the rest stay at -1."""
+    FakeGridSearchCV.instances.clear()
+    FakeCVSplitter.instances.clear()
+
+    config = SimpleNamespace(CATEGORICAL_FEATURES=[], CLUSTERING_STRATEGY={"enabled": False, "params": {}})
+    trainer = ModelTrainer(config=config, columns_to_transform=[], n_splits=2, logger=MagicMock())
+
+    monkeypatch.setattr(trainer_module, "ChildRunLogger", lambda: FakeChildLogger())
+    monkeypatch.setattr(trainer_module, "CVSplitter", FakeCVSplitter)
+    monkeypatch.setattr(trainer_module, "GridSearchCV", FakeGridSearchCV)
+    monkeypatch.setattr(trainer_module, "clone", lambda obj: obj)
+    monkeypatch.setattr(trainer_module.PipelineBuilder, "build", lambda self, *args, **kwargs: FakePipeline())
+
+    data = {
+        "X_train": pd.DataFrame({"lat": [0, 1, 2], "lon": [10, 11, 12], "num": [1, 2, 3]}),
+        "X_test": pd.DataFrame({"lat": [3], "lon": [13], "num": [4]}),
+        "y_train": pd.DataFrame({"target_a": [1.0, 2.0, 3.0]}),
+        "y_test": pd.DataFrame({"target_a": [4.0]}),
+    }
+
+    trainer.train(
+        target="target_a",
+        data=data,
+        model_pipelines={"heavy": {"model": object(), "params": {}, "modeltype": "ml", **spec_extra}},
+    )
+
+    assert FakeGridSearchCV.instances
+    assert FakeGridSearchCV.instances[0].n_jobs == expected_n_jobs
+
+
 def test_model_trainer_falls_back_to_sklearn_file_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 

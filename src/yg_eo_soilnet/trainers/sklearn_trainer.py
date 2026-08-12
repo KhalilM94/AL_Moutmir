@@ -133,7 +133,10 @@ class ModelTrainer:
                             param_grid= params if params is not None else {},
                             cv=splits, refit=False,
                             scoring= "neg_root_mean_squared_error",
-                            n_jobs=-1, return_train_score=True,
+                            # -1 for ordinary estimators; entries whose model loads a large
+                            # checkpoint per worker set search_n_jobs to keep memory bounded.
+                            n_jobs=int(config.get("search_n_jobs", -1)),
+                            return_train_score=True,
                             verbose=self.tuning_verbose
                         )
 

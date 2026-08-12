@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import random
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -86,7 +85,11 @@ class LightningTrainer:
         results: dict[str, LightningRunResult] = {}
 
         for model_name, bundle in model_bundles.items():
-            self._seed_for_bundle(bundle)
+            # Deliberately no seeding here. Seeding at this point is too late to reach the weights -
+            # the factory built them already - and resetting the stream now would start fit() from a
+            # different place than the HPO trial that chose these hyperparameters, so a tuned config
+            # could never reproduce its score. LightningConfigFactory.build_lightning_configs seeds
+            # per entry instead, immediately before it constructs each model.
             run_name = model_name
             with mlflow.start_run(run_name=run_name, nested=True):
                 trainer = self._build_trainer(bundle)
@@ -164,27 +167,6 @@ class LightningTrainer:
                 )
 
         return results
-
-    def _seed_for_bundle(self, bundle: LightningModelBundle) -> None:
-        seed_value = int(
-            bundle.registry_entry.get(
-                "random_seed",
-                getattr(self.config, "RANDOM_SEED", 42),
-            )
-        )
-        lightning = self._get_lightning_module()
-        seed_everything = getattr(lightning, "seed_everything", None)
-        if callable(seed_everything):
-            seed_everything(seed_value, workers=True)
-            return
-
-        random.seed(seed_value)
-        np.random.seed(seed_value)
-        if torch is not None:
-            torch.manual_seed(seed_value)
-            if torch.cuda.is_available():  # pragma: no cover - hardware dependent
-                torch.cuda.manual_seed(seed_value)
-                torch.cuda.manual_seed_all(seed_value)
 
     def _build_trainer(self, bundle: LightningModelBundle):
         lightning = self._get_lightning_module()

@@ -70,21 +70,53 @@ def build_tuned_spec(registry_entry: dict[str, Any], overrides: dict[str, Any], 
 
 
 def _header(
-    study: optuna.Study, entry: str, objective: Objective, registry_path: str | None, path: Path
+    study: optuna.Study,
+    entry: str,
+    objective: Objective,
+    registry_path: str | None,
+    path: Path,
+    *,
+    trial_number: int | None = None,
+    headline_value: float | None = None,
+    rerank: Any = None,
 ) -> str:
-    trial = study.best_trial
+    number = study.best_trial.number if trial_number is None else trial_number
+    value = study.best_value if headline_value is None else headline_value
     lines = [
         "# Tuned Lightning registry entry, exported from an Optuna study.",
         "#",
         f"#   study      : {study.study_name}",
         f"#   entry      : {entry}",
-        f"#   best trial : #{trial.number} of {len(study.trials)}",
-        f"#   objective  : {objective.metric} = {study.best_value:.6f} ({objective.direction})",
-        f"#   exported   : {datetime.datetime.now().isoformat(timespec='seconds')}",
+        f"#   trial      : #{number} of {len(study.trials)}",
+        f"#   objective  : {objective.metric} = {value:.6f} ({objective.direction})",
     ]
+    if rerank is None:
+        lines += [
+            "#",
+            "# NOTE: that value is the best of many trials, each itself the best epoch of a noisy",
+            "# run - a maximum over noise, so it is optimistically biased and a retrain will",
+            "# typically fall short of it. `tune.py --rerank-top K` re-runs the shortlist over",
+            "# several seeds and reports what a retrain should actually deliver.",
+        ]
+    else:
+        lines += [
+            f"#   reranked   : {objective.metric} = {rerank.mean:.6f} +- {rerank.std:.6f} "
+            f"over {len(rerank.values)} seed(s)  <- expect this on a retrain",
+            "#   selection  : chosen on the re-ranked mean, not on the headline value",
+        ]
+        if rerank.reproduced is False:
+            lines.append(
+                f"#   WARNING    : the re-run at the trial's own seed gave {rerank.values[0]:.6f}, "
+                f"which does not reproduce the trial."
+            )
+    lines.append(f"#   exported   : {datetime.datetime.now().isoformat(timespec='seconds')}")
     if registry_path:
         lines.append(f"#   source     : {registry_path}")
     lines += [
+        "#",
+        f"# Compare against the MLflow `{objective.metric}` of the retrained run. NOT r2_score or",
+        "# r2_test - those are TEST-split R2 in original units after expm1, a different split, a",
+        "# different metric and a different space from anything the study optimized.",
         "#",
         "# Values pinned under `fixed:` in the search space are baked in here too - notably",
         "# trainer.max_epochs, which is the tuning budget. Raise it for a final production run if you",
@@ -108,13 +140,34 @@ def export_best_config(
     path: str | Path,
     *,
     registry_path: str | None = None,
+    rerank: Any = None,
 ) -> Path:
-    """Write `{entry: tuned_spec}` to `path` and return it."""
-    spec = build_tuned_spec(registry_entry, best_overrides(study), objective)
+    """Write `{entry: tuned_spec}` to `path` and return it.
+
+    `rerank`, when given, is the winning RerankResult: its overrides are exported instead of the
+    study's best trial, because the re-ranked winner is frequently a different configuration.
+    """
+    if rerank is None:
+        overrides, trial_number, headline = best_overrides(study), None, None
+    else:
+        overrides = dict(rerank.overrides)
+        trial_number, headline = rerank.trial_number, rerank.original_value
+    spec = build_tuned_spec(registry_entry, overrides, objective)
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as handle:
-        handle.write(_header(study, entry, objective, registry_path, path))
+        handle.write(
+            _header(
+                study,
+                entry,
+                objective,
+                registry_path,
+                path,
+                trial_number=trial_number,
+                headline_value=headline,
+                rerank=rerank,
+            )
+        )
         yaml.safe_dump({entry: spec}, handle, sort_keys=False, default_flow_style=False)
     return path

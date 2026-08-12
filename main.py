@@ -7,19 +7,18 @@ from yg_eo_soilnet.utils import LogTransformer
 from yg_eo_soilnet.logger.mlflow_loggers import ParentRunLogger
 from config import Config
 from yg_eo_soilnet.models.config_fatories.lightning_config_factory import LightningConfigFactory
+from yg_eo_soilnet.seeding import seed_everything
 from yg_eo_soilnet.trainers.lightning_trainer import LightningTrainer
 import mlflow
 import datetime 
 import time
 import shutil
 import re
-import random
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Dict
 import argparse
 
-import numpy as np
 
 try:  # pragma: no cover - optional dependency
     import torch
@@ -61,13 +60,12 @@ def _resolve_main_relative_path(path_value: str) -> Path:
 
 
 def _seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    if torch is not None:
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():  # pragma: no cover - hardware dependent
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
+    """Kept as a thin alias so existing callers and tests keep working.
+
+    Delegates to the shared helper, which also sets PL_SEED_WORKERS - this local version did not,
+    so dataloader workers were seeded differently here than on the hyperparameter-search path.
+    """
+    seed_everything(seed)
 
 
 def _export_mlflow_run_folder(trainer, experiment_id: str, run_id: str, run_name: str) -> Path | None:
@@ -171,7 +169,13 @@ class SoilModelTraining:
                 )
 
             if not run_lightning_once:
-                lightning_model_bundles = self.lightning_model_configs.build_lightning_configs(target=target, data=lightning_input)
+                # `seed` so each model is constructed from a fixed RNG state rather than from
+                # whatever the preceding data work and sklearn training left behind. Without it a
+                # tuned config cannot reproduce the hyperparameter trial that produced it, and two
+                # production runs do not agree with each other either.
+                lightning_model_bundles = self.lightning_model_configs.build_lightning_configs(
+                    target=target, data=lightning_input, seed=int(self.config.RANDOM_SEED)
+                )
                 if lightning_model_bundles:
                     self.lightning_trainer.train(
                         target=target,
@@ -183,6 +187,7 @@ class SoilModelTraining:
             lightning_model_bundles = self.lightning_model_configs.build_lightning_configs(
                 target=combined_lightning_target,
                 data=lightning_input,
+                seed=int(self.config.RANDOM_SEED),
             )
             if lightning_model_bundles:
                 self.lightning_trainer.train(

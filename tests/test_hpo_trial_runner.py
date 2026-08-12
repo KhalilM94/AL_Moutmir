@@ -1,10 +1,17 @@
+import sys
 from types import SimpleNamespace
 
 import optuna
 import pytest
 
 from yg_eo_soilnet.hpo.search_space import Objective
-from yg_eo_soilnet.hpo.trial_runner import TRIAL_TRAINER_OVERRIDES, TrialRunner
+from yg_eo_soilnet.hpo.trial_runner import (
+    TRIAL_TRAINER_OVERRIDES,
+    TrialRunner,
+    UnrecoverableAcceleratorError,
+    cuda_context_is_dead,
+    release_dataloader_workers,
+)
 
 
 class FakeBundle:
@@ -230,3 +237,121 @@ def test_report_false_still_tracks_the_best_without_reporting(monkeypatch):
 
     assert result.value == 0.7
     assert trial.storage.get_trial(trial._trial_id).intermediate_values == {}
+
+
+# --- a dead accelerator is not a bad hyperparameter ---------------------------
+
+
+class FakeCuda:
+    """Stands in for torch.cuda: `initialized` gates the probe, `alive` decides its verdict."""
+
+    def __init__(self, initialized=True, alive=True):
+        self.initialized = initialized
+        self.alive = alive
+        self.empty_cache_calls = 0
+
+    def is_initialized(self):
+        return self.initialized
+
+    def empty_cache(self):
+        self.empty_cache_calls += 1
+
+
+def _fake_torch(monkeypatch, initialized=True, alive=True):
+    """Install a stand-in `torch` in sys.modules, which is where the probe looks it up."""
+    cuda = FakeCuda(initialized=initialized, alive=alive)
+
+    def zeros(*args, **kwargs):
+        if not cuda.alive:
+            raise RuntimeError("CUDA error: unknown error")
+        return SimpleNamespace(add_=lambda *a: SimpleNamespace(cpu=lambda: None))
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda, zeros=zeros))
+    return cuda
+
+
+def test_a_dead_context_aborts_the_study_instead_of_pruning(monkeypatch):
+    """Pruning a dead GPU would spend the rest of the study reloading data to fail again."""
+    _fake_torch(monkeypatch, alive=False)
+    runner, bundle = _runner(monkeypatch, [{"val_r2": 0.5}])
+    monkeypatch.setattr(
+        RecordingTrainer, "fit", lambda self, model, datamodule=None: (_ for _ in ()).throw(RuntimeError("CUDA error"))
+    )
+
+    with pytest.raises(UnrecoverableAcceleratorError, match="died during trial"):
+        runner.run(bundle, _trial())
+
+
+def test_the_abort_message_says_how_to_recover(monkeypatch):
+    _fake_torch(monkeypatch, alive=False)
+    runner, bundle = _runner(monkeypatch, [{"val_r2": 0.5}])
+    monkeypatch.setattr(RecordingTrainer, "fit", lambda self, model, datamodule=None: 1 / 0)
+
+    with pytest.raises(UnrecoverableAcceleratorError, match="wsl --shutdown"):
+        runner.run(bundle, _trial())
+
+
+def test_a_live_context_still_prunes_the_trial(monkeypatch):
+    """An OOM leaves the context usable: a too-large corner of the space stays one pruned trial."""
+    _fake_torch(monkeypatch, alive=True)
+    runner, bundle = _runner(monkeypatch, [{"val_r2": 0.5}])
+    monkeypatch.setattr(
+        RecordingTrainer,
+        "fit",
+        lambda self, model, datamodule=None: (_ for _ in ()).throw(MemoryError("CUDA out of memory")),
+    )
+
+    with pytest.raises(optuna.TrialPruned, match="raised MemoryError"):
+        runner.run(bundle, _trial())
+
+
+def test_a_process_with_no_cuda_context_never_probes(monkeypatch):
+    """A CPU run must behave exactly as it did before the probe existed."""
+    _fake_torch(monkeypatch, initialized=False, alive=False)
+    runner, bundle = _runner(monkeypatch, [{"val_r2": 0.5}])
+    monkeypatch.setattr(RecordingTrainer, "fit", lambda self, model, datamodule=None: 1 / 0)
+
+    with pytest.raises(optuna.TrialPruned, match="raised ZeroDivisionError"):
+        runner.run(bundle, _trial())
+
+
+def test_fail_fast_still_wins_over_the_probe(monkeypatch):
+    _fake_torch(monkeypatch, alive=False)
+    runner, bundle = _runner(monkeypatch, [{"val_r2": 0.5}], fail_fast=True)
+    monkeypatch.setattr(RecordingTrainer, "fit", lambda self, model, datamodule=None: 1 / 0)
+
+    with pytest.raises(ZeroDivisionError):
+        runner.run(bundle, _trial())
+
+
+def test_cuda_context_is_dead_is_false_without_torch(monkeypatch):
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+
+    assert cuda_context_is_dead() is False
+
+
+# --- releasing a trial's resources --------------------------------------------
+
+
+def test_the_allocator_is_emptied_between_trials(monkeypatch):
+    """Trials range from one small block to five wide ones; freed blocks are the wrong shapes."""
+    cuda = _fake_torch(monkeypatch)
+
+    release_dataloader_workers()
+
+    assert cuda.empty_cache_calls == 1
+
+
+def test_nothing_is_emptied_when_no_context_was_built(monkeypatch):
+    cuda = _fake_torch(monkeypatch, initialized=False)
+
+    release_dataloader_workers()
+
+    assert cuda.empty_cache_calls == 0
+
+
+def test_releasing_works_without_torch_imported(monkeypatch):
+    """The module lazy-imports on purpose; the collect must still run on a torch-free path."""
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+
+    release_dataloader_workers()

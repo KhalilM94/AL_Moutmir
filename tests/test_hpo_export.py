@@ -232,6 +232,63 @@ def test_the_export_carries_its_provenance(tmp_path):
     assert any("LIGHTNING_MODEL_REGISTRY_PATH" in line for line in header)
 
 
+def test_a_plain_export_warns_that_the_headline_is_biased(tmp_path):
+    study, context = _study_with_a_best_trial()
+    path = export_best_config(study, "fake_entry", context.registry_entry, OBJECTIVE, tmp_path / "t.yml")
+
+    header = path.read_text()
+    assert "optimistically biased" in header
+    assert "--rerank-top" in header
+
+
+def test_the_export_says_which_mlflow_metric_to_compare_against(tmp_path):
+    """Three R2-shaped numbers get logged per run; only the objective is comparable."""
+    study, context = _study_with_a_best_trial()
+    path = export_best_config(study, "fake_entry", context.registry_entry, OBJECTIVE, tmp_path / "t.yml")
+
+    header = path.read_text()
+    assert "Compare against the MLflow `val_r2`" in header
+    assert "NOT r2_score" in header
+
+
+def test_a_reranked_export_carries_the_expected_value_and_the_winner(tmp_path):
+    from yg_eo_soilnet.hpo.rerank import RerankResult
+
+    study, context = _study_with_a_best_trial(values=(0.3, 0.8))
+    # A winner that is NOT the study's best trial, with its own overrides.
+    winner = RerankResult(
+        trial_number=0,
+        original_value=0.3,
+        overrides={"model.dropout": 0.42},
+        values=[0.51, 0.53],
+    )
+    path = export_best_config(
+        study, "fake_entry", context.registry_entry, OBJECTIVE, tmp_path / "t.yml", rerank=winner
+    )
+
+    header = path.read_text()
+    assert "reranked" in header
+    assert "0.520000" in header  # the mean, i.e. what to expect on a retrain
+    assert "#   trial      : #0" in header  # the reranked winner, not study.best_trial (#1)
+    assert "optimistically biased" not in header  # that caveat is for un-reranked exports
+
+    document = yaml.safe_load(header)
+    assert document["fake_entry"]["init_args"]["dropout"] == 0.42  # the winner's config was exported
+
+
+def test_a_reranked_export_flags_a_trial_that_did_not_reproduce(tmp_path):
+    from yg_eo_soilnet.hpo.rerank import RerankResult
+
+    study, context = _study_with_a_best_trial()
+    winner = RerankResult(trial_number=1, original_value=0.80, overrides={}, values=[0.20, 0.22])
+    path = export_best_config(
+        study, "fake_entry", context.registry_entry, OBJECTIVE, tmp_path / "t.yml", rerank=winner
+    )
+
+    assert "WARNING" in path.read_text()
+    assert "does not reproduce the trial" in path.read_text()
+
+
 def test_the_export_creates_missing_directories(tmp_path):
     study, context = _study_with_a_best_trial()
     path = export_best_config(

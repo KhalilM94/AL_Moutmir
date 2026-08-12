@@ -9,6 +9,7 @@ from typing import Any, Mapping, MutableMapping
 import numpy as np
 
 from yg_eo_soilnet.datamodules.lightning.spatiotemporal_graph_builder import SpatiotemporalGraphBuilder
+from yg_eo_soilnet.seeding import seed_everything
 
 
 @dataclass
@@ -51,7 +52,18 @@ class LightningConfigFactory:
             raise ImportError(f"Failed to import module '{module_path}': {exc}") from exc
         return getattr(module, attr_name)
 
-    def build_lightning_configs(self, target: str, data: Mapping[str, Any]) -> dict[str, LightningModelBundle]:
+    def build_lightning_configs(
+        self, target: str, data: Mapping[str, Any], seed: int | None = None
+    ) -> dict[str, LightningModelBundle]:
+        """Build one bundle per enabled entry.
+
+        `seed`, when given, is applied immediately before each model is constructed. Weight
+        initialization draws from the global torch generator, so this is the only point at which
+        seeding reaches the weights - seeding later leaves them at whatever state the preceding work
+        happened to leave behind, and a tuned configuration cannot then reproduce the trial that
+        selected it. Per entry rather than once for the whole loop, so a second enabled entry does
+        not inherit the stream the first one consumed.
+        """
         bundles: dict[str, LightningModelBundle] = {}
         for name, spec in self.registry.items():
             if not spec.get("enabled", False):
@@ -59,6 +71,8 @@ class LightningConfigFactory:
 
             self._validate_entry(name, spec)
             datamodule = self._build_datamodule(target=target, spec=spec, data=data)
+            if seed is not None:
+                seed_everything(int(spec.get("random_seed", seed)))
             model = self._build_model(spec, datamodule)
             bundles[name] = LightningModelBundle(
                 name=name,

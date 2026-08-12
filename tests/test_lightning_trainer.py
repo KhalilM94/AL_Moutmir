@@ -179,7 +179,7 @@ def test_lightning_trainer_seeds_each_bundle(monkeypatch) -> None:
     )
 
     seed_spy = MagicMock()
-    monkeypatch.setattr(trainer, "_seed_for_bundle", seed_spy)
+    monkeypatch.setattr(lightning_trainer_module, "seed_everything", seed_spy, raising=False)
     monkeypatch.setattr(trainer, "_build_trainer", lambda bundle: fake_trainer)
     monkeypatch.setattr(trainer, "_resolve_best_checkpoint", lambda trainer_obj: "/tmp/best.ckpt")
 
@@ -194,7 +194,11 @@ def test_lightning_trainer_seeds_each_bundle(monkeypatch) -> None:
         model_bundles={"toy_lightning": bundle},
     )
 
-    seed_spy.assert_called_once_with(bundle)
+    # train() must NOT seed. Seeding here is too late to reach the weights - the factory built them
+    # already - and resetting the stream now starts fit() from a different point than the HPO trial
+    # that chose these hyperparameters, so a tuned config could never reproduce its score.
+    # LightningConfigFactory.build_lightning_configs(seed=...) owns seeding now.
+    seed_spy.assert_not_called()
 
 
 def test_lightning_epoch_metrics_callback_logs_train_and_val_losses(monkeypatch) -> None:
@@ -331,7 +335,6 @@ def test_lightning_trainer_fans_out_multitarget_child_runs(monkeypatch) -> None:
         test=lambda *args, **kwargs: [{"test_loss": 0.5}],
     )
 
-    monkeypatch.setattr(trainer, "_seed_for_bundle", MagicMock())
     monkeypatch.setattr(trainer, "_build_trainer", MagicMock(return_value=fake_trainer))
     monkeypatch.setattr(trainer, "_resolve_best_checkpoint", MagicMock(return_value="/tmp/best.ckpt"))
     monkeypatch.setattr(trainer, "_build_evaluation_frame", MagicMock(return_value=evaluation_df))

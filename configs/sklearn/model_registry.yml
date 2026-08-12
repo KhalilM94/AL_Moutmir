@@ -1,3 +1,7 @@
+# Seeding: entries do not set random_state. Every estimator that exposes one inherits RANDOM_SEED
+# from main_config.yml, and the same value seeds the CV folds. Set `random_seed:` on an entry to
+# deviate from the run's seed; only put random_state in init_args to pin one model regardless of it.
+
 PLSRegression:
   enabled: False
   modeltype: "ml"
@@ -16,8 +20,6 @@ GradientBoosting:
   enabled: False
   modeltype: "ml"
   import_path: sklearn.ensemble.GradientBoostingRegressor
-  init_args:
-    random_state: 42
   params:
     model__n_estimators: [50, 100]
     model__max_depth: [5]
@@ -32,17 +34,34 @@ XGBoost:
   modeltype: "ml"
   import_path: xgboost.XGBRegressor
   init_args:
-    random_state: 42
     objective: "reg:squarederror"  #"reg:quantileerror"
     # quantile_alpha: [0.5]
     tree_method: "hist" 
     # device: "cuda"
   params:
     model__n_estimators: [100, 150, 200]
-    model__max_depth: [6, 8] # 3, 4, 5, 6, 7, 8, 9, 10, 
-    model__learning_rate: [0.05, 0.01]
+    model__max_depth: [6, 8, 10] # 3, 4, 5, 6, 7, 8, 9, 10, 
+    model__learning_rate: [0.05]
     # model__subsample: [0.8]
     # model__reg_alpha: [0, 0.1, 1]
     # model__reg_lambda: [1, 10, 100]
     # model__colsample_bytree: [0.8, 1.0]
     # model__min_child_weight: [1, 5]
+
+TabICL:
+  # Pretrained tabular foundation model: fit() does in-context learning, it does not train weights.
+  # First fit downloads tabicl-regressor-v2-*.ckpt from the HuggingFace hub.
+  enabled: true
+  modeltype: "ml"
+  import_path: tabicl.TabICLRegressor
+  # Each worker loads the full checkpoint, so the default -1 would fan that out over every CV fold
+  # and every grid point at once. Keep this at 1 unless you have the memory to spare.
+  search_n_jobs: 1
+  init_args:
+    n_estimators: 8      # ensemble members; lower is faster, 4 is usually enough to compare
+    device: "cuda"     # default None auto-detects
+    # batch_size: 8      # lower if the first fit runs out of memory
+    # offload_mode: "cpu"
+  # Deliberately empty: TabICL is designed to need no tuning, and every grid point is a full
+  # checkpoint inference pass. GridSearchCV still cross-validates the single default config.
+  params: {}

@@ -407,9 +407,20 @@ class ChildRunLogger:
                                          name = f"{target}_{model_name}",
                                          input_example=X_test[:5],
                                          skops_trusted_types=[
-                                             "numpy.dtype", 
-                                             "xgboost.core.Booster", 
-                                             "xgboost.sklearn.XGBRegressor"
+                                             "numpy.dtype",
+                                             "xgboost.core.Booster",
+                                             "xgboost.sklearn.XGBRegressor",
+                                             # TabICL ships its own preprocessing estimators inside
+                                             # the fitted regressor; skops refuses to persist any of
+                                             # them unless they are named here.
+                                             "random.Random",
+                                             "tabicl._sklearn.preprocessing.CustomStandardScaler",
+                                             "tabicl._sklearn.preprocessing.EnsembleGenerator",
+                                             "tabicl._sklearn.preprocessing.OutlierRemover",
+                                             "tabicl._sklearn.preprocessing.PreprocessingPipeline",
+                                             "tabicl._sklearn.preprocessing.TransformToNumerical",
+                                             "tabicl._sklearn.preprocessing.UniqueFeatureFilter",
+                                             "tabicl._sklearn.regressor.TabICLRegressor",
                                              ])
             # --- CV results as artifact ---
             self._log_cv_results(cv_results, target, model_name, param_names)

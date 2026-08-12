@@ -31,6 +31,7 @@ from yg_eo_soilnet.hpo.data import build_lightning_input
 from yg_eo_soilnet.hpo.export import export_best_config
 from yg_eo_soilnet.hpo.objective import ObjectiveContext, TrialObjective
 from yg_eo_soilnet.hpo.progress import MODES, StudyProgress
+from yg_eo_soilnet.hpo.rerank import choose_winner, rerank, rerank_frame
 from yg_eo_soilnet.hpo.search_space import SearchSpace
 from yg_eo_soilnet.hpo.study import (
     DEFAULT_STORAGE,
@@ -41,8 +42,8 @@ from yg_eo_soilnet.hpo.study import (
     set_hpo_experiment,
     summarize,
 )
-from yg_eo_soilnet.hpo.tracker import ObjectiveTracker
-from yg_eo_soilnet.hpo.trial_runner import silence_lightning
+from yg_eo_soilnet.hpo.tracker import ObjectiveTracker, best_value_or_none
+from yg_eo_soilnet.hpo.trial_runner import UnrecoverableAcceleratorError, silence_lightning
 from yg_eo_soilnet.logger.training_logger import TrainingLogger
 
 
@@ -87,6 +88,24 @@ def parse_args() -> argparse.Namespace:
         "--export-only",
         action="store_true",
         help="Re-export the best trial of an existing study and exit; runs no trials and loads no data",
+    )
+    parser.add_argument(
+        "--rerank-top",
+        type=int,
+        default=None,
+        metavar="K",
+        help=(
+            "Re-run the K best trials of an existing study over several seeds and export the winner "
+            "on the averaged score, instead of the single best trial. Runs no new trials. Budget "
+            "K x --rerank-seeds full training runs"
+        ),
+    )
+    parser.add_argument(
+        "--rerank-seeds",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Seeds per candidate when re-ranking (default 3). The first is the trial's own seed",
     )
     parser.add_argument("--export-path", default=None, help="Defaults to configs/lightning/tuned/<entry>_best.yml")
     return parser.parse_args()
@@ -170,23 +189,122 @@ def main() -> None:
         progress=progress,
     )
 
+    if args.rerank_top is not None:
+        rerank_and_export(objective, space, args, config, logger, study_name)
+        return
+
     logger.info(f"Tuning '{args.entry}' to {space.objective.direction} {space.objective.metric}")
-    study = run_study(
-        objective,
-        space,
-        study_name=study_name,
-        storage=args.storage,
-        n_trials=args.n_trials,
-        timeout=args.timeout,
-        use_mlflow=not args.no_mlflow,
-        extra_params={"entry": args.entry, "target": context.target, "seed_repeats": args.seed_repeats},
-        logger=logger,
-        tracker=tracker,
-        progress=progress,
-        artifact_dir=Path("optuna_studies") / study_name,
-    )
+    try:
+        study = run_study(
+            objective,
+            space,
+            study_name=study_name,
+            storage=args.storage,
+            n_trials=args.n_trials,
+            timeout=args.timeout,
+            use_mlflow=not args.no_mlflow,
+            extra_params={"entry": args.entry, "target": context.target, "seed_repeats": args.seed_repeats},
+            logger=logger,
+            tracker=tracker,
+            progress=progress,
+            artifact_dir=Path("optuna_studies") / study_name,
+        )
+    except BaseException as error:
+        # BaseException on purpose: Ctrl-C on a long sweep used to lose the export exactly the same
+        # way a lost GPU did.
+        handle_study_abort(error, space, tracker, context, args, config, logger, study_name)
+        raise
 
     report_and_export(study, space, tracker, context.registry_entry, args, config, logger)
+
+
+def rerank_and_export(objective, space, args, config, logger, study_name: str) -> None:
+    """Re-run the shortlist over several seeds and export the winner on the averaged score.
+
+    The study's headline value is the best of hundreds of trials, each itself the best epoch of a
+    noisy run - a maximum over noise, so it overstates what a retrain will give. This picks the
+    configuration that holds up across seeds and records the figure to actually expect.
+    """
+    study = create_or_load_study(space, study_name, args.storage)
+    logger.info(
+        f"Re-ranking the top {args.rerank_top} of {len(study.trials)} trials in '{study_name}' "
+        f"over {args.rerank_seeds} seed(s) each - {args.rerank_top * args.rerank_seeds} training runs"
+    )
+
+    results = rerank(objective, study, top_k=args.rerank_top, seeds=args.rerank_seeds, logger=logger)
+    if not results:
+        raise SystemExit("No shortlisted trial could be re-run, so there is nothing to export.")
+
+    frame = rerank_frame(results, metric=space.objective.metric)
+    logger.info(f"Re-ranked shortlist:\n{frame.to_string(index=False)}")
+
+    not_reproduced = [r.trial_number for r in results if r.reproduced is False]
+    if not_reproduced:
+        # Seed 0 of each candidate re-runs the trial's own seed, so this is a direct check that
+        # seeding reaches the weights. A miss means a run cannot be reproduced from its record.
+        logger.warning(
+            f"Trials {not_reproduced} did not reproduce at their own seed - runs are not "
+            f"reproducible from their recorded seed, so treat the re-ranked means as noisy."
+        )
+
+    winner = choose_winner(results, space.objective.direction)
+    logger.info(
+        f"Winner: trial {winner.trial_number} | headline {winner.original_value:.6f} -> "
+        f"re-ranked {winner.mean:.6f} +- {winner.std:.6f}"
+    )
+    if winner.trial_number != study.best_trial.number:
+        logger.info(
+            f"That is NOT the study's best trial ({study.best_trial.number}, "
+            f"{study.best_value:.6f}) - the headline ranking did not survive re-running."
+        )
+
+    artifact_dir = Path("optuna_studies") / study_name
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(artifact_dir / "rerank.csv", index=False)
+
+    export_path = Path(args.export_path or f"configs/lightning/tuned/{study_name}_reranked.yml")
+    export_best_config(
+        study,
+        args.entry,
+        deepcopy(config.LIGHTNING_MODEL_REGISTRY[args.entry]),
+        space.objective,
+        export_path,
+        registry_path=config.lightning_registry_path,
+        rerank=winner,
+    )
+    logger.info(f"Exported to {export_path}")
+    print(f"\nRe-ranked winner: trial {winner.trial_number}")
+    print(f"  headline   {space.objective.metric} = {winner.original_value:.6f}  (best of {len(study.trials)} trials)")
+    print(f"  expect     {space.objective.metric} = {winner.mean:.6f} +- {winner.std:.6f}  on a retrain")
+    print(f"Tuned config: {export_path}")
+    print(f"  rerank table: {artifact_dir / 'rerank.csv'}")
+
+
+def handle_study_abort(error, space, tracker, context, args, config, logger, study_name: str) -> None:
+    """Salvage an aborted study, then leave the caller to re-raise.
+
+    A sweep that ran for hours must not lose its winner because trial N+1 crashed - which is exactly
+    what a lost GPU driver did to a 266-trial study whose 174 completed trials never reached
+    `configs/lightning/tuned/`. Every trial is in the storage the whole time, so the study is simply
+    reloaded and exported.
+
+    Exporting never raises: it runs while another exception is in flight, and masking that one with
+    a failure to export would hide why the study stopped. The one exception raised deliberately is
+    SystemExit for a dead accelerator, whose traceback names whatever CUDA call came next rather than
+    the failure and is therefore misleading noise.
+    """
+    try:
+        study = create_or_load_study(space, study_name, args.storage)
+        if best_value_or_none(study) is None:
+            logger.warning("Study aborted with no completed trial, so there is nothing to export.")
+        else:
+            logger.warning(f"Study aborted - exporting the best of its {len(study.trials)} trials anyway.")
+            report_and_export(study, space, tracker, context.registry_entry, args, config, logger)
+    except Exception as export_error:
+        logger.error(f"Could not export after the study aborted: {export_error!r}", exc_info=True)
+
+    if isinstance(error, UnrecoverableAcceleratorError):
+        raise SystemExit(str(error)) from error
 
 
 def report_and_export(study, space, tracker, registry_entry, args, config, logger) -> None:

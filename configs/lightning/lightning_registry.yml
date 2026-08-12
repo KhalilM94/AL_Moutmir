@@ -26,15 +26,15 @@ defaults:
     early_stopping:
       monitor: val_loss
       mode: min
-      patience: 30          # 10 fired on ties/noise while train_loss was still falling
+      patience: 100          # 10 fired on ties/noise while train_loss was still falling
     checkpoint:
       monitor: val_loss
       mode: min
       save_top_k: 1
   datamodule_init_args:
     batch_size: 32
-    val_size: 0.3
-    test_size: 0.15         # splits apply sequentially: without this, train was 0.7*0.7=0.49
+    val_size: 0.2
+    test_size: 0.2         # splits apply sequentially: without this, train was 0.7*0.7=0.49
     target_transform: log1p # null | log1p (log1p also standardizes in transformed space)
     num_workers: 11         # collate pickles the whole datamodule per worker
     pin_memory: false
@@ -52,7 +52,7 @@ defaults:
 # observation and columns are calendar months, so nothing is tied to a date range. grid_years is
 # inferred from the data, and adaptive pooling means no weight depends on it.
 soil_cnn:
-  enabled: true
+  enabled: false
   input_kind: sequence
   import_path: yg_eo_soilnet.models.lightningmodules.soil_cnn_lightning_module.SoilCNNLightningModule
   datamodule_import_path: yg_eo_soilnet.datamodules.sequence.sequence_datamodule.SoilSequenceDataModule
@@ -201,11 +201,11 @@ soil_tabular:
     categorical_feature_names: auto
     embedding_dims: auto                 # auto = min(embedding_max_dim, (cardinality + 1) // 2)
     embedding_max_dim: 50
-    embedding_dropout: 0.0
-    continuous_norm: none                # none | batch | layer
+    embedding_dropout: 0.3
+    continuous_norm: batch                # none | batch | layer
 
     static_hidden_dims: [64]
-    head_hidden_dims: [64, 32]
+    head_hidden_dims: [256, 256, 128, 64, 32]  # 256 -> 256 -> 128 -> 64 -> 32 -> 1
     dropout: 0.1
     activation: relu                     # relu | gelu
     use_layer_norm: true
