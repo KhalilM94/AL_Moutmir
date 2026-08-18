@@ -98,6 +98,12 @@ class SoilSequenceDataModule(LightningDataModule):
         self.sequence_scale_: dict[str, np.ndarray] = {}
         self.target_mean_: Optional[np.ndarray] = None
         self.target_scale_: Optional[np.ndarray] = None
+        # Lab-value statistics, train-only for the same reason as everything above. The median is
+        # kept separately from the mean because it is the FILL value, not a centring constant: a
+        # skewed column's mean sits somewhere no sample actually is.
+        self.label_mean_: Optional[np.ndarray] = None
+        self.label_scale_: Optional[np.ndarray] = None
+        self.label_median_: Optional[np.ndarray] = None
 
         # The shape contract the Lightning config factory reads off the datamodule. Note the
         # deliberate absence of `temporal_steps` and `edge_attr_dim`: the model is length-agnostic
@@ -112,9 +118,110 @@ class SoilSequenceDataModule(LightningDataModule):
         self.categorical_cardinalities: list[int] = []
         self.categorical_vocabularies: list[list[str]] = []
         self.target_names = list(self.sequence_bundle.target_names)
+        # Every lab column the bundle carries, offered to the model so it can resolve the subset
+        # named in auxiliary_label_columns. Nothing is selected here: the choice belongs to the
+        # architecture, and this datamodule serves several.
+        self.label_feature_names = list(self.sequence_bundle.label_feature_names)
+        self.label_dim = int(self.sequence_bundle.label_dim)
         self.modality_dims = dict(self.sequence_bundle.modality_dims)
         self.temporal_enabled = bool(self.sequence_bundle.temporal_enabled and self.modality_dims)
         self.grid_years = self._infer_grid_years()
+
+    def preprocessing_state(self) -> dict:
+        """Everything fitted in :meth:`setup` that a saved model needs in order to serve raw data.
+
+        The scalers here are fitted on the TRAIN SPLIT ONLY, and until this method existed they
+        lived nowhere but on this object. A checkpoint therefore restored the weights and the target
+        inverse-transform (both are buffers on the module) but not the input standardization, so a
+        reloaded model could only ever be fed data that some datamodule had already scaled - which
+        is to say, it could not be deployed. Attaching this to the module closes that gap.
+
+        Everything is returned as plain builtins. That is not cosmetic: numpy arrays in a Lightning
+        module's ``hyper_parameters`` make the checkpoint unloadable under ``torch.load``'s
+        ``weights_only=True`` default from PyTorch 2.6 on, which is the same constraint that put
+        ``as_float_list`` in the model constructors.
+        """
+
+        def as_list(values) -> list[float]:
+            if values is None:
+                return []
+            return [float(value) for value in np.asarray(values, dtype=np.float64).reshape(-1)]
+
+        return {
+            "static_mean": as_list(self.static_mean_),
+            "static_scale": as_list(self.static_scale_),
+            "static_feature_names": list(self.static_feature_names),
+            "sequence_mean": {name: as_list(values) for name, values in self.sequence_mean_.items()},
+            "sequence_scale": {name: as_list(values) for name, values in self.sequence_scale_.items()},
+            "modality_column_names": {
+                name: list(columns) for name, columns in self.sequence_bundle.modality_columns.items()
+            },
+            "label_mean": as_list(self.label_mean_),
+            "label_scale": as_list(self.label_scale_),
+            "label_median": as_list(self.label_median_),
+            "label_feature_names": list(self.label_feature_names),
+            "categorical_feature_names": list(self.categorical_feature_names),
+            "categorical_vocabularies": [
+                [str(category) for category in vocabulary] for vocabulary in self.categorical_vocabularies
+            ],
+            "target_mean": as_list(self.target_mean_),
+            "target_scale": as_list(self.target_scale_),
+            "target_names": list(self.target_names),
+        }
+
+    def apply_preprocessing_state(self, state: Mapping[str, Any]) -> None:
+        """Install statistics fitted ELSEWHERE, instead of fitting them from this data.
+
+        The inference counterpart of :meth:`setup`. At serving time the incoming points are not a
+        training split - they may be a single point - so re-fitting a scaler on them would
+        standardize each request against itself and produce predictions that drift with batch
+        composition. This installs the statistics the model was trained with, which is the only
+        correct choice, and is why :meth:`preprocessing_state` puts them in the checkpoint.
+
+        Categorical codes are re-derived through ``CategoricalEncoder.from_vocabularies``, so a
+        category this data has but training did not lands on the reserved out-of-vocabulary index
+        rather than shifting every other code.
+        """
+        if not state:
+            raise ValueError("apply_preprocessing_state needs the state produced by preprocessing_state()")
+
+        def as_array(values, dtype=np.float32):
+            array = np.asarray(list(values or []), dtype=dtype)
+            return None if array.size == 0 else array
+
+        self.static_mean_ = as_array(state.get("static_mean"))
+        self.static_scale_ = as_array(state.get("static_scale"))
+        self.target_mean_ = as_array(state.get("target_mean"))
+        self.target_scale_ = as_array(state.get("target_scale"))
+        self.label_mean_ = as_array(state.get("label_mean"))
+        self.label_scale_ = as_array(state.get("label_scale"))
+        self.label_median_ = as_array(state.get("label_median"))
+        self.sequence_mean_ = {
+            name: np.asarray(values, dtype=np.float32)
+            for name, values in (state.get("sequence_mean") or {}).items()
+        }
+        self.sequence_scale_ = {
+            name: np.asarray(values, dtype=np.float32)
+            for name, values in (state.get("sequence_scale") or {}).items()
+        }
+
+        vocabularies = state.get("categorical_vocabularies") or []
+        names = state.get("categorical_feature_names") or []
+        raw_categoricals = np.asarray(self.sequence_bundle.static_categoricals, dtype=object)
+        if vocabularies and names and raw_categoricals.size:
+            self.categorical_encoder_ = CategoricalEncoder.from_vocabularies(names, vocabularies)
+            self.categorical_codes_ = self.categorical_encoder_.transform(raw_categoricals)
+            self.categorical_vocabularies = [list(vocabulary) for vocabulary in vocabularies]
+            self.categorical_cardinalities = [len(vocabulary) + 1 for vocabulary in vocabularies]
+        else:
+            self.categorical_encoder_ = None
+            self.categorical_codes_ = np.zeros((raw_categoricals.shape[0], 0), dtype=np.int64)
+
+        self._is_setup = True
+
+    def collate(self, point_indices) -> dict[str, Any]:
+        """Public entry to the batch builder, so serving code need not reach for a private name."""
+        return self._collate_points(point_indices)
 
     def _infer_grid_years(self) -> int:
         """How many calendar years a per-point grid must span to hold every observation.
@@ -229,6 +336,29 @@ class SoilSequenceDataModule(LightningDataModule):
             self.target_mean_ = train_targets.mean(axis=0).astype(np.float32)
             self.target_scale_ = self._safe_scale(train_targets.std(axis=0))
 
+        label_features = np.asarray(self.sequence_bundle.label_features)
+        if label_features.size:
+            # Measured cells only, exactly as for the sequence channels below: a column that is 37%
+            # absent would otherwise have its own fill value counted into the mean it was derived
+            # from, shrinking the spread and inflating every real reading on standardization.
+            train_labels = np.asarray(label_features[indices], dtype=np.float64)
+            measured = np.isfinite(train_labels)
+            counts = measured.sum(axis=0)
+            # A column with nothing measured in the train split cannot be filled from the data;
+            # 0.0 with unit scale makes it a constant the model can only ignore, which is the
+            # honest degenerate answer rather than a fabricated centre.
+            median = np.zeros(train_labels.shape[1], dtype=np.float64)
+            for column in range(train_labels.shape[1]):
+                if counts[column]:
+                    median[column] = np.median(train_labels[measured[:, column], column])
+            # Statistics are computed AFTER the fill, so the model's inputs and the standardizer
+            # agree about what a filled cell looks like: it lands wherever the train median lands,
+            # not at an arbitrary offset from a mean fitted on a different population.
+            filled = np.where(measured, train_labels, median)
+            self.label_median_ = median.astype(np.float32)
+            self.label_mean_ = filled.mean(axis=0).astype(np.float32)
+            self.label_scale_ = self._safe_scale(filled.std(axis=0))
+
         # Per-modality, per-channel statistics over the train points' real observations. With no
         # padding at rest there is nothing to mask out - every row here is a genuine reading.
         for modality_name, per_point_values in (self.sequence_bundle.sequences or {}).items():
@@ -291,6 +421,21 @@ class SoilSequenceDataModule(LightningDataModule):
             return self._finite(values).astype(np.float32)
         return ((self._finite(values) - self.static_mean_) / self.static_scale_).astype(np.float32)
 
+    def _standardize_labels(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Lab values -> ``(standardized, validity)``, filling what is missing from the train median.
+
+        Validity is captured BEFORE the fill - afterwards the information is gone for good, and a
+        filled cell would be indistinguishable from a measured one. That is the same failure the
+        time-series validity channels exist to prevent.
+        """
+        values = np.asarray(values, dtype=np.float64)
+        validity = np.isfinite(values)
+        if values.size == 0 or self.label_median_ is None:
+            return np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32), validity
+
+        filled = np.where(validity, values, self.label_median_)
+        return ((filled - self.label_mean_) / self.label_scale_).astype(np.float32), validity
+
     def _apply_target_transform(self, values: np.ndarray) -> np.ndarray:
         """Forward target transform. Mirrors LogTransformer in yg_eo_soilnet.utils (10 * log1p)."""
         if self.target_transform != "log1p" or values.size == 0:
@@ -342,12 +487,25 @@ class SoilSequenceDataModule(LightningDataModule):
         else:
             x_categorical = np.zeros((indices.size, 0), dtype=np.int64)
 
+        # ALL lab columns, always, in bundle order. The model index_selects the ones it was built
+        # for; sending only a selected subset would make the batch depend on which architecture is
+        # training, and this datamodule is shared and cached across several.
+        label_features = np.asarray(bundle.label_features)
+        if label_features.size:
+            x_labels, x_label_validity = self._standardize_labels(label_features[indices])
+        else:
+            x_labels = np.zeros((indices.size, 0), dtype=np.float32)
+            x_label_validity = np.zeros((indices.size, 0), dtype=bool)
+
         batch: dict[str, Any] = {
             "x_static": torch.as_tensor(x_static, dtype=torch.float32),
             "x_categorical": torch.as_tensor(x_categorical, dtype=torch.long),
+            "x_labels": torch.as_tensor(x_labels, dtype=torch.float32),
+            "x_label_validity": torch.as_tensor(x_label_validity, dtype=torch.bool),
             "y": torch.as_tensor(y, dtype=torch.float32),
             "point_ids": [bundle.point_ids[index] for index in indices.tolist()],
             "target_names": list(bundle.target_names),
+            "label_feature_names": list(bundle.label_feature_names),
             "sequences": {},
             "sequence_mask": {},
             "sequence_time": {},

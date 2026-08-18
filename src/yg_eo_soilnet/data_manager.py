@@ -311,7 +311,32 @@ class DataManager:
         if coordinate_columns:
             self.logger.info(f"Joining coordinate column(s) {coordinate_columns} from the targets source")
 
-        join_columns = [point_col, *target_columns, *coordinate_columns]
+        # Measured lab values beyond the ones being fitted, carried only when CARRY_LABEL_COLUMNS
+        # asks for them. Without this the split-file layout silently offers a model just the active
+        # targets while the joint-file layout offers every label, so the same LABEL_COLUMNS
+        # declaration means different things depending on how the data happens to be filed.
+        #
+        # Joining them does NOT make them predictors: metadata_columns adds every LABEL_COLUMNS
+        # entry to the drop set regardless of which targets are active, and all three paths select
+        # their features through filter_schema. Only a model that names one in
+        # auxiliary_label_columns ever reads it.
+        label_columns = []
+        if getattr(self.config, "CARRY_LABEL_COLUMNS", False):
+            label_columns = [
+                column
+                for column in (getattr(self.config, "LABEL_COLUMNS", []) or [])
+                if column in targets_df.columns and column not in static_df.columns
+            ]
+            if label_columns:
+                self.logger.info(
+                    f"Joining {len(label_columns)} measured label column(s) from the targets source "
+                    "as auxiliary inputs; they remain excluded from the feature set"
+                )
+
+        # dict.fromkeys, not a bare list: a column that is both a target and a label - which every
+        # active target is - would otherwise be selected twice, and targets_df[join_columns] would
+        # return a frame with a duplicated column that fails on merge for no legible reason.
+        join_columns = list(dict.fromkeys([point_col, *target_columns, *label_columns, *coordinate_columns]))
         dedup_targets = targets_df[join_columns].drop_duplicates(subset=[point_col])
         return static_df.merge(dedup_targets, on=point_col, how="inner")
 

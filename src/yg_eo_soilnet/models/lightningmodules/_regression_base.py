@@ -213,6 +213,55 @@ class SoilRegressionLightningBase(LightningModule):
     def on_test_epoch_end(self) -> None:
         self._log_epoch_metrics("test")
 
+    # --- preprocessing state ------------------------------------------------
+
+    def attach_preprocessing_state(self, state: Mapping[str, Any] | None) -> None:
+        """Record the datamodule's fitted input statistics on this module.
+
+        The target statistics were always buffers, so a restored checkpoint could invert its own
+        predictions. The INPUT statistics were not: they lived only on the datamodule, so a
+        restored model could not standardize raw data and was therefore not servable on its own.
+        This carries them across.
+
+        Carried in the checkpoint by :meth:`on_save_checkpoint` rather than in ``hparams``. It is
+        deliberately NOT a hyperparameter: Lightning replays ``hparams`` as constructor keyword
+        arguments on restore, so an entry that is not an ``__init__`` parameter would break
+        ``load_from_checkpoint``. It is not a buffer either - the payload is ragged (per-modality
+        dicts of differing widths, string vocabularies, feature names), which is not a tensor shape.
+
+        Also the source of the feature names an explainer labels its rows with; without it the
+        attribution seam falls back to positional names like ``static_0``.
+        """
+        if not state:
+            return
+
+        payload = dict(state)
+        self.preprocessing_state = payload
+
+        # Promoted to attributes because the attribution seam and the serving wrapper read them on
+        # every call and should not have to know they came from a dict.
+        self.static_feature_names = list(payload.get("static_feature_names") or [])
+        self.modality_column_names = {
+            str(name): list(columns) for name, columns in (payload.get("modality_column_names") or {}).items()
+        }
+
+    def get_preprocessing_state(self) -> dict:
+        """The attached state, empty when this module was never given one."""
+        return dict(getattr(self, "preprocessing_state", None) or {})
+
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        """Put the fitted input statistics in the checkpoint, beside the weights.
+
+        Plain builtins by contract (see SoilSequenceDataModule.preprocessing_state), so a checkpoint
+        carrying them still loads under ``torch.load``'s ``weights_only=True`` default.
+        """
+        state = self.get_preprocessing_state()
+        if state:
+            checkpoint["preprocessing_state"] = state
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        self.attach_preprocessing_state(checkpoint.get("preprocessing_state"))
+
     # --- target inversion and optimizer ------------------------------------
 
     def inverse_transform_targets(self, predictions):

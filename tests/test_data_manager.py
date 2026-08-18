@@ -64,6 +64,55 @@ def test_load_tabular_data_joins_static_and_targets(tmp_path: Path, toy_config, 
     assert joined.shape == (3, 6)
 
 
+def _split_sources(tmp_path: Path, toy_config) -> None:
+    """Static covariates in one file, every measured lab value in another - the real layout."""
+    pd.DataFrame(
+        {"point_id": [1, 2, 3], "lat": [0.0, 0.1, 0.2], "lon": [0.0, 0.1, 0.2], "feature": [10.0, 20.0, 30.0]}
+    ).to_csv(tmp_path / "static.csv", index=False)
+    pd.DataFrame(
+        {
+            "point_id": [1, 2, 3],
+            "target_a": [1.0, 2.0, 3.0],
+            "target_b": [4.0, 5.0, 6.0],
+            "lab_extra": [7.0, 8.0, 9.0],
+        }
+    ).to_csv(tmp_path / "targets.csv", index=False)
+
+    toy_config.DATA_FOLDER = str(tmp_path)
+    toy_config.DATA_FILE = "static.csv"
+    toy_config.STATIC_FEATURES_FILE = "static.csv"
+    toy_config.TARGETS_FILE = "targets.csv"
+    toy_config.TARGET_COLUMNS = ["target_a"]
+    toy_config.LABEL_COLUMNS = ["target_a", "target_b", "lab_extra"]
+    toy_config.POINT_ID_COLUMN = "point_id"
+
+
+def test_the_targets_join_carries_only_active_targets_by_default(tmp_path: Path, toy_config, logger) -> None:
+    """A run that never opted in must see exactly the frame it saw before the flag existed."""
+    _split_sources(tmp_path, toy_config)
+    toy_config.CARRY_LABEL_COLUMNS = False
+
+    joined = DataManager(toy_config, logger).load_tabular_data()
+
+    assert list(joined.columns) == ["point_id", "lat", "lon", "feature", "target_a"]
+
+
+def test_the_targets_join_carries_every_label_column_when_asked(tmp_path: Path, toy_config, logger) -> None:
+    """Without this the split layout offers a model only the active target, while a joint file
+    offers every lab value - the same declaration meaning two different things."""
+    _split_sources(tmp_path, toy_config)
+    toy_config.CARRY_LABEL_COLUMNS = True
+
+    manager = DataManager(toy_config, logger)
+    joined = manager.load_tabular_data()
+
+    # target_a is both a target and a label; it must cross exactly once.
+    assert list(joined.columns) == ["point_id", "lat", "lon", "feature", "target_a", "target_b", "lab_extra"]
+    assert joined["target_a"].tolist() == [1.0, 2.0, 3.0]
+    # Carried, but still not predictors: the schema filter drops every label by name.
+    assert manager.filter_schema(joined, ["target_a"]).columns.tolist() == ["feature"]
+
+
 def test_load_tabular_data_discovers_csv_and_parquet_shards_one_level_deep(tmp_path: Path, toy_config, logger) -> None:
     pytest.importorskip("pyarrow")
 

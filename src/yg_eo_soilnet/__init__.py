@@ -21,11 +21,22 @@ from yg_eo_soilnet.datamodules.scikit import (
 )
 from yg_eo_soilnet.trainers import ModelTrainer
 from yg_eo_soilnet.utils import LogTransformer
+from yg_eo_soilnet.artifacts import ArtifactLayout
+from yg_eo_soilnet.metrics import cv_rmse_from_search, regression_metrics
+from yg_eo_soilnet.serving import SoilSequencePredictor
+
+# Deliberately NOT re-exported: yg_eo_soilnet.explain. Importing it here would defeat the
+# EXPLAIN_ENABLED off-switch, which depends on nothing reaching the explain package until the
+# switch has been checked.
 
 __all__ = [
 	"DataManager",
 	"SoilDataset",
 	"LogTransformer",
+	"ArtifactLayout",
+	"regression_metrics",
+	"cv_rmse_from_search",
+	"SoilSequencePredictor",
 	"CVSplitter",
 	"PipelineBuilder",
 	"TargetNanFilter",

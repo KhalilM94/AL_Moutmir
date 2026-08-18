@@ -149,6 +149,38 @@ class Config:
         self.SKLEARN_FILE_LOGGING_ENABLED = self._get_config('SKLEARN_FILE_LOGGING_ENABLED', True)
         self.MLFLOW_EXPERIMENT_EXPORT_ENABLED = self._get_config('MLFLOW_EXPERIMENT_EXPORT_ENABLED', False)
         self.MLFLOW_EXPERIMENT_EXPORT_PATH = self._get_config('MLFLOW_EXPERIMENT_EXPORT_PATH', 'mlflow_exports')
+        # Where runs are recorded, and under which experiment. Both are configurable because an
+        # experiment's artifact_location is an ABSOLUTE path baked in at creation time: the original
+        # experiment was created in a different checkout, so its metadata and its artifacts have
+        # been landing in two different directories ever since. A new experiment created under the
+        # current tracking root gets a correct artifact_location from MLflow automatically.
+        self.MLFLOW_TRACKING_URI = self._get_config('MLFLOW_TRACKING_URI', '')
+        self.MLFLOW_EXPERIMENT_NAME = self._get_config('MLFLOW_EXPERIMENT_NAME', 'Soil_Model_Training_v2')
+        # Enter each fitted model into the MLflow Model Registry as a new version of
+        # <target>_<model>, so deployment can reference models:/<name>/<version> or the champion
+        # alias instead of a run-scoped URI. false for throwaway experiments that should not
+        # accumulate versions.
+        self.MLFLOW_REGISTER_MODELS = self._get_config('MLFLOW_REGISTER_MODELS', True)
+        # SHAP explainability. EXPLAIN_ENABLED is a real off-switch, not just a plot suppressor:
+        # when it is false the logger returns before importing shap at all, so a run that does not
+        # want explanations does not pay for numba's import either.
+        self.EXPLAIN_ENABLED = self._get_config('EXPLAIN_ENABLED', True)
+        self.EXPLAIN_MAX_SAMPLES = self._get_config('EXPLAIN_MAX_SAMPLES', 500)
+        self.EXPLAIN_BACKGROUND_SAMPLES = self._get_config('EXPLAIN_BACKGROUND_SAMPLES', 100)
+        self.EXPLAIN_MAX_DISPLAY = self._get_config('EXPLAIN_MAX_DISPLAY', 25)
+        # Ceiling on model evaluations for the model-agnostic explainer, which is what any model
+        # that is neither a tree nor linear falls back to. Without it, TabICL cost ~1.08M forward
+        # passes and the run never terminated.
+        self.EXPLAIN_MAX_EVALS = self._get_config('EXPLAIN_MAX_EVALS', 200000)
+        # Empty means every model. Named entries restrict it, because SHAP on a large TabICL
+        # regressor costs far more than on XGBoost and you want that choice per model, not global.
+        self.EXPLAIN_MODELS = self._get_config('EXPLAIN_MODELS', [])
+        # Models never explained unless EXPLAIN_MODELS names them explicitly. TabICL is an
+        # in-context learner: one prediction re-processes the training set, measured at ~13 ms per
+        # row against microseconds for a tree. EXPLAIN_MAX_EVALS counts evaluations and cannot see
+        # that difference, so the exclusion is by name rather than by budget.
+        self.EXPLAIN_SKIP_MODELS = self._get_config('EXPLAIN_SKIP_MODELS', ['TabICL'])
+        self.EXPLAIN_FAIL_ON_ERROR = self._get_config('EXPLAIN_FAIL_ON_ERROR', False)
         self.LIGHTNING_EARLY_STOPPING_MONITOR = self._get_config('LIGHTNING_EARLY_STOPPING_MONITOR', 'val_loss')
         self.LIGHTNING_EARLY_STOPPING_MODE = self._get_config('LIGHTNING_EARLY_STOPPING_MODE', 'min')
         self.LIGHTNING_EARLY_STOPPING_PATIENCE = self._get_config('LIGHTNING_EARLY_STOPPING_PATIENCE', 5)
@@ -169,6 +201,12 @@ class Config:
         # Every measured label, whether or not a model is fitted for it. Defaults to empty so a
         # config that has not adopted the key behaves exactly as before.
         self.LABEL_COLUMNS = self._get_config('LABEL_COLUMNS', self._get_config('label_columns', []))
+        # Whether measured lab values travel with the data as AUXILIARY INPUTS. Off by default, so
+        # a config that has not opted in behaves exactly as before. This governs availability only -
+        # which columns reach the frame and the bundle - never whether they are predictors, which
+        # metadata_columns still refuses for every LABEL_COLUMNS entry. A model then names the subset
+        # it wants; see soil_cnn's auxiliary_label_columns.
+        self.CARRY_LABEL_COLUMNS = self._get_config('CARRY_LABEL_COLUMNS', False)
         self.PREDICTOR_COLUMNS = self._get_config('PREDICTOR_COLUMNS', self._get_config('predictor_columns', []))
         self.IGNORED_COLUMNS = self._get_config('IGNORED_COLUMNS', self._get_config('ignored_columns', []))
         self.TREE_CATEGORICAL_ENCODING = self._get_sklearn_categorical_config('TREE_CATEGORICAL_ENCODING', 'onehot')

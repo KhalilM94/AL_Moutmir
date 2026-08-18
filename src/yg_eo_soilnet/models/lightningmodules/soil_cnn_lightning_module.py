@@ -45,12 +45,19 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
     * ``annual_grid2d`` keeps it 2D and factorises the kernel into a months pass and a years pass.
 
     Any number of modalities of any width is supported: everything is driven by ``modality_dims``.
+
+    ``auxiliary_label_columns`` optionally appends MEASURED lab values to the fused vector, just
+    before the head. This is an explicit opt-out of the rule that a label is never a feature, and it
+    is only sound when the named values are genuinely available at inference time too - predicting
+    organic matter for a sample whose texture and pH were measured, say. Naming a column that is
+    also being fitted raises rather than being filtered out.
     """
 
     def __init__(
         self,
         static_dim: int,
         target_dim: int,
+        target_names: Optional[Sequence[str]] = None,
         categorical_cardinalities: Optional[Sequence[int]] = None,
         categorical_vocabularies: Optional[Sequence[Sequence[str]]] = None,
         categorical_feature_names: Optional[Sequence[str]] = None,
@@ -68,6 +75,11 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         pool: str = "masked_avg",
         month_positional: bool = True,
         use_validity_channels: bool = True,
+        auxiliary_label_columns: Optional[Sequence[str]] = None,
+        auxiliary_available_names: Optional[Sequence[str]] = None,
+        auxiliary_validity_channels: bool = True,
+        auxiliary_hidden_dims: Optional[Sequence[int]] = None,
+        auxiliary_dropout: float = 0.0,
         static_hidden_dims: Sequence[int] = (64,),
         head_hidden_dims: Sequence[int] = (128, 64),
         head_norm_final: bool = False,
@@ -102,6 +114,13 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
             [str(category) for category in vocabulary] for vocabulary in (categorical_vocabularies or [])
         ]
         categorical_feature_names = [str(name) for name in (categorical_feature_names or [])]
+        # Same reason again, plus one of its own: the selected names and the roster they were
+        # resolved against both travel in hyper_parameters, so the checkpoint records which lab
+        # columns it expects instead of re-deriving positions from whatever frame it is handed.
+        auxiliary_label_columns = [str(name) for name in (auxiliary_label_columns or [])]
+        auxiliary_available_names = [str(name) for name in (auxiliary_available_names or [])]
+        auxiliary_hidden_dims = [int(width) for width in (auxiliary_hidden_dims or [])]
+        target_names = [str(name) for name in (target_names or [])]
         self.save_hyperparameters()
 
         self._init_regression_targets(
@@ -195,12 +214,21 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
                     pool=pool,
                 )
 
+        self.target_names = list(target_names)
+        self.auxiliary_validity_channels = bool(auxiliary_validity_channels)
+        self.auxiliary_encoder = self._build_auxiliary_encoder(
+            auxiliary_label_columns,
+            auxiliary_available_names,
+            auxiliary_hidden_dims,
+            auxiliary_dropout,
+        )
+
         # The static branch keeps its width even when static_dim is 0, so the fused vector has a
         # fixed shape regardless of whether covariates are present.
         temporal_dim = sum(encoder.output_dim for encoder in self.temporal_encoders.values())
         self.fusion = ConcatGatedFusion(self.static_hidden_dim, temporal_dim)
         self.output_head = build_mlp_stack(
-            self.fusion.output_dim,
+            self.fusion.output_dim + self.auxiliary_output_dim,
             head_hidden_dims,
             self.target_dim,
             dropout=dropout,
@@ -228,6 +256,94 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
                 )
             return value
         return setting
+
+    def _build_auxiliary_encoder(
+        self,
+        selected: list[str],
+        available: list[str],
+        hidden_dims: list[int],
+        dropout: float,
+    ) -> nn.Module:
+        """Resolve the named lab columns to positions and build the branch that reads them.
+
+        The selection is by NAME against the roster the datamodule offers, resolved once into a
+        buffer. Positions cannot be configured directly: the bundle's column order follows
+        LABEL_COLUMNS, so an index would silently point at a different measurement the moment that
+        list is reordered.
+        """
+        self.auxiliary_label_columns = list(selected)
+        self.auxiliary_available_names = list(available)
+        self.auxiliary_output_dim = 0
+        # Registered even when empty so state_dict keys do not depend on the configuration, and a
+        # checkpoint trained without auxiliary columns still loads into a module that declares them.
+        self.register_buffer("auxiliary_index", torch.zeros(0, dtype=torch.long), persistent=True)
+        if not selected:
+            return nn.Identity()
+
+        if not self.target_names:
+            # Without the target roster the leakage check below cannot run, and silently skipping
+            # it is how a model ends up reading its own answer. The config factory always supplies
+            # these, so this only fires on hand-built modules.
+            raise ValueError(
+                "auxiliary_label_columns requires target_names so a selected column can be checked "
+                "against what is being fitted; pass target_names explicitly."
+            )
+
+        leaking = [name for name in selected if name in set(self.target_names)]
+        if leaking:
+            raise ValueError(
+                f"auxiliary_label_columns may not name a column being fitted: {sorted(leaking)} "
+                f"also appear(s) in target_names {sorted(self.target_names)}. The model would read "
+                "its own target as an input."
+            )
+
+        if not available:
+            # Distinguished from the unknown-name case below because the fix is somewhere else
+            # entirely: the columns may well exist and be correctly declared, and still not have
+            # been carried. Reporting "unknown column" here sends the reader to audit a config that
+            # is already right.
+            raise ValueError(
+                f"auxiliary_label_columns names {sorted(selected)} but no lab columns are being "
+                "carried with the data. Set CARRY_LABEL_COLUMNS: true in data_spec.yml to make the "
+                "LABEL_COLUMNS entries available as auxiliary inputs."
+            )
+
+        unknown = [name for name in selected if name not in set(available)]
+        if unknown:
+            raise ValueError(
+                f"auxiliary_label_columns names column(s) the data does not carry: {sorted(unknown)}. "
+                f"Available: {sorted(available)}. A lab column must be listed in LABEL_COLUMNS and "
+                "present in the static or targets source to be selectable."
+            )
+
+        duplicates = sorted({name for name in selected if selected.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"auxiliary_label_columns lists duplicate column(s): {duplicates}")
+
+        self.auxiliary_index = torch.as_tensor([available.index(name) for name in selected], dtype=torch.long)
+        # Validity doubles the width: one measured/filled flag per selected column, so the network
+        # can discount a train-median fill instead of reading it as a measurement.
+        input_dim = len(selected) * (2 if self.auxiliary_validity_channels else 1)
+        # An empty hidden_dims makes this an Identity, which IS the raw-concat mode - the two
+        # options are one code path, and forward() needs no branch between them.
+        encoder = build_mlp_stack(
+            input_dim,
+            hidden_dims,
+            None,
+            dropout=dropout,
+            activation="gelu",
+            use_layer_norm=True,
+            # This block feeds the head's input vector rather than a readout, so both are on - the
+            # case build_mlp_stack's docstring describes as "feeding a fusion".
+            norm_final=True,
+            dropout_final=True,
+        )
+        self.auxiliary_output_dim = hidden_dims[-1] if hidden_dims else input_dim
+        return encoder
+
+    @property
+    def has_auxiliary_labels(self) -> bool:
+        return bool(self.auxiliary_label_columns)
 
     @property
     def has_static_features(self) -> bool:
@@ -271,17 +387,66 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
             )
         return self.static_encoder(x_static, x_categorical)
 
-    def _encode_temporal(self, batch: Any, device, dtype) -> Optional[torch.Tensor]:
-        if not self.temporal_encoders:
+    def _select_auxiliary(self, batch: Any, device, dtype) -> Optional[torch.Tensor]:
+        """The auxiliary lab block as it enters ``auxiliary_encoder``: values, then validity flags.
+
+        Separated from :meth:`_encode_auxiliary` so an explainer can attribute to these raw
+        per-column inputs rather than to the encoder's output, which has no per-column meaning.
+        """
+        if not self.has_auxiliary_labels:
             return None
 
+        values = batch_get(batch, "x_labels")
+        if values is None:
+            raise KeyError(
+                "Batch is missing 'x_labels'; auxiliary_label_columns needs the measured lab values "
+                f"({self.auxiliary_label_columns}) that the sequence datamodule collates."
+            )
+        values = values.to(device=device, dtype=dtype)
+        if values.size(-1) != len(self.auxiliary_available_names):
+            # Positions were resolved against the roster this model was BUILT with. A batch of a
+            # different width means it is not that roster, and index_select would then quietly read
+            # whichever measurement now sits at that position.
+            raise ValueError(
+                f"Batch carries {values.size(-1)} lab column(s) but this model resolved its "
+                f"auxiliary columns against {len(self.auxiliary_available_names)}; the data no "
+                "longer matches the checkpoint's label roster."
+            )
+
+        selected = values.index_select(-1, self.auxiliary_index)
+        if self.auxiliary_validity_channels:
+            validity = batch_get(batch, "x_label_validity")
+            if validity is None:
+                raise KeyError(
+                    "Batch is missing 'x_label_validity'; set auxiliary_validity_channels=False to "
+                    "run without the measured-vs-filled flags."
+                )
+            validity = validity.to(device=device, dtype=dtype).index_select(-1, self.auxiliary_index)
+            selected = torch.cat([selected, validity], dim=-1)
+
+        return selected
+
+    def _encode_auxiliary(self, batch: Any, device, dtype) -> Optional[torch.Tensor]:
+        selected = self._select_auxiliary(batch, device=device, dtype=dtype)
+        if selected is None:
+            return None
+        return self.auxiliary_encoder(selected)
+
+    def _rasterize(self, batch: Any, device, dtype) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """One ``(grid, cell_mask)`` per modality: the ragged sequences laid onto a calendar grid.
+
+        This is the boundary between the non-differentiable part of the temporal branch and the
+        differentiable one. The scatter that builds the grid cannot be attributed through, but
+        everything downstream of it is convolution and pooling, so a gradient explainer takes these
+        grids as its inputs and reaches every individual band.
+        """
         sequences = batch_get(batch, "sequences", {}) or {}
         masks = batch_get(batch, "sequence_mask", {}) or {}
         times = batch_get(batch, "sequence_time", {}) or {}
         validities = batch_get(batch, "sequence_validity", {}) or {}
 
-        embeddings = []
-        for modality_name, encoder in self.temporal_encoders.items():
+        grids: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        for modality_name in self.temporal_encoders:
             values = sequences.get(modality_name)
             mask = masks.get(modality_name)
             modality_times = times.get(modality_name)
@@ -291,18 +456,34 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
                     "'sequences', 'sequence_mask' and 'sequence_time'"
                 )
             validity = validities.get(modality_name)
-            grid, cell_mask = self.rasterizers[modality_name](
+            grids[modality_name] = self.rasterizers[modality_name](
                 values.to(device=device, dtype=dtype),
                 mask.to(device=device),
                 modality_times.to(device=device),
                 None if validity is None else validity.to(device=device),
             )
+        return grids
+
+    def _encode_temporal_from_grids(
+        self, grids: Mapping[str, tuple[torch.Tensor, torch.Tensor]]
+    ) -> Optional[torch.Tensor]:
+        if not self.temporal_encoders:
+            return None
+
+        embeddings = []
+        for modality_name, encoder in self.temporal_encoders.items():
+            grid, cell_mask = grids[modality_name]
             embedding = encoder(grid, cell_mask)
             # A point with nothing in the window contributes nothing rather than a bias-shaped
             # artefact that the gate would then have to learn to suppress.
             embeddings.append(embedding * cell_mask.flatten(1).any(dim=1, keepdim=True).to(dtype=embedding.dtype))
 
         return torch.cat(embeddings, dim=-1)
+
+    def _encode_temporal(self, batch: Any, device, dtype) -> Optional[torch.Tensor]:
+        if not self.temporal_encoders:
+            return None
+        return self._encode_temporal_from_grids(self._rasterize(batch, device=device, dtype=dtype))
 
     def forward(self, batch: Any) -> torch.Tensor:
         x_static = batch_get(batch, "x_static")
@@ -319,4 +500,185 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         static_features = self._encode_static(x_static, x_categorical)
         temporal_features = self._encode_temporal(batch, device=device, dtype=dtype)
         fused = self.fusion(static_features, temporal_features)
+
+        # Appended AFTER the gate, so a measured lab value reaches the head at full strength rather
+        # than being traded off against the branches that had to infer it.
+        auxiliary_features = self._encode_auxiliary(batch, device=device, dtype=dtype)
+        if auxiliary_features is not None:
+            fused = torch.cat([fused, auxiliary_features], dim=-1)
         return self.output_head(fused)
+
+    # --- attribution seam ---------------------------------------------------
+    # explanation_parts() splits a batch into the tensors an explainer perturbs, and
+    # forward_from_parts() rebuilds the prediction from exactly those tensors. The pair must agree:
+    # forward_from_parts(explanation_parts(batch)[0]) has to equal forward(batch) exactly, because
+    # any drift between the two silently attributes importance to a model that is not the one being
+    # scored. tests/test_explain.py pins that equality.
+    #
+    # Neither method is called by forward, _shared_step or predict_step. Training is bit-identical
+    # whether or not anything ever explains the model.
+
+    def explanation_parts(self, batch: Any) -> tuple[list[torch.Tensor], list[dict[str, Any]]]:
+        """``(parts, groups)`` - the attribution inputs and how to fold them back into features.
+
+        Each group describes one contiguous run of columns in one part tensor, and names the
+        feature that run belongs to. Summing a group's SHAP values gives that feature's
+        contribution, which is valid because SHAP values are additive.
+        """
+        reference = next(self.parameters())
+        device, dtype = reference.device, reference.dtype
+
+        x_static = batch_get(batch, "x_static")
+        if x_static is None:
+            raise KeyError("Batch is missing 'x_static'")
+        x_static = x_static.to(device=device, dtype=dtype)
+
+        parts: list[torch.Tensor] = [x_static]
+        groups: list[dict[str, Any]] = [
+            {
+                "part": 0,
+                "kind": "static",
+                "name": name,
+                "columns": [index],
+            }
+            for index, name in enumerate(self._static_feature_names(x_static.size(-1)))
+        ]
+
+        # Categorical: the embedding, not the int64 index, because an index has no gradient. One
+        # group per feature, spanning that feature's embedding dimensions.
+        if self.has_static_features and self.static_encoder.embeddings.num_features:
+            x_categorical = batch_get(batch, "x_categorical")
+            if x_categorical is None:
+                raise KeyError("Batch is missing 'x_categorical'")
+            embedded = self.static_encoder.embeddings(x_categorical.to(device=device)).to(dtype=dtype)
+            part_index = len(parts)
+            parts.append(embedded)
+            cursor = 0
+            for name, width in zip(
+                self.static_encoder.embeddings.feature_names,
+                self.static_encoder.embeddings.embedding_dims,
+            ):
+                groups.append(
+                    {
+                        "part": part_index,
+                        "kind": "categorical",
+                        "name": name,
+                        "columns": list(range(cursor, cursor + int(width))),
+                    }
+                )
+                cursor += int(width)
+
+        # Temporal: one part per modality, the rasterized grid. Groups fold each band's value
+        # channel together with its validity channel - they describe the same band - and keep the
+        # month sin/cos pair as one row of its own.
+        grids = self._rasterize(batch, device=device, dtype=dtype) if self.temporal_encoders else {}
+        for modality_name in self.temporal_encoders:
+            grid, _cell_mask = grids[modality_name]
+            part_index = len(parts)
+            parts.append(grid)
+            layout = self.rasterizers[modality_name].channel_layout()
+            column_names = self._modality_column_names(modality_name, len(layout["values"]))
+            for band_index, band_name in enumerate(column_names):
+                columns = [layout["values"][band_index]]
+                if layout["validity"]:
+                    columns.append(layout["validity"][band_index])
+                groups.append(
+                    {
+                        "part": part_index,
+                        "kind": "temporal",
+                        "modality": modality_name,
+                        "name": band_name,
+                        "columns": columns,
+                    }
+                )
+            if layout["month_positional"]:
+                groups.append(
+                    {
+                        "part": part_index,
+                        "kind": "temporal",
+                        "modality": modality_name,
+                        "name": f"{modality_name}_month_positional",
+                        "columns": list(layout["month_positional"]),
+                    }
+                )
+
+        # Auxiliary lab block: raw values, followed by validity flags when they are enabled.
+        selected = self._select_auxiliary(batch, device=device, dtype=dtype)
+        if selected is not None:
+            part_index = len(parts)
+            parts.append(selected)
+            count = len(self.auxiliary_label_columns)
+            for index, name in enumerate(self.auxiliary_label_columns):
+                columns = [index]
+                if self.auxiliary_validity_channels:
+                    columns.append(count + index)
+                groups.append(
+                    {
+                        "part": part_index,
+                        "kind": "auxiliary",
+                        "name": name,
+                        "columns": columns,
+                    }
+                )
+
+        return parts, groups
+
+    def forward_from_parts(self, parts: Sequence[torch.Tensor]) -> torch.Tensor:
+        """Rebuild a prediction from :meth:`explanation_parts` output, and nothing else.
+
+        A pure function of ``parts`` on purpose. A gradient explainer evaluates the model on
+        interpolations between a sample and random background rows, so anything the forward pass
+        needs has to be derivable from the perturbed tensors themselves - it cannot be captured from
+        the original batch, because the row count and the row identities both change.
+
+        ``cell_mask`` is therefore read back out of the grid rather than passed alongside it: the
+        rasterizer already writes it as the ``cell_observed`` channel, so the grid is self-contained.
+        """
+        cursor = 0
+        x_static = parts[cursor]
+        cursor += 1
+
+        embedded = None
+        if self.has_static_features and self.static_encoder.embeddings.num_features:
+            embedded = parts[cursor]
+            cursor += 1
+
+        if self.has_static_features:
+            static_features = self.static_encoder.forward_with_embedding(x_static, embedded)
+        else:
+            static_features = torch.zeros(
+                (x_static.size(0), self.static_hidden_dim), device=x_static.device, dtype=x_static.dtype
+            )
+
+        temporal_features = None
+        if self.temporal_encoders:
+            grids = {}
+            for modality_name in self.temporal_encoders:
+                grid = parts[cursor]
+                cursor += 1
+                observed_index = self.rasterizers[modality_name].channel_layout()["cell_observed"][0]
+                grids[modality_name] = (grid, grid[:, observed_index] > 0.5)
+            temporal_features = self._encode_temporal_from_grids(grids)
+
+        fused = self.fusion(static_features, temporal_features)
+
+        if self.has_auxiliary_labels:
+            fused = torch.cat([fused, self.auxiliary_encoder(parts[cursor])], dim=-1)
+            cursor += 1
+
+        return self.output_head(fused)
+
+    def _static_feature_names(self, width: int) -> list[str]:
+        """Names for the continuous static block, falling back to positions when none were stored."""
+        names = list(getattr(self, "static_feature_names", None) or [])
+        if len(names) == width:
+            return names
+        return [f"static_{index}" for index in range(width)]
+
+    def _modality_column_names(self, modality_name: str, width: int) -> list[str]:
+        """Band names for one modality, falling back to positions when none were stored."""
+        stored = (getattr(self, "modality_column_names", None) or {}).get(modality_name)
+        names = list(stored or [])
+        if len(names) == width:
+            return names
+        return [f"{modality_name}_{index}" for index in range(width)]

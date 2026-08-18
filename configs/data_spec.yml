@@ -4,23 +4,23 @@
 LABEL_COLUMNS:
   - sand_pct
   - clay_pct
-  # - total_silt_pct
-  # - fine_silt_pct
+  - total_silt_pct
+  - fine_silt_pct
   - coarse_silt_pct
   - coarse_element_pct
   - ph_water
-  # - caco3_pct_total
+  - caco3_pct_total
   - caco3_active_pct
-  # - c_e_c_meq_100g
+  - c_e_c_meq_100g
   - ce_ext1_5_ms_cm
   - na2o_ppm
   - cl_ppm
   - na_meq_100g
-  # - c_n_ratio
+  - c_n_ratio
   - organic_matter_pct
   - organic_matter_g_kg
   - exchangeable_k2o_ppm
-  # - p2o5_ehangable_olsen_ppm
+  - p2o5_ehangable_olsen_ppm
   - mgo_ppm
   - cao_ppm
   - iron_ppm_dtpa
@@ -29,11 +29,22 @@ LABEL_COLUMNS:
   - zn_ppm_dtpa
   - b_ppm_hot_water
 
+# Whether the measured values above travel with the data as AUXILIARY INPUTS. This changes
+# availability only: every LABEL_COLUMNS entry stays out of the feature set either way, because
+# metadata_columns drops them by name for all three paths. What it enables is a model naming one
+# explicitly - see soil_cnn's auxiliary_label_columns - for the case where the value is genuinely
+# measured at prediction time too.
+#
+# Needed because targets live in their own file here: the join carries only the ACTIVE targets
+# unless asked otherwise, so without this a model could select organic_matter_g_kg and nothing else,
+# while the same declaration on a joint static+targets file would offer all 24.
+CARRY_LABEL_COLUMNS: true
+
 # The subset of LABEL_COLUMNS to actually fit models for in this run. A name on either side is
 # treated as a label and kept out of the features; only these get models fitted.
 TARGET_COLUMNS:
-  # - organic_matter_pct
   - organic_matter_g_kg
+  # - organic_matter_pct
   # - clay_pct
   # - sand_pct
   # - total_silt_pct
@@ -53,6 +64,12 @@ IGNORED_COLUMNS: &ignored_columns
   - date
   - texture_20cm
   - landform_class
+  - bd_median_0_30cm
+  - clay_median_0_30cm
+  - ph_median_0_30cm
+  - sand_median_0_30cm
+  - soc_median_0_30cm
+  - swc_median_0_30cm
 
 ELIMINATED_FEATURES: *ignored_columns
 
@@ -63,6 +80,6 @@ CATEGORICAL_FEATURES:
 existing_hs_features:
   enabled: false
   ignore: false
-  prefix: ["S2_", "S1_", "SOIL_", "AG_", "CLIM_"]
+  prefix: ["S2_", "S1_asc","S1_desc", "SOIL_", "AG_", "CLIM_"]
   band_count: 6
   band_names: []

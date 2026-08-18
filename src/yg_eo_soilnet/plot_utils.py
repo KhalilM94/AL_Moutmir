@@ -313,7 +313,10 @@ def create_pred_obs_plot(eval_df, builtin_metrics, artifacts_dir):
     ax.text(0.05, 0.95,
             f"RMSE={root_mean_squared_error(y_test, y_pred):.2f}\n"
             f"R²={r2_score(y_test, y_pred):.2f}\n"
-            f"RPIQ={rpiq_score(y_test, y_pred):.2f}",
+            # (predictions, targets), in that order: the IQR in the numerator is read off the
+            # SECOND argument. Passing (y_test, y_pred) measures the spread of the predictions,
+            # which under-reports RPIQ because predictions are systematically under-dispersed.
+            f"RPIQ={rpiq_score(y_pred, y_test):.2f}",
             transform=ax.transAxes,
             verticalalignment='top',
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)

@@ -20667,7 +20667,7 @@ packages:
 - pypi: ./
   name: yg-eo-soilnet
   version: 0.1.0
-  sha256: 3c57dc67fb4b6fca7f56e46bf139ddb9967049f7e946fd4ca3a4024b59b78076
+  sha256: 63cc15d0792a6ec6e1675336bdac32fbaf704766ddbb196ea1891202189aefb2
   requires_dist:
   - mlflow==3.14.*
   - psutil>=7.2.2,<8

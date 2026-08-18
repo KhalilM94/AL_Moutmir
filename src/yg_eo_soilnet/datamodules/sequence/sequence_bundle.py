@@ -32,6 +32,15 @@ class SoilSequenceBundle:
     categorical_feature_names: list[str] = field(default_factory=list)
     targets: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
     target_names: list[str] = field(default_factory=list)
+    # Measured lab values, (n_points, n_labels) float32. Every LABEL_COLUMNS entry the static frame
+    # carries, not just the ones some model asked for: the bundle is built once per registry entry
+    # and cached across them, so it must not depend on any one model's column choice. Selection
+    # happens in the model, by name.
+    #
+    # NaN is PRESERVED here rather than filled. The fill value is a train-split median and at build
+    # time the split does not exist yet - the same reason static_categoricals above stays raw.
+    label_features: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
+    label_feature_names: list[str] = field(default_factory=list)
     # modality -> one (n_i, C_m) array per point, in static point order
     sequences: dict[str, list[np.ndarray]] = field(default_factory=dict)
     # modality -> one (n_i,) array of decimal years per point, in static point order
@@ -71,6 +80,25 @@ class SoilSequenceBundle:
         Reading it off an array would break on a bundle whose first point has no observations.
         """
         return {name: len(columns) for name, columns in self.modality_columns.items()}
+
+    @property
+    def label_dim(self) -> int:
+        """How many lab columns travel with the bundle, from the names rather than the array.
+
+        Same reason as modality_dims: a bundle whose static frame carried no label columns at all
+        has a (0, 0) array, and reading a width off that would disagree with the name list.
+        """
+        return len(self.label_feature_names)
+
+    def label_missing_fraction(self, column: str) -> float:
+        """Share of points whose value for this lab column is absent."""
+        if column not in self.label_feature_names:
+            raise KeyError(f"Unknown label column {column!r}; available: {self.label_feature_names}")
+        values = np.asarray(self.label_features, dtype=np.float64)
+        if values.size == 0:
+            return 0.0
+        column_values = values[:, self.label_feature_names.index(column)]
+        return float((~np.isfinite(column_values)).mean())
 
     def observation_counts(self, modality: str) -> np.ndarray:
         return np.asarray([len(values) for values in self.sequences.get(modality, [])], dtype=np.int64)
@@ -126,6 +154,20 @@ class SoilSequenceBundle:
                 )
         if self.targets.size and self.targets.shape[0] != num_points:
             raise ValueError(f"targets has {self.targets.shape[0]} row(s) but there are {num_points} point(s)")
+
+        # Deliberately NOT run through _validate_numeric_array: a missing lab value is legitimate
+        # here and becomes a train-median fill once the split is known. Only the alignment matters.
+        labels = np.asarray(self.label_features)
+        if labels.ndim == 2 and labels.shape[1]:
+            if labels.shape[0] != num_points:
+                raise ValueError(
+                    f"label_features has {labels.shape[0]} row(s) but there are {num_points} point(s)"
+                )
+            if labels.shape[1] != len(self.label_feature_names):
+                raise ValueError(
+                    f"label_features has {labels.shape[1]} column(s) but "
+                    f"{len(self.label_feature_names)} label feature name(s)"
+                )
 
         for modality, per_point_values in (self.sequences or {}).items():
             per_point_times = (self.sequence_times or {}).get(modality)

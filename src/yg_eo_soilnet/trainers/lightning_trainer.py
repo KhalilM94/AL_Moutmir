@@ -94,6 +94,10 @@ class LightningTrainer:
             with mlflow.start_run(run_name=run_name, nested=True):
                 trainer = self._build_trainer(bundle)
                 bundle.datamodule.setup("fit")
+                # After setup (the scalers and vocabulary are fitted there) and before fit, so the
+                # state is inside every checkpoint the run writes. Without it a restored model has
+                # its weights but no way to standardize raw input, which makes it unservable.
+                self._attach_preprocessing_state(bundle)
                 trainer.fit(bundle.model, datamodule=bundle.datamodule)
 
                 best_model_path = self._resolve_best_checkpoint(trainer)
@@ -167,6 +171,20 @@ class LightningTrainer:
                 )
 
         return results
+
+    @staticmethod
+    def _attach_preprocessing_state(bundle: LightningModelBundle) -> None:
+        """Copy the datamodule's fitted input statistics onto the model, when both support it.
+
+        Both sides are optional on purpose: the graph datamodule and SoilGraphLightningModule do not
+        implement this pair, and a model that cannot carry the state should train exactly as before
+        rather than fail.
+        """
+        state_source = getattr(bundle.datamodule, "preprocessing_state", None)
+        attach = getattr(bundle.model, "attach_preprocessing_state", None)
+        if not callable(state_source) or not callable(attach):
+            return
+        attach(state_source())
 
     def _build_trainer(self, bundle: LightningModelBundle):
         lightning = self._get_lightning_module()

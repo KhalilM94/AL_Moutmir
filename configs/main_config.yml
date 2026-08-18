@@ -3,14 +3,14 @@ common:
   data:
     root: "/home/kmisbah/CESBIO/AL_Moutmir/Soil_Datasets/soil_dataset_20251118_140815"
     # Static features. Targets may live in this same file (joint) or be listed separately below.
-    static: 'Morocco_roadsafe_6k_with_ts_features_and_covariates_V_160726.csv'
-    
+    static: 'Morocco_Static_Covariates_Processed_V_110826.csv'
+    # static: "Morocco_roadsafe_6k_with_ts_features_and_covariates_V_110826.csv"
     # Omit / leave null when `static` is a joint file that already carries the target columns.
     # Lab targets live in their own file; lat/lon are carried across from it on the join.
-    # targets: 'Morocco_soil_targets_uuid_roadsafe_6ksample_V_160726.csv'
+    targets: 'Morocco_soil_targets_uuid_roadsafe_6ksample_V_110826.csv'
     
     # Time-series always arrives separately: a single file, or a folder of per-modality shards.
-    # timeseries: 'Morocco_Soil_Predictors_2017_2025_TS_with_indices_V_160726_Copy.csv'
+    timeseries: 'Morocco_Soil_Predictors_2017_2025_TS_with_indices_V_110826.csv'
     # Optional index.json listing exact paths per source (static_features / targets / timeseries).
     manifest: null
   POINT_ID_COLUMN: "uuid"
@@ -31,10 +31,54 @@ common:
     time_column: "observation_date"
     modality_prefix_map:
       s2: "S2_"
-      s1: "S1_"
+      s1_asc: "S1_asc_"
+      s1_dsc: "S1_desc_"
       soil: "SOIL_"
       ag: "AG_"
       clim: "CLIM_"
   MAIN_FILE_LOGGING_ENABLED: true
   MLFLOW_EXPERIMENT_EXPORT_ENABLED: false
   MLFLOW_EXPERIMENT_EXPORT_PATH: "mlflow_exports"
+
+  # --- MLflow tracking -------------------------------------------------------
+  # Empty means <repo>/mlruns. An experiment's artifact_location is an ABSOLUTE path fixed when the
+  # experiment is created, so the original Soil_Model_Training_Experiment - created in a different
+  # checkout - has been writing its metadata and its artifacts to two different directories. This
+  # experiment is new, so MLflow derives a correct artifact_location under the tracking root below.
+  # Old runs are untouched and still readable; comparisons do not span the two.
+  MLFLOW_TRACKING_URI: ""
+  MLFLOW_EXPERIMENT_NAME: "Soil_Model_Training_v2"
+  # Register each fitted model as a new version of <target>_<model>, and move the `champion` alias
+  # onto it when its rmse_test beats the version currently aliased. Note the scope: an MLflow alias
+  # belongs to ONE registered name, so champion means "the best version of this model on this
+  # target", not "the best model for this target" - the leaderboard still decides between soil_cnn
+  # and XGBoost. false stops versions accumulating for throwaway experiments.
+  MLFLOW_REGISTER_MODELS: true
+
+  # --- Explainability (SHAP) ------------------------------------------------
+  # EXPLAIN_ENABLED is the master switch. false skips every explainer and writes no explain/
+  # artifacts; training, metrics and every other artifact are untouched, and shap is never
+  # imported. Every key here is also settable as an environment variable of the same name.
+  EXPLAIN_ENABLED: false
+  # Test rows explained. Subsampled deterministically from RANDOM_SEED when the split is larger.
+  EXPLAIN_MAX_SAMPLES: 500
+  # Reference rows the explainer integrates against. Larger is more stable and slower.
+  EXPLAIN_BACKGROUND_SAMPLES: 100
+  # Rows drawn in the beeswarm and bar plots. The full unranked table is always written to
+  # explain/shap_values.parquet, so this caps the picture and never the data.
+  EXPLAIN_MAX_DISPLAY: 25
+  # Ceiling on model evaluations for the model-agnostic explainer. Tree and linear models are exact
+  # and cheap and ignore this; anything else (TabICL) is estimated first and SKIPPED with the reason
+  # recorded in meta/run_summary.json when it would cost more. Raise it to explain an expensive
+  # model deliberately, ideally together with a smaller EXPLAIN_MAX_SAMPLES.
+  EXPLAIN_MAX_EVALS: 200000
+  # [] explains every trained model. Name registry entries to restrict it, e.g. ["XGBoost"].
+  EXPLAIN_MODELS: []
+  # Never explained unless EXPLAIN_MODELS names them explicitly (an allowlist entry wins over this).
+  # TabICL is an in-context learner: a single prediction re-processes the training set, measured at
+  # ~13 ms/row against microseconds for a tree, which puts its SHAP run at 13-80 minutes.
+  # EXPLAIN_MAX_EVALS counts evaluations and cannot price that, so the exclusion is by name.
+  # For reference, XGBoost on the same data measures ~28 s and stays enabled.
+  EXPLAIN_SKIP_MODELS: ["TabICL"]
+  # false records an explainer failure in meta/run_summary_*.json and keeps the training run.
+  EXPLAIN_FAIL_ON_ERROR: false

@@ -502,3 +502,31 @@ def test_an_entry_cannot_mutate_the_defaults_for_the_next_one(base_config_paths:
     registry["overrider"]["callbacks"]["checkpoint"]["save_top_k"] = 99
 
     assert registry["inheritor"]["callbacks"]["checkpoint"]["save_top_k"] == 1
+
+
+def test_explain_switch_defaults_to_on(base_config_paths: dict) -> None:
+    config = Config(**base_config_paths)
+
+    assert config.EXPLAIN_ENABLED is True
+    assert isinstance(config.EXPLAIN_MAX_SAMPLES, int)
+    assert isinstance(config.EXPLAIN_BACKGROUND_SAMPLES, int)
+    assert isinstance(config.EXPLAIN_MAX_DISPLAY, int)
+    assert config.EXPLAIN_MODELS == []
+    assert config.EXPLAIN_FAIL_ON_ERROR is False
+
+
+def test_explain_switch_honours_an_env_override(
+    monkeypatch: pytest.MonkeyPatch, base_config_paths: dict
+) -> None:
+    """_get_config coerces an env override to the type of the DEFAULT.
+
+    Declaring EXPLAIN_ENABLED with a bool default is what makes `EXPLAIN_ENABLED=false python
+    main.py` actually disable SHAP, rather than arriving as the truthy string "false".
+    """
+    monkeypatch.setenv("EXPLAIN_ENABLED", "false")
+    monkeypatch.setenv("EXPLAIN_MAX_SAMPLES", "50")
+
+    config = Config(**base_config_paths)
+
+    assert config.EXPLAIN_ENABLED is False
+    assert config.EXPLAIN_MAX_SAMPLES == 50

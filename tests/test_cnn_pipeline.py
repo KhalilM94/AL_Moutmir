@@ -36,7 +36,12 @@ def _times(dates) -> torch.Tensor:
     return torch.as_tensor(to_decimal_year(pd.Series(pd.to_datetime(dates)))).unsqueeze(0)
 
 
-def _batch(batch_size=4, length=24, channels=3, seed=0, start="2019-01-01", months_step=1, year_offset=0):
+LABEL_NAMES = ["lab_a", "lab_b", "lab_c"]
+
+
+def _batch(
+    batch_size=4, length=24, channels=3, seed=0, start="2019-01-01", months_step=1, year_offset=0, labels=3
+):
     generator = torch.Generator().manual_seed(seed)
     dates = pd.date_range(start, periods=length, freq=f"{months_step}MS")
     if year_offset:
@@ -49,6 +54,10 @@ def _batch(batch_size=4, length=24, channels=3, seed=0, start="2019-01-01", mont
         "sequence_mask": {"m": torch.ones(batch_size, length, dtype=torch.bool)},
         "sequence_time": {"m": times},
         "sequence_validity": {"m": torch.ones(batch_size, length, channels, dtype=torch.bool)},
+        # Appended last so the generator draws above keep their values and every existing
+        # expectation in this file still holds.
+        "x_labels": torch.randn(batch_size, labels, generator=generator),
+        "x_label_validity": torch.ones(batch_size, labels, dtype=torch.bool),
     }
 
 
@@ -443,6 +452,130 @@ def test_module_runs_without_static_features() -> None:
     assert torch.isfinite(predictions).all()
 
 
+# --- auxiliary lab columns ---------------------------------------------------
+
+
+def _auxiliary_module(**kwargs) -> SoilCNNLightningModule:
+    defaults = dict(
+        target_names=["target_a"],
+        auxiliary_available_names=LABEL_NAMES,
+        auxiliary_label_columns=["lab_a", "lab_c"],
+    )
+    defaults.update(kwargs)
+    return _module("dilated_tempcnn", **defaults)
+
+
+def test_a_selected_lab_column_reaches_the_head_and_an_unselected_one_does_not() -> None:
+    """The whole point of the feature, and the guard that selection is by position not by luck."""
+    module = _auxiliary_module()
+    batch = _batch()
+    baseline = module(batch)
+
+    for column, expected_change in (("lab_a", True), ("lab_b", False), ("lab_c", True)):
+        perturbed = {**batch, "x_labels": batch["x_labels"].clone()}
+        perturbed["x_labels"][:, LABEL_NAMES.index(column)] += 5.0
+        changed = not torch.allclose(module(perturbed), baseline, atol=1e-6)
+        assert changed is expected_change, f"{column} should{'' if expected_change else ' not'} affect the head"
+
+
+def test_validity_flags_reach_the_head_too() -> None:
+    module = _auxiliary_module()
+    batch = _batch()
+
+    flipped = {**batch, "x_label_validity": batch["x_label_validity"].clone()}
+    flipped["x_label_validity"][:, LABEL_NAMES.index("lab_a")] = False
+
+    assert not torch.allclose(module(flipped), module(batch), atol=1e-6)
+
+
+def test_validity_channels_can_be_switched_off() -> None:
+    module = _auxiliary_module(auxiliary_validity_channels=False)
+    batch = _batch()
+
+    flipped = {**batch, "x_label_validity": torch.zeros_like(batch["x_label_validity"])}
+    assert torch.allclose(module(flipped), module(batch), atol=1e-6)
+    # Two selected columns, no flags -> the raw branch is 2 wide rather than 4.
+    assert module.auxiliary_output_dim == 2
+
+
+def test_selecting_a_column_that_is_also_a_target_is_refused() -> None:
+    """A filter would be worse than an error: the run would train a model that reads its answer."""
+    with pytest.raises(ValueError, match="may not name a column being fitted"):
+        _auxiliary_module(
+            target_names=["target_a", "lab_c"],
+            auxiliary_available_names=[*LABEL_NAMES, "target_a"],
+            auxiliary_label_columns=["lab_a", "lab_c"],
+        )
+
+
+def test_selecting_an_unknown_column_names_what_is_available() -> None:
+    with pytest.raises(ValueError, match=r"does not carry.*lab_zzz"):
+        _auxiliary_module(auxiliary_label_columns=["lab_a", "lab_zzz"])
+
+
+def test_selecting_a_duplicate_column_is_refused() -> None:
+    with pytest.raises(ValueError, match="duplicate column"):
+        _auxiliary_module(auxiliary_label_columns=["lab_a", "lab_a"])
+
+
+def test_auxiliary_columns_without_target_names_are_refused() -> None:
+    """Skipping the leakage check silently is exactly the failure this feature could cause."""
+    with pytest.raises(ValueError, match="requires target_names"):
+        _auxiliary_module(target_names=[])
+
+
+def test_raw_concat_widens_the_head_by_the_column_count() -> None:
+    module = _auxiliary_module(auxiliary_hidden_dims=[])
+    head_input = next(layer for layer in module.output_head.modules() if isinstance(layer, torch.nn.Linear))
+
+    # 2 selected columns + 2 validity flags, appended straight onto the fused vector.
+    assert module.auxiliary_output_dim == 4
+    assert isinstance(module.auxiliary_encoder, torch.nn.Identity)
+    assert head_input.in_features == module.fusion.output_dim + 4
+
+
+def test_an_encoder_width_decouples_the_head_from_the_column_count() -> None:
+    module = _auxiliary_module(auxiliary_hidden_dims=[16, 8])
+    head_input = next(layer for layer in module.output_head.modules() if isinstance(layer, torch.nn.Linear))
+
+    assert module.auxiliary_output_dim == 8
+    assert head_input.in_features == module.fusion.output_dim + 8
+
+
+def test_no_auxiliary_columns_leaves_the_architecture_untouched() -> None:
+    """The default must be byte-for-byte the model that existed before this feature."""
+    plain = _module("dilated_tempcnn")
+    head_input = next(layer for layer in plain.output_head.modules() if isinstance(layer, torch.nn.Linear))
+
+    assert plain.has_auxiliary_labels is False
+    assert plain.auxiliary_output_dim == 0
+    assert head_input.in_features == plain.fusion.output_dim
+    # No target_names needed, and a batch without the lab keys still runs.
+    batch = {key: value for key, value in _batch().items() if not key.startswith("x_label")}
+    assert torch.isfinite(plain(batch)).all()
+
+
+def test_a_batch_that_no_longer_matches_the_label_roster_is_refused() -> None:
+    """Positions were resolved at build time; a narrower batch would read a different measurement."""
+    module = _auxiliary_module()
+    batch = _batch(labels=2)
+
+    with pytest.raises(ValueError, match="no longer matches the checkpoint's label roster"):
+        module(batch)
+
+
+def test_auxiliary_selection_survives_a_weights_only_checkpoint_round_trip(tmp_path: Path) -> None:
+    module = _auxiliary_module(auxiliary_hidden_dims=[16])
+    checkpoint_path = tmp_path / "auxiliary.ckpt"
+    torch.save({"state_dict": module.state_dict(), "hyper_parameters": dict(module.hparams)}, checkpoint_path)
+
+    loaded = torch.load(checkpoint_path, weights_only=True)
+    assert loaded["hyper_parameters"]["auxiliary_label_columns"] == ["lab_a", "lab_c"]
+    assert loaded["hyper_parameters"]["auxiliary_available_names"] == LABEL_NAMES
+    # The resolved positions travel with the weights rather than being re-derived on load.
+    assert loaded["state_dict"]["auxiliary_index"].tolist() == [0, 2]
+
+
 @pytest.mark.parametrize("encoder", ENCODERS)
 def test_module_checkpoint_reloads_under_weights_only(tmp_path: Path, encoder: str) -> None:
     module = _module(encoder, target_mean=np.array([2.0]), target_scale=np.array([0.75]))
@@ -459,7 +592,13 @@ def test_module_checkpoint_reloads_under_weights_only(tmp_path: Path, encoder: s
 # --- data path -------------------------------------------------------------
 
 
-def _write_csvs(tmp_path: Path, dates_by_point):
+def _write_csvs(tmp_path: Path, dates_by_point, split: bool = False):
+    """Write the fixture as one joint file, or as separate static and targets files.
+
+    `split` is not decoration: the targets join used to carry only the ACTIVE targets, so the two
+    layouts disagreed about which lab columns a model could select from the very same declaration.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
     point_ids = sorted(dates_by_point)
     static_df = pd.DataFrame(
         {
@@ -468,8 +607,21 @@ def _write_csvs(tmp_path: Path, dates_by_point):
             "lon": [0.1 * index for index in range(len(point_ids))],
             "target_a": [1.0 + index for index in range(len(point_ids))],
             "static_1": [10.0 + index for index in range(len(point_ids))],
+            # Measured lab values: named in LABEL_COLUMNS so they are never features, but carried
+            # on the bundle so a model may opt into them. lab_sparse is deliberately incomplete.
+            "lab_dense": [100.0 + 10.0 * index for index in range(len(point_ids))],
+            "lab_sparse": [
+                np.nan if index % 2 else 5.0 + index for index in range(len(point_ids))
+            ],
         }
     )
+    targets_df = static_df
+    if split:
+        # The lab values live with the targets, which is where a real targets file keeps them.
+        lab_columns = ["point_id", "target_a", "lab_dense", "lab_sparse"]
+        targets_df = static_df[lab_columns]
+        static_df = static_df.drop(columns=[column for column in lab_columns if column != "point_id"])
+
     rows = []
     for point_id, dates in dates_by_point.items():
         for index, date in enumerate(dates):
@@ -482,13 +634,16 @@ def _write_csvs(tmp_path: Path, dates_by_point):
                 }
             )
     static_path, timeseries_path = tmp_path / "static.csv", tmp_path / "ts.csv"
+    targets_path = tmp_path / "targets.csv" if split else static_path
     static_df.to_csv(static_path, index=False)
+    if split:
+        targets_df.to_csv(targets_path, index=False)
     pd.DataFrame(rows).to_csv(timeseries_path, index=False)
-    return static_path, timeseries_path
+    return static_path, timeseries_path, targets_path
 
 
-def _bundle(tmp_path: Path, logger, dates_by_point):
-    static_path, timeseries_path = _write_csvs(tmp_path, dates_by_point)
+def _bundle(tmp_path: Path, logger, dates_by_point, carry_labels: bool = True, split: bool = False):
+    static_path, timeseries_path, targets_path = _write_csvs(tmp_path, dates_by_point, split=split)
     config = SimpleNamespace(
         DATA_FOLDER=str(tmp_path),
         DATA_FILE="static.csv",
@@ -505,7 +660,8 @@ def _bundle(tmp_path: Path, logger, dates_by_point):
         S2_COLUMNS=[],
         MODIS_COLUMNS=[],
         TARGET_COLUMNS=["target_a"],
-        LABEL_COLUMNS=["target_a"],
+        LABEL_COLUMNS=["target_a", "lab_dense", "lab_sparse"],
+        CARRY_LABEL_COLUMNS=carry_labels,
         PREDICTOR_COLUMNS=[],
         IGNORED_COLUMNS=["point_id", "lat", "lon"],
         ELIMINATED_FEATURES=["point_id", "lat", "lon"],
@@ -521,8 +677,8 @@ def _bundle(tmp_path: Path, logger, dates_by_point):
         STATIC_FEATURES_FOLDER=None,
         TARGETS_FOLDER=None,
         TIMESERIES_FOLDER=None,
-        TARGETS_FILE="static.csv",
-        TARGETS_CSV_PATH=str(static_path),
+        TARGETS_FILE=targets_path.name,
+        TARGETS_CSV_PATH=str(targets_path),
     )
     return SoilSequenceBuilder(config, logger, DataManager(config, logger)).build()
 
@@ -580,6 +736,194 @@ def test_standardization_ignores_median_filled_cells(tmp_path: Path, logger) -> 
         ]
     )
     np.testing.assert_allclose(datamodule.sequence_mean_["s2"][1], measured.mean(), rtol=1e-5)
+
+
+def test_label_columns_travel_on_the_bundle_without_becoming_features(tmp_path: Path, logger) -> None:
+    bundle = _bundle(
+        tmp_path,
+        logger,
+        {1: ["2022-01-01", "2022-02-01"], 2: ["2022-01-01"], 3: ["2022-03-01"]},
+    )
+
+    # Every LABEL_COLUMNS entry the frame carries, target included - selection happens in the model.
+    assert bundle.label_feature_names == ["target_a", "lab_dense", "lab_sparse"]
+    assert bundle.label_dim == 3
+    # ...and none of them leaked into the predictors.
+    assert bundle.static_feature_names == ["static_1"]
+    # NaN is preserved at build time: the fill value is a train-split median and the split does not
+    # exist yet.
+    assert bundle.label_missing_fraction("lab_sparse") > 0
+    assert bundle.label_missing_fraction("lab_dense") == 0
+    assert not np.isfinite(bundle.label_features[:, 2]).all()
+
+
+def test_a_split_targets_file_offers_the_same_lab_columns_as_a_joint_one(tmp_path: Path, logger) -> None:
+    """The regression: the join used to carry only the ACTIVE targets, so the same LABEL_COLUMNS
+    declaration meant 3 selectable columns on a joint file and 1 on split files."""
+    dates = {1: ["2022-01-01", "2022-02-01"], 2: ["2022-01-01"], 3: ["2022-03-01"]}
+    joint = _bundle(tmp_path / "joint", logger, dates)
+    split = _bundle(tmp_path / "split", logger, dates, split=True)
+
+    assert split.label_feature_names == joint.label_feature_names == ["target_a", "lab_dense", "lab_sparse"]
+    np.testing.assert_array_equal(
+        np.isfinite(split.label_features), np.isfinite(joint.label_features)
+    )
+    # The join must not have promoted anything: features come from filter_schema either way.
+    assert split.static_feature_names == joint.static_feature_names == ["static_1"]
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_the_carry_flag_off_leaves_no_lab_columns_on_the_bundle(tmp_path: Path, logger, split: bool) -> None:
+    bundle = _bundle(
+        tmp_path,
+        logger,
+        {1: ["2022-01-01", "2022-02-01"], 2: ["2022-01-01"], 3: ["2022-03-01"]},
+        carry_labels=False,
+        split=split,
+    )
+
+    assert bundle.label_feature_names == []
+    assert bundle.label_dim == 0
+    # Everything else is untouched, so a run that never opted in is unaffected.
+    assert bundle.static_feature_names == ["static_1"]
+    assert bundle.target_names == ["target_a"]
+
+
+def test_the_carry_flag_off_produces_batches_without_lab_values(tmp_path: Path, logger) -> None:
+    bundle = _bundle(
+        tmp_path,
+        logger,
+        {1: ["2022-01-01", "2022-02-01"], 2: ["2022-01-01"], 3: ["2022-03-01"]},
+        carry_labels=False,
+    )
+    datamodule = SoilSequenceDataModule(bundle, batch_size=3, val_size=0.0, test_size=0.0)
+    datamodule.setup("fit")
+
+    batch = datamodule._collate_points(np.arange(3))
+    assert datamodule.label_feature_names == []
+    assert batch["x_labels"].shape == (3, 0)
+    assert datamodule.label_median_ is None
+
+
+def test_selecting_a_column_with_nothing_carried_names_the_flag(tmp_path: Path, logger) -> None:
+    """The message the failing run should have shown: the config was right, the flag was off."""
+    bundle = _bundle(
+        tmp_path,
+        logger,
+        {1: ["2022-01-01", "2022-02-01"], 2: ["2022-01-01"], 3: ["2022-03-01"]},
+        carry_labels=False,
+    )
+    datamodule = SoilSequenceDataModule(bundle, batch_size=3, val_size=0.0, test_size=0.0)
+    datamodule.setup("fit")
+
+    with pytest.raises(ValueError, match="CARRY_LABEL_COLUMNS"):
+        SoilCNNLightningModule(
+            static_dim=datamodule.static_dim,
+            target_dim=datamodule.target_dim,
+            target_names=datamodule.target_names,
+            modality_dims=datamodule.modality_dims,
+            auxiliary_available_names=datamodule.label_feature_names,
+            auxiliary_label_columns=["lab_dense"],
+        )
+
+
+def test_lab_values_reach_the_batch_standardized_with_validity(tmp_path: Path, logger) -> None:
+    bundle = _bundle(
+        tmp_path,
+        logger,
+        {1: ["2022-01-01", "2022-02-01"], 2: ["2022-01-01"], 3: ["2022-03-01"]},
+    )
+    datamodule = SoilSequenceDataModule(bundle, batch_size=3, val_size=0.0, test_size=0.0)
+    datamodule.setup("fit")
+
+    assert datamodule.label_feature_names == ["target_a", "lab_dense", "lab_sparse"]
+    batch = datamodule._collate_points(np.arange(3))
+
+    assert batch["x_labels"].shape == (3, 3)
+    assert batch["x_label_validity"].dtype == torch.bool
+    # Filling happens, but never silently: the flag is what tells a fill from a measurement.
+    sparse_valid = batch["x_label_validity"][:, 2]
+    assert not bool(sparse_valid.all())
+    assert torch.isfinite(batch["x_labels"]).all()
+
+
+def test_lab_fill_and_scaling_come_from_the_train_split_only(tmp_path: Path, logger) -> None:
+    """A median fitted over val/test would leak their distribution into every filled cell."""
+    bundle = _bundle(
+        tmp_path,
+        logger,
+        {point: ["2022-01-01", "2022-02-01"] for point in range(1, 9)},
+    )
+    datamodule = SoilSequenceDataModule(bundle, batch_size=2, val_size=0.25, test_size=0.25, seed=5)
+    datamodule.setup("fit")
+
+    column = bundle.label_feature_names.index("lab_sparse")
+    train_values = bundle.label_features[datamodule.train_idx_, column]
+    measured = train_values[np.isfinite(train_values)]
+
+    assert measured.size and measured.size < train_values.size
+    np.testing.assert_allclose(datamodule.label_median_[column], np.median(measured), rtol=1e-5)
+
+
+def test_a_lab_column_with_no_measured_train_value_stays_inert(tmp_path: Path, logger) -> None:
+    bundle = _bundle(
+        tmp_path,
+        logger,
+        {1: ["2022-01-01", "2022-02-01"], 2: ["2022-01-01"], 3: ["2022-03-01"]},
+    )
+    column = bundle.label_feature_names.index("lab_sparse")
+    bundle.label_features[:, column] = np.nan
+
+    datamodule = SoilSequenceDataModule(bundle, batch_size=3, val_size=0.0, test_size=0.0)
+    datamodule.setup("fit")
+    batch = datamodule._collate_points(np.arange(3))
+
+    # Nothing to fill from, so it becomes a constant the model can only ignore - not a NaN, and not
+    # a fabricated centre.
+    assert datamodule.label_median_[column] == 0.0
+    assert torch.isfinite(batch["x_labels"]).all()
+    assert not bool(batch["x_label_validity"][:, column].any())
+
+
+def test_builder_to_cnn_module_with_auxiliary_labels_end_to_end(tmp_path: Path, logger) -> None:
+    from lightning.pytorch import Trainer
+
+    dates = [f"20{year:02d}-{month:02d}-01" for year in range(19, 23) for month in range(1, 13)]
+    bundle = _bundle(tmp_path, logger, {point: dates[: 20 + 4 * point] for point in range(1, 9)})
+    datamodule = SoilSequenceDataModule(bundle, batch_size=2, val_size=0.4, test_size=0.25, seed=5)
+    datamodule.setup("fit")
+
+    module = SoilCNNLightningModule(
+        static_dim=datamodule.static_dim,
+        target_dim=datamodule.target_dim,
+        target_names=datamodule.target_names,
+        modality_dims=datamodule.modality_dims,
+        grid_years=datamodule.grid_years,
+        temporal_encoder="annual_grid2d",
+        cnn_norm="group",
+        auxiliary_available_names=datamodule.label_feature_names,
+        auxiliary_label_columns=["lab_dense", "lab_sparse"],
+        auxiliary_hidden_dims=[8],
+        target_mean=datamodule.target_mean_,
+        target_scale=datamodule.target_scale_,
+    )
+    assert module.auxiliary_index.tolist() == [1, 2]
+
+    trainer = Trainer(
+        max_epochs=2,
+        accelerator="cpu",
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+    )
+    trainer.fit(module, datamodule=datamodule)
+
+    # The sparse column is partly train-median filled, so this also pins that the fill path does not
+    # produce a NaN loss.
+    assert torch.isfinite(torch.as_tensor(trainer.callback_metrics["train_loss"]))
+    predicted = torch.cat(trainer.predict(module, datamodule=datamodule)).reshape(-1)
+    assert torch.isfinite(predicted).all()
 
 
 def test_builder_to_cnn_module_end_to_end(tmp_path: Path, logger) -> None:

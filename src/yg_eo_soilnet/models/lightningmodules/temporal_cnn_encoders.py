@@ -102,6 +102,30 @@ class CalendarGridRasterizer(nn.Module):
             channels += 2
         return channels
 
+    def channel_layout(self) -> dict[str, list[int]]:
+        """Which output channel index carries what, in the order ``forward`` writes them.
+
+        Defined here rather than reconstructed by callers because this class is the only thing that
+        decides the order, and an explainer that guessed it wrong would attribute a band's
+        importance to a different band - a mistake that produces a plausible-looking plot instead of
+        an error. The keys mirror the class docstring: ``values`` then ``validity`` then the
+        cell-observed flag then the optional month sin/cos pair.
+        """
+        layout: dict[str, list[int]] = {"values": list(range(self.num_channels))}
+        cursor = self.num_channels
+
+        if self.use_validity_channels:
+            layout["validity"] = list(range(cursor, cursor + self.num_channels))
+            cursor += self.num_channels
+        else:
+            layout["validity"] = []
+
+        layout["cell_observed"] = [cursor]
+        cursor += 1
+
+        layout["month_positional"] = list(range(cursor, cursor + 2)) if self.month_positional else []
+        return layout
+
     def resolve_grid_years(self, times: torch.Tensor, mask: torch.Tensor) -> int:
         """The configured span, or the batch's own longest history when none was configured."""
         if self.grid_years is not None:

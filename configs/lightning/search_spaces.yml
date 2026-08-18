@@ -167,7 +167,7 @@ soil_cnn:
     datamodule.batch_size: {type: categorical, choices: [16, 32, 64]}
 
   derive:
-    - dims_pyramid: {key: model.head_hidden_dims,   min_depth: 0, max_depth: 3,
+    - dims_pyramid: {key: model.head_hidden_dims,   min_depth: 0, max_depth: 5,
                      widths: [32, 64, 128, 256], taper: 0.5, floor: 8}
     - dims_pyramid: {key: model.static_hidden_dims, min_depth: 1, max_depth: 5,
                      widths: [32, 64, 128, 256], taper: 1.0}
@@ -175,3 +175,9 @@ soil_cnn:
     # num_blocks x cnn_hidden_dim sweep covered. Raise it to 2.0 to search a widening stack.
     - dims_pyramid: {key: model.cnn_hidden_dims,    min_depth: 1, max_depth: 5,
                      widths: [16, 32, 64, 128, 256], taper: 1.0}
+    # min_depth 0 keeps raw concat reachable: an empty list IS the pass-through mode, so this one
+    # knob searches across "append the lab values as they are" and "encode them first". Inert while
+    # auxiliary_label_columns is empty, since the branch is not built at all then.
+    
+    # - dims_pyramid: {key: model.auxiliary_hidden_dims, min_depth: 0, max_depth: 2,
+                    #  widths: [16, 32, 64], taper: 1.0}

@@ -39,8 +39,8 @@ XGBoost:
     tree_method: "hist" 
     # device: "cuda"
   params:
-    model__n_estimators: [100, 150, 200]
-    model__max_depth: [6, 8, 10] # 3, 4, 5, 6, 7, 8, 9, 10, 
+    model__n_estimators: [50]
+    model__max_depth: [6] # 3, 4, 5, 6, 7, 8, 9, 10, 
     model__learning_rate: [0.05]
     # model__subsample: [0.8]
     # model__reg_alpha: [0, 0.1, 1]
@@ -51,7 +51,7 @@ XGBoost:
 TabICL:
   # Pretrained tabular foundation model: fit() does in-context learning, it does not train weights.
   # First fit downloads tabicl-regressor-v2-*.ckpt from the HuggingFace hub.
-  enabled: true
+  enabled: false
   modeltype: "ml"
   import_path: tabicl.TabICLRegressor
   # Each worker loads the full checkpoint, so the default -1 would fan that out over every CV fold

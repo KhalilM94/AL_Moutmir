@@ -102,4 +102,14 @@ filterwarnings = [
     # Optuna marks its matplotlib plotting helpers experimental. They are the only backend we can
     # use (the default one needs plotly, which is not installed), so the warning is not actionable.
     "ignore::optuna.exceptions.ExperimentalWarning",
+    # shap 0.48 builds its colormaps with the pre-3.11 matplotlib API. Raised at import time, from
+    # library code we do not control, and unrelated to anything this project calls.
+    "ignore:The set_bad function will be deprecated:PendingDeprecationWarning",
+    "ignore:The set_over function will be deprecated:PendingDeprecationWarning",
+    "ignore:The set_under function will be deprecated:PendingDeprecationWarning",
+    # mlflow.pyfunc emits these from its OWN module-level code the moment it is imported - they are
+    # about mlflow's type-hint-based validation, which the sequence pyfunc does not use (its schema
+    # comes from an explicit signature built from a real input example).
+    "ignore:.*Any type hint is inferred as AnyType.*:UserWarning",
+    "ignore:.*Union type hint with multiple non-None types.*:UserWarning",
 ]

@@ -87,6 +87,23 @@ soil_cnn:
     month_positional: false             # sin/cos month channels; without them pooling loses position
     use_validity_channels: true         # per-channel measured-vs-median-filled flags
 
+    # --- measured lab values as extra inputs (OFF by default) ---
+    # Appends already-measured soil properties to the fused vector, just before the head. This is a
+    # deliberate opt-out of the rule that a LABEL_COLUMNS entry is never a feature, so it is only
+    # sound when the named values are genuinely measured at prediction time too - e.g. predicting
+    # organic matter for a sample whose texture and pH came back from the lab. Naming a column that
+    # is also in TARGET_COLUMNS raises rather than being quietly dropped.
+    # Missing values are filled from the TRAIN-split median and flagged; a column like mgo_ppm is
+    # ~32% absent, so check the builder's startup log before selecting one.
+    auxiliary_label_columns: []         # e.g. [clay_pct, ph_water]; [] disables the branch entirely
+    auxiliary_available_names: auto     # the roster the names resolve against; recorded in hparams
+    auxiliary_validity_channels: true   # per-column measured-vs-filled flags, doubling the width
+    # [] = concat the standardized values straight onto the fused vector. A non-empty list inserts
+    # Linear/LayerNorm/GELU blocks of those widths first, so a handful of lab columns cannot be
+    # swamped by a 384-wide fused vector - and the head's width stops tracking the column count.
+    auxiliary_hidden_dims: []
+    auxiliary_dropout: 0.0              # only applies inside those blocks
+
     static_hidden_dims: [64]            # one width per block; [128, 64] deepens the static branch
     # Widths per block, then the readout: 384 -> 64 -> 1. GELU per block; LayerNorm on every block
     # EXCEPT the one feeding the readout, so a single-layer head like this one carries no norm at

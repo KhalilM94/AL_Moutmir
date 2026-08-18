@@ -119,11 +119,11 @@ def set_hpo_experiment(name: str = HPO_EXPERIMENT_NAME) -> None:
     which auto-starts a run in whatever experiment is current. Leaving that as Default drops the
     split artifacts into experiment 0.
     """
-    try:
-        mlflow.set_experiment(name)
-    except mlflow.exceptions.MlflowException:  # pragma: no cover - only on a deleted experiment
-        mlflow.create_experiment(name)
-        mlflow.set_experiment(name)
+    from yg_eo_soilnet.tracking import configure_tracking
+
+    # Through configure_tracking so HPO records into the same tracking root as training, and so the
+    # MLflow 3.14 file-store opt-in is applied here too rather than depending on the launcher.
+    configure_tracking(experiment_name=name)
     if mlflow.active_run():
         mlflow.end_run()
 

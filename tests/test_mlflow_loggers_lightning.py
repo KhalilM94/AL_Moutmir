@@ -2,13 +2,26 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from pathlib import Path
 
+import mlflow.pyfunc
+import mlflow.pytorch
 import pandas as pd
 
 import yg_eo_soilnet.logger.mlflow_loggers as mlflow_loggers_module
 from yg_eo_soilnet.logger.mlflow_loggers import ChildRunLogger, ParentRunLogger
 
 
-def test_log_lightning_child_run_logs_metrics_artifacts_and_tags(monkeypatch) -> None:
+def _checkpoint(tmp_path) -> Path:
+    """A checkpoint file that actually exists.
+
+    The logger copies the best checkpoint to a stable `best.ckpt` name rather than uploading the
+    path it was handed, so these tests need a real file on disk.
+    """
+    path = tmp_path / "epoch=7-step=42.ckpt"
+    path.write_bytes(b"fake-checkpoint")
+    return path
+
+
+def test_log_lightning_child_run_logs_metrics_artifacts_and_tags(monkeypatch, tmp_path) -> None:
     logger = ChildRunLogger()
 
     set_tags = MagicMock()
@@ -21,7 +34,8 @@ def test_log_lightning_child_run_logs_metrics_artifacts_and_tags(monkeypatch) ->
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_params", log_params)
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_metric", log_metric)
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_artifact", log_artifact)
-    monkeypatch.setattr(mlflow_loggers_module.mlflow.pytorch, "log_model", log_model)
+    monkeypatch.setattr(mlflow.pyfunc, "log_model", log_model)
+    monkeypatch.setattr(mlflow.pytorch, "save_model", MagicMock())
     monkeypatch.setattr(logger, "_log_plots", MagicMock())
 
     fake_model = SimpleNamespace()
@@ -43,13 +57,14 @@ def test_log_lightning_child_run_logs_metrics_artifacts_and_tags(monkeypatch) ->
         }),
         validation_metrics={"val_loss": 0.5},
         test_metrics={"test_loss": 0.4},
-        best_model_path="/tmp/best.ckpt",
+        best_model_path=str(_checkpoint(tmp_path)),
         extra_params={"foo": "bar"},
         plot_functions={},
         model=fake_model,
     )
 
-    set_tags.assert_called_once()
+    # Two calls now: the run identity, then the checkpoint's original filename.
+    assert set_tags.call_count == 2
     log_params.assert_any_call({
         "LIGHTNING_BATCH_SIZE": 8,
         "LIGHTNING_VAL_SIZE": 0.2,
@@ -60,12 +75,24 @@ def test_log_lightning_child_run_logs_metrics_artifacts_and_tags(monkeypatch) ->
     })
     log_metric.assert_any_call("val_loss", 0.5)
     log_metric.assert_any_call("test_loss", 0.4)
-    log_artifact.assert_any_call("/tmp/best.ckpt", artifact_path="checkpoints")
+    # Logged under a STABLE leaf name, not Lightning's epoch=NN-step=MMM, so two runs of the
+    # same model produce the same artifact path and MLflow can compare them.
+    checkpoint_calls = [
+        call for call in log_artifact.call_args_list
+        if call.kwargs.get("artifact_path") == "checkpoints"
+    ]
+    assert len(checkpoint_calls) == 1
+    assert Path(checkpoint_calls[0].args[0]).name == "best.ckpt"
+    # The original name survives as a tag rather than in the path.
+    assert any(
+        c.args and c.args[0].get("checkpoint_filename") == "epoch=7-step=42.ckpt"
+        for c in set_tags.call_args_list
+    )
     assert any(call.kwargs.get("artifact_path") == "eval_results" for call in log_artifact.call_args_list)
     assert log_model.called
 
 
-def test_log_lightning_child_run_logs_split_summary_metrics(monkeypatch) -> None:
+def test_log_lightning_child_run_logs_split_summary_metrics(monkeypatch, tmp_path) -> None:
     logger = ChildRunLogger()
 
     set_tags = MagicMock()
@@ -78,7 +105,8 @@ def test_log_lightning_child_run_logs_split_summary_metrics(monkeypatch) -> None
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_params", log_params)
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_metric", log_metric)
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_artifact", log_artifact)
-    monkeypatch.setattr(mlflow_loggers_module.mlflow.pytorch, "log_model", log_model)
+    monkeypatch.setattr(mlflow.pyfunc, "log_model", log_model)
+    monkeypatch.setattr(mlflow.pytorch, "save_model", MagicMock())
     monkeypatch.setattr(logger, "_log_plots", MagicMock())
 
     bundle = SimpleNamespace(
@@ -108,7 +136,7 @@ def test_log_lightning_child_run_logs_split_summary_metrics(monkeypatch) -> None
         }),
         validation_metrics={"val_loss": 0.5},
         test_metrics={"test_loss": 0.4},
-        best_model_path="/tmp/best.ckpt",
+        best_model_path=str(_checkpoint(tmp_path)),
         extra_params={"foo": "bar"},
         plot_functions={},
         bundle=bundle,
@@ -121,7 +149,7 @@ def test_log_lightning_child_run_logs_split_summary_metrics(monkeypatch) -> None
     assert any(call.kwargs.get("artifact_path") == "eval_results" for call in log_artifact.call_args_list)
 
 
-def test_log_lightning_child_run_logs_architecture_dimensions(monkeypatch) -> None:
+def test_log_lightning_child_run_logs_architecture_dimensions(monkeypatch, tmp_path) -> None:
     logger = ChildRunLogger()
 
     set_tags = MagicMock()
@@ -134,7 +162,8 @@ def test_log_lightning_child_run_logs_architecture_dimensions(monkeypatch) -> No
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_params", log_params)
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_metric", log_metric)
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_artifact", log_artifact)
-    monkeypatch.setattr(mlflow_loggers_module.mlflow.pytorch, "log_model", log_model)
+    monkeypatch.setattr(mlflow.pyfunc, "log_model", log_model)
+    monkeypatch.setattr(mlflow.pytorch, "save_model", MagicMock())
     monkeypatch.setattr(logger, "_log_plots", MagicMock())
 
     model = SimpleNamespace(
@@ -189,7 +218,7 @@ def test_log_lightning_child_run_logs_architecture_dimensions(monkeypatch) -> No
         }),
         validation_metrics={"val_loss": 0.5},
         test_metrics={"test_loss": 0.4},
-        best_model_path="/tmp/best.ckpt",
+        best_model_path=str(_checkpoint(tmp_path)),
         extra_params={"foo": "bar"},
         plot_functions={},
         bundle=bundle,
@@ -214,7 +243,8 @@ def test_log_lightning_child_run_skips_pred_obs_for_multi_output(monkeypatch) ->
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_params", MagicMock())
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_metric", MagicMock())
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_artifact", log_artifact)
-    monkeypatch.setattr(mlflow_loggers_module.mlflow.pytorch, "log_model", log_model)
+    monkeypatch.setattr(mlflow.pyfunc, "log_model", log_model)
+    monkeypatch.setattr(mlflow.pytorch, "save_model", MagicMock())
 
     logger.log_lightning_child_run(
         config=SimpleNamespace(),
@@ -231,7 +261,7 @@ def test_log_lightning_child_run_skips_pred_obs_for_multi_output(monkeypatch) ->
     )
 
     eval_plot_calls = [
-        call for call in log_artifact.call_args_list if call.kwargs.get("artifact_path") == "eval_plots"
+        call for call in log_artifact.call_args_list if call.kwargs.get("artifact_path") == "plots"
     ]
     assert eval_plot_calls == []
 
@@ -346,10 +376,16 @@ def test_collect_eval_dfs_ignores_unlabeled_runs(monkeypatch) -> None:
     assert eval_dfs == []
 
 
-def test_log_lightning_pred_obs_artifact_uses_distinct_filenames_per_target(monkeypatch, tmp_path) -> None:
+def test_log_lightning_pred_obs_artifact_separates_targets_by_directory(monkeypatch, tmp_path) -> None:
+    """Two targets in one run must not overwrite each other - but they separate by DIRECTORY now.
+
+    They used to separate by filename (`..._target_a_soil_graph.png`), which kept them apart within
+    a run at the cost of giving every run a different artifact path, so MLflow's compare view found
+    nothing in common. Nesting under `plots/<target>/` keeps both properties.
+    """
     logger = ChildRunLogger()
 
-    logged_paths: list[str] = []
+    logged: list[tuple[str, str]] = []
 
     def fake_create_pred_obs_plot(eval_df, builtin_metrics, artifacts_dir):
         artifact = Path(artifacts_dir) / "obs_pred_and_residual_plot.png"
@@ -357,7 +393,7 @@ def test_log_lightning_pred_obs_artifact_uses_distinct_filenames_per_target(monk
         return {"obs_pred_and_residual_plot": str(artifact)}
 
     def fake_log_artifact(path, artifact_path=None):
-        logged_paths.append(path)
+        logged.append((path, artifact_path))
 
     monkeypatch.setattr(mlflow_loggers_module, "create_pred_obs_plot", fake_create_pred_obs_plot)
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_artifact", fake_log_artifact)
@@ -365,13 +401,40 @@ def test_log_lightning_pred_obs_artifact_uses_distinct_filenames_per_target(monk
     eval_a = pd.DataFrame({"target_a": [1.0, 2.0], "prediction": [1.1, 1.9]})
     eval_b = pd.DataFrame({"target_b": [3.0, 4.0], "prediction": [3.1, 3.9]})
 
-    assert logger._log_lightning_pred_obs_artifact(eval_a, target="target_a", model_name="soil_graph")
-    assert logger._log_lightning_pred_obs_artifact(eval_b, target="target_b", model_name="soil_graph")
+    assert logger._log_lightning_pred_obs_artifact(
+        eval_a, target="target_a", model_name="soil_graph", artifact_path="plots/target_a"
+    )
+    assert logger._log_lightning_pred_obs_artifact(
+        eval_b, target="target_b", model_name="soil_graph", artifact_path="plots/target_b"
+    )
 
-    assert len(logged_paths) == 2
-    assert logged_paths[0] != logged_paths[1]
-    assert "target_a" in Path(logged_paths[0]).name
-    assert "target_b" in Path(logged_paths[1]).name
+    assert len(logged) == 2
+    # Same stable leaf, different directory: distinct destinations, comparable across runs.
+    assert [Path(path).name for path, _ in logged] == ["pred_obs.png", "pred_obs.png"]
+    assert [artifact_path for _, artifact_path in logged] == ["plots/target_a", "plots/target_b"]
+
+
+def test_single_target_pred_obs_lands_on_the_flat_comparable_path(monkeypatch) -> None:
+    logger = ChildRunLogger()
+    logged: list[tuple[str, str]] = []
+
+    def fake_create_pred_obs_plot(eval_df, builtin_metrics, artifacts_dir):
+        artifact = Path(artifacts_dir) / "obs_pred_and_residual_plot.png"
+        artifact.write_text("plot", encoding="utf-8")
+        return {"obs_pred_and_residual_plot": str(artifact)}
+
+    monkeypatch.setattr(mlflow_loggers_module, "create_pred_obs_plot", fake_create_pred_obs_plot)
+    monkeypatch.setattr(
+        mlflow_loggers_module.mlflow,
+        "log_artifact",
+        lambda path, artifact_path=None: logged.append((path, artifact_path)),
+    )
+
+    frame = pd.DataFrame({"target_a": [1.0, 2.0], "prediction": [1.1, 1.9]})
+    assert logger._log_lightning_pred_obs_artifact(frame, target="target_a", model_name="soil_cnn")
+
+    assert logged == [(logged[0][0], "plots")]
+    assert Path(logged[0][0]).name == "pred_obs.png"
 
 
 def test_log_lightning_child_run_logs_pred_obs_for_single_target_frame(monkeypatch) -> None:
@@ -387,7 +450,8 @@ def test_log_lightning_child_run_logs_pred_obs_for_single_target_frame(monkeypat
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_params", log_params)
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_metric", log_metric)
     monkeypatch.setattr(mlflow_loggers_module.mlflow, "log_artifact", log_artifact)
-    monkeypatch.setattr(mlflow_loggers_module.mlflow.pytorch, "log_model", log_model)
+    monkeypatch.setattr(mlflow.pyfunc, "log_model", log_model)
+    monkeypatch.setattr(mlflow.pytorch, "save_model", MagicMock())
 
     logger.log_lightning_child_run(
         config=SimpleNamespace(),
@@ -405,7 +469,7 @@ def test_log_lightning_child_run_logs_pred_obs_for_single_target_frame(monkeypat
         model=SimpleNamespace(),
     )
 
-    assert any(call.kwargs.get("artifact_path") == "eval_plots" for call in log_artifact.call_args_list)
+    assert any(call.kwargs.get("artifact_path") == "plots" for call in log_artifact.call_args_list)
 
 # --- architecture introspection over real modules ---------------------------
 # The fakes above use SimpleNamespace(in_features=...), which hides the case that actually

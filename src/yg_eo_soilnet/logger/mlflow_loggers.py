@@ -1,10 +1,21 @@
 from yg_eo_soilnet.utils import mlflow_rpiq_score
 from yg_eo_soilnet.plot_utils import plot_leaderboard_scatter, create_pred_obs_plot, create_parent_pred_obs
+from yg_eo_soilnet.artifacts import (
+    ArtifactLayout,
+    candidate_artifact_paths,
+    log_figure,
+    log_json,
+    log_table,
+)
+from yg_eo_soilnet.metrics import (
+    cv_rmse_from_search,
+    metric_space_for,
+    regression_metrics,
+)
 
 import pandas as pd
-import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.metrics import r2_score, root_mean_squared_error
+from sklearn.metrics import r2_score
 
 import mlflow
 import mlflow.sklearn
@@ -13,21 +24,33 @@ from mlflow.models import infer_signature
 
 import os
 import importlib
-import json
+import shutil
 import tempfile
-import re
+from typing import Any
 
 
-EVAL_RESULTS_ARTIFACT_PATH = "eval_results"
+# Kept as a module constant because callers outside this file import it. It is now sourced from
+# ArtifactLayout so there is one definition of the tree.
+EVAL_RESULTS_ARTIFACT_PATH = ArtifactLayout.EVAL_RESULTS
 
 
 def _eval_results_filename(target: str, model_name: str) -> str:
-    return f"eval_results_{target}_{model_name}.csv"
+    """LEGACY per-run name, kept only so readers can resolve pre-rename runs."""
+    return ArtifactLayout.eval_results_filename(target, model_name)
 
 
 def _eval_results_artifact_paths(target: str, model_name: str) -> list[str]:
-    filename = _eval_results_filename(target, model_name)
-    return [f"{EVAL_RESULTS_ARTIFACT_PATH}/{filename}", filename]
+    """Every path a reader should try for one run's eval CSV, current layout first.
+
+    Three generations coexist in ``mlruns/``: the stable ``eval_results/eval_results.csv`` written
+    now, the per-run ``eval_results/eval_results_<target>_<model>.csv`` written before the rename,
+    and the same file at the run root from older runs still.
+    """
+    return candidate_artifact_paths(
+        ArtifactLayout.EVAL_RESULTS,
+        ArtifactLayout.EVAL_RESULTS_FILE,
+        ArtifactLayout.eval_results_filename(target, model_name),
+    )
 
 class ChildRunLogger:
     def __init__(self):
@@ -97,7 +120,11 @@ class ChildRunLogger:
                     mlflow.log_metric(f"eval_{stat_name}", value)
 
         if summary:
-            self._write_json_artifact(summary, f"split_summary_{target}.json", artifact_path="eval_results")
+            self._write_json_artifact(
+                summary,
+                ArtifactLayout.SPLIT_SUMMARY_FILE,
+                artifact_path=ArtifactLayout.EVAL_RESULTS,
+            )
 
     @staticmethod
     def _resolve_lightning_run_target_label(evaluation_df: pd.DataFrame | None, fallback_target: str) -> str:
@@ -260,17 +287,12 @@ class ChildRunLogger:
         return {key: value for key, value in params.items() if value is not None}
 
     def _log_table_artifact(self, df: pd.DataFrame, filename: str, artifact_path: str):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, filename)
-            df.to_csv(path, index=False)
-            mlflow.log_artifact(path, artifact_path=artifact_path)
+        """Thin delegate; the implementation lives in :mod:`yg_eo_soilnet.artifacts`."""
+        log_table(df, filename, artifact_path)
 
     def _write_json_artifact(self, payload: dict, filename: str, artifact_path: str):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, filename)
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, default=str)
-            mlflow.log_artifact(path, artifact_path=artifact_path)
+        """Thin delegate; the implementation lives in :mod:`yg_eo_soilnet.artifacts`."""
+        log_json(payload, filename, artifact_path)
 
     def _log_metric_dict(self, metrics: dict, prefix: str = ""):
         for metric_name, metric_value in metrics.items():
@@ -281,7 +303,13 @@ class ChildRunLogger:
             except (TypeError, ValueError):
                 continue
 
-    def _log_lightning_pred_obs_artifact(self, evaluation_df: pd.DataFrame, target: str, model_name: str) -> bool:
+    def _log_lightning_pred_obs_artifact(
+        self,
+        evaluation_df: pd.DataFrame,
+        target: str,
+        model_name: str,
+        artifact_path: str | None = None,
+    ) -> bool:
         if evaluation_df.empty or target not in evaluation_df.columns or "prediction" not in evaluation_df.columns:
             return False
 
@@ -292,34 +320,247 @@ class ChildRunLogger:
             }
         )
 
+        # create_pred_obs_plot follows MLflow's custom-artifact contract: it SAVES into the
+        # directory it is handed and returns {name: path}, rather than returning a Figure the way
+        # every other plotter in plot_utils does. Hence the temp dir here instead of log_figure.
         with tempfile.TemporaryDirectory() as tmpdir:
             artifacts = create_pred_obs_plot(plot_eval_df, builtin_metrics={}, artifacts_dir=tmpdir)
             if not artifacts:
                 return False
-            safe_target = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(target)).strip("_") or "target"
-            safe_model = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(model_name)).strip("_") or "model"
-            for artifact_key, artifact_path in artifacts.items():
-                artifact_stem, artifact_ext = os.path.splitext(os.path.basename(artifact_path))
-                renamed_filename = f"{artifact_stem}_{safe_target}_{safe_model}{artifact_ext}"
+            # One stable name, so this plot lines up across runs in the compare view. It used to be
+            # suffixed with the target and model, which made every run's copy a different path.
+            # Multi-target runs separate by DIRECTORY instead - see plots_path - so two targets
+            # still cannot overwrite each other.
+            destination = artifact_path or ArtifactLayout.PLOTS
+            for index, (_artifact_key, source_path) in enumerate(artifacts.items()):
+                _stem, source_ext = os.path.splitext(os.path.basename(source_path))
+                stable_stem, stable_ext = os.path.splitext(ArtifactLayout.PRED_OBS_FILE)
+                suffix = "" if index == 0 else f"_{index}"
+                renamed_filename = f"{stable_stem}{suffix}{stable_ext or source_ext}"
                 renamed_path = os.path.join(tmpdir, renamed_filename)
-                if artifact_path != renamed_path:
-                    os.replace(artifact_path, renamed_path)
-                mlflow.log_artifact(renamed_path, artifact_path="eval_plots")
+                if source_path != renamed_path:
+                    os.replace(source_path, renamed_path)
+                mlflow.log_artifact(renamed_path, artifact_path=destination)
         return True
 
-    def _log_lightning_serialized_model(self, model, model_name: str, input_example: pd.DataFrame | None = None) -> bool:
+    def _log_checkpoint(self, best_model_path: str) -> None:
+        """Log the best checkpoint under a STABLE name.
+
+        Lightning names its checkpoints ``epoch=NN-step=MMM.ckpt``, so two runs of the same model on
+        the same target still produce different artifact paths and MLflow's compare view finds
+        nothing in common. Copying to ``best.ckpt`` fixes that; the original name is not lost - it
+        goes to the ``checkpoint_filename`` tag and into meta/run_summary.json, where it is still
+        greppable but no longer part of the path.
+        """
+        original_name = os.path.basename(best_model_path)
+        mlflow.set_tags({"checkpoint_filename": original_name})
+
+        if not os.path.isfile(best_model_path):
+            # The trainer reports a path that Lightning may never have written - a run with
+            # checkpointing disabled, or one that stopped before the first save. Skipping keeps the
+            # rest of the run's artifacts and its summary, which a raise here would discard.
+            return
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stable_path = os.path.join(tmpdir, ArtifactLayout.CHECKPOINT_FILE)
+            shutil.copyfile(best_model_path, stable_path)
+            mlflow.log_artifact(stable_path, artifact_path=ArtifactLayout.CHECKPOINTS)
+
+    def _log_lightning_serialized_model(
+        self,
+        model,
+        model_name: str,
+        target: str = "",
+        bundle=None,
+        best_model_path: str | None = None,
+        config=None,
+    ) -> bool:
+        """Log the model as an mlflow.pyfunc so it can be loaded and served.
+
+        NOT mlflow.pytorch.log_model: MLflow 3 defaults that to serialization_format="pt2", which
+        traces model.forward from an example input. These models consume a dict batch of ragged,
+        date-stamped sequences, so no example can trace them - the previous run failed with
+        "If serialization_format is set to 'pt2', then input_example is required" and the logged
+        model was left in status FAILED. A pyfunc sidesteps tracing entirely and, unlike a raw
+        checkpoint, arrives with the preprocessing needed to consume raw data.
+        """
         if model is None:
             return False
 
-        log_kwargs = {
-            "artifact_path": f"models/{model_name}",
-            "pytorch_model": model,
-        }
-        if input_example is not None and not input_example.empty:
-            log_kwargs["input_example"] = input_example.head(5)
+        import mlflow.pyfunc
+        from mlflow.models import infer_signature
 
-        mlflow.pytorch.log_model(**log_kwargs)
+        from yg_eo_soilnet.serving.lightning_pyfunc import (
+            SoilSequencePyfunc,
+            build_input_example,
+            serving_requirements,
+            stage_serving_package,
+        )
+
+        sequence_bundle = getattr(getattr(bundle, "datamodule", None), "sequence_bundle", None)
+
+        signature = None
+        input_example = None
+        if sequence_bundle is not None:
+            input_example = build_input_example(model, sequence_bundle, n_rows=3)
+            predictions = SoilSequencePyfunc(model).predict(None, input_example)
+            signature = infer_signature(input_example, predictions)
+
+        entry_script = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "serving", "_pyfunc_entry.py"
+        )
+
+        registered_name = (
+            ArtifactLayout.logged_model_name(target, model_name)
+            if bool(getattr(config, "MLFLOW_REGISTER_MODELS", True))
+            else None
+        )
+
+        with tempfile.TemporaryDirectory() as staging:
+            torch_model_path = self._save_nested_torch_model(model, best_model_path, staging)
+
+            model_info = mlflow.pyfunc.log_model(
+                # `name`, not the deprecated `artifact_path`. The old value was "models/{model}"
+                # with no target in it, so on a multi-target run every target overwrote the slot.
+                name=ArtifactLayout.logged_model_name(target, model_name),
+                # A PATH, not an object. Handing mlflow the live object CloudPickles the whole
+                # graph - that is what produced a 15 MB python_model.pkl whose weights could not be
+                # read without unpickling it, and which mlflow warns can execute arbitrary code on
+                # load. Models-from-code stores this script and loads the nested model below.
+                python_model=entry_script,
+                artifacts={"torch_model": torch_model_path},
+                signature=signature,
+                input_example=input_example,
+                code_paths=[stage_serving_package(os.path.join(staging, "code"))],
+                pip_requirements=serving_requirements(),
+                registered_model_name=registered_name,
+            )
+
+        self._registered_version = getattr(model_info, "registered_model_version", None)
         return True
+
+    @staticmethod
+    def _save_nested_torch_model(model, best_model_path: str | None, staging: str) -> str:
+        """A real ``mlflow.pytorch`` model directory, nested inside the pyfunc's artifacts.
+
+        Nesting rather than logging a second top-level model keeps one deployable entry per run and
+        stores the weights once, while still making the network recognisable: the nested MLmodel
+        carries the ``pytorch`` flavor and ``mlflow.pytorch.load_model`` works against it.
+
+        ``serialization_format="pickle"`` is forced, not chosen: ``pt2`` traces ``forward`` from a
+        tensor example and this architecture consumes a dict batch of ragged sequences. So this copy
+        is an object pickle. The run's ``checkpoints/best.ckpt`` remains the safe,
+        ``weights_only``-loadable one.
+        """
+        import mlflow.pytorch
+
+        # The checkpoint Lightning selected is the early-stopped BEST epoch; the live module may
+        # hold a later, worse state. Restore before saving so the served weights are the best ones.
+        publishable = model
+        if best_model_path and os.path.isfile(best_model_path):
+            try:
+                publishable = type(model).load_from_checkpoint(best_model_path, map_location="cpu")
+                publishable.eval()
+            except Exception:
+                # A checkpoint from a different architecture revision should not lose the model
+                # entirely - the live module is still a valid, if not-best, thing to publish.
+                publishable = model
+
+        path = os.path.join(staging, "torch_model")
+        mlflow.pytorch.save_model(publishable, path, serialization_format="pickle")
+        return path
+
+    def _promote_champion(self, target: str, model_name: str, metrics: dict, version) -> dict:
+        """Move the champion alias onto this version when it beats the incumbent.
+
+        Reads rmse_test, the metric that means the same thing for both families and is in the
+        target's original units - which is what makes the comparison meaningful at all. Shared by
+        both families so a sklearn model and a Lightning model are promoted on identical evidence.
+        """
+        if version is None:
+            return {"promoted": False, "reason": "the model was not registered"}
+
+        from yg_eo_soilnet.tracking import CHAMPION_METRIC, promote_if_better
+
+        try:
+            return promote_if_better(
+                ArtifactLayout.logged_model_name(target, model_name),
+                version,
+                metrics.get(CHAMPION_METRIC),
+            )
+        except Exception as exc:
+            # A registry that will not take the alias must not lose a finished training run.
+            return {"promoted": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+    def _log_shap_artifacts(
+        self,
+        config,
+        target: str,
+        model_name: str,
+        backend: str,
+        payload: dict,
+    ) -> dict:
+        """Build and log the SHAP artifacts for one child run, or explain why it did not.
+
+        This method is the SHAP off-switch, and it is deliberately the ONLY place that reaches for
+        the explain package. Three properties it has to keep:
+
+        * ``EXPLAIN_ENABLED: false`` returns before importing anything - ``shap`` pulls in numba and
+          is slow to import, and a run that asked for no explainability must not pay for it, nor
+          risk tripping the ``filterwarnings = ["error"]`` pytest setting on a warning it emits;
+        * the import is local to this function for the same reason;
+        * a failure here is recorded, not raised, unless ``EXPLAIN_FAIL_ON_ERROR`` - losing a
+          finished training run because an explainer choked is a bad trade.
+
+        Returns the dict that goes into the run summary's ``explain`` key.
+        """
+        if not bool(getattr(config, "EXPLAIN_ENABLED", True)):
+            return {"enabled": False, "reason": "EXPLAIN_ENABLED is false"}
+
+        # Precedence: naming a model in EXPLAIN_MODELS is an explicit request, so it overrides the
+        # denylist. Without that rule the two settings could contradict each other and the allowlist
+        # would silently do nothing, which is the worse failure - the user asked for the expensive
+        # explanation and would get no plot and no explanation of why.
+        selected_models = list(getattr(config, "EXPLAIN_MODELS", None) or [])
+        skipped_models = list(getattr(config, "EXPLAIN_SKIP_MODELS", None) or [])
+
+        if selected_models and model_name not in selected_models:
+            return {"enabled": False, "reason": f"{model_name} is not in EXPLAIN_MODELS"}
+
+        if model_name in skipped_models and model_name not in selected_models:
+            return {
+                "enabled": True,
+                "logged": False,
+                "skipped": True,
+                "reason": (
+                    f"{model_name} is in EXPLAIN_SKIP_MODELS. It is excluded by name rather than by "
+                    "EXPLAIN_MAX_EVALS because that budget counts model evaluations and cannot see "
+                    "that one costs this model far more than a tree. Add it to EXPLAIN_MODELS to "
+                    "explain it anyway."
+                ),
+            }
+
+        try:
+            from yg_eo_soilnet.explain import build_shap_results, log_shap_artifacts
+
+            results = build_shap_results(config=config, backend=backend, **payload)
+            if not results:
+                return {"enabled": True, "logged": False, "reason": "explainer produced no values"}
+
+            written = log_shap_artifacts(
+                results,
+                max_display=int(getattr(config, "EXPLAIN_MAX_DISPLAY", 25)),
+            )
+            return {"enabled": True, "logged": True, **written}
+        except Exception as exc:
+            # A budget skip is a decision, not a failure: the run is healthy and the explanation was
+            # declined on cost. It is reported as "skipped" so it is not mistaken for a crash, and
+            # it is NOT escalated by EXPLAIN_FAIL_ON_ERROR, which is there for genuine errors.
+            if type(exc).__name__ == "ExplainBudgetExceeded":
+                return {"enabled": True, "logged": False, "skipped": True, "reason": str(exc)}
+            if bool(getattr(config, "EXPLAIN_FAIL_ON_ERROR", False)):
+                raise
+            return {"enabled": True, "logged": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def _log_plots(self, plot_functions: dict, target: str, model_name: str):
         """
@@ -344,28 +585,28 @@ class ChildRunLogger:
             kwargs = call_args.get("kwargs", {})
     
             fig = plot_func(*args, **kwargs)
-    
-            with tempfile.TemporaryDirectory() as tmpdir:
-                plot_path = os.path.join(
-                    tmpdir, f"{plot_func.__name__}_{target}_{model_name}.png"
-                )
-                fig.savefig(plot_path, bbox_inches="tight")
-                plt.close(fig)
-                mlflow.log_artifact(plot_path)
+
+            # Under PLOTS, not the run root. These used to be logged with no artifact_path at all,
+            # so a CV plot landed beside leaderboard.csv while its own CSV went to cv_results/.
+            log_figure(
+                fig,
+                f"{plot_func.__name__}.png",
+                ArtifactLayout.PLOTS,
+            )
 
     def _log_cv_results(self, cv_results_df, target, model_name, param_names):
-        """Save cv_results as artifact for later inspection."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, f"cv_results_{target}_{model_name}.csv")
-            cv_results_df.to_csv(path, index=False)
-            mlflow.log_artifact(path, artifact_path="cv_results")
-            if isinstance(param_names, str):
-                for i, row in cv_results_df.iterrows():
-                    train_score = -row['mean_train_score']
-                    test_score = -row['mean_test_score']
-                    # Log parameter as a metric step
-                    mlflow.log_metric(f"train_score_{param_names.rsplit('__', 1)[-1]}", train_score, step=i)
-                    mlflow.log_metric(f"test_score_{param_names.rsplit('__', 1)[-1]}", test_score, step=i)
+        """Save cv_results as an artifact for later inspection.
+
+        The per-step ``train_score_*`` / ``test_score_*`` metrics that used to be emitted here when
+        ``param_names`` was a string are gone. That branch was unreachable - ModelTrainer always
+        passes a list - and it carried a second, unguarded ``neg_*`` sign flip, which is exactly the
+        pattern yg_eo_soilnet.metrics exists to keep in one place. The full grid is in the CSV.
+        """
+        log_table(
+            cv_results_df,
+            ArtifactLayout.CV_RESULTS_FILE,
+            ArtifactLayout.CV,
+        )
 
     def log_child_run(
         self,
@@ -404,7 +645,16 @@ class ChildRunLogger:
             signature = infer_signature(X_test, best_model.predict(X_test))
             model_info = mlflow.sklearn.log_model(sk_model=best_model,  # type: ignore
                                          signature=signature,
-                                         name = f"{target}_{model_name}",
+                                         name=ArtifactLayout.logged_model_name(target, model_name),
+                                         # Enters the registry under the same stable name, so
+                                         # versions accumulate per target+model and deployment can
+                                         # reference models:/<name>/<version> rather than a
+                                         # run-scoped URI.
+                                         registered_model_name=(
+                                             ArtifactLayout.logged_model_name(target, model_name)
+                                             if bool(getattr(config, "MLFLOW_REGISTER_MODELS", True))
+                                             else None
+                                         ),
                                          input_example=X_test[:5],
                                          skops_trusted_types=[
                                              "numpy.dtype",
@@ -424,23 +674,27 @@ class ChildRunLogger:
                                              ])
             # --- CV results as artifact ---
             self._log_cv_results(cv_results, target, model_name, param_names)
-            # --- CV metrics (best index) ---
-            r2_train = r2_score(y_train, best_model.predict(X_train))
-            mlflow.log_metric("r2_train", r2_train)
-            mlflow.log_metric("mean_train_score", -cv_results["mean_train_score"][search.best_index_])
-            mlflow.log_metric("mean_test_score", -cv_results["mean_test_score"][search.best_index_])
 
-            # --- Evaluation metrics and plots ---
+            # --- Evaluation frame, in ORIGINAL target units ---
             eval_df = pd.concat([X_test, y_test], axis=1)
             eval_df["prediction"] = best_model.predict(X_test)  # ensure predictions column exists
-            
-            # Save evaluation DataFrame
-            with tempfile.TemporaryDirectory() as tmpdir:
-                eval_path = os.path.join(tmpdir, _eval_results_filename(target, model_name))
-                eval_df.to_csv(eval_path, index=False)
-                mlflow.log_artifact(eval_path, artifact_path=EVAL_RESULTS_ARTIFACT_PATH)
 
-    
+            # --- Metrics ---
+            # The unified set, computed from the same prediction frame the Lightning path uses, so
+            # the two families are directly comparable. `mean_test_score` and `mean_train_score` are
+            # deliberately NOT logged any more: they meant a positive CV RMSE here and a negative
+            # -test_loss on the Lightning side, under one name and on one leaderboard axis.
+            metrics = regression_metrics(eval_df[target], eval_df["prediction"])
+            metrics.update(cv_rmse_from_search(cv_results, search.best_index_))
+            metrics["r2_train_fit"] = float(r2_score(y_train, best_model.predict(X_train)))
+            self._log_metric_dict(metrics)
+
+            self._log_table_artifact(
+                eval_df,
+                filename=ArtifactLayout.EVAL_RESULTS_FILE,
+                artifact_path=ArtifactLayout.EVAL_RESULTS,
+            )
+
             mlflow.models.evaluate(
                 model_info.model_uri,
                 data=pd.concat([X_test, y_test], axis=1),
@@ -453,6 +707,43 @@ class ChildRunLogger:
 
             # --- Test Plots ---
             self._log_plots(plot_functions, target, model_name)
+
+            # --- SHAP ---
+            explain_summary = self._log_shap_artifacts(
+                config=config,
+                target=target,
+                model_name=model_name,
+                backend="sklearn",
+                payload={
+                    "fitted_estimator": best_model,
+                    "X_train": X_train,
+                    "X_test": X_test,
+                    "target": target,
+                },
+            )
+
+            # --- Run summary, the same shape the Lightning path writes ---
+            self._write_json_artifact(
+                {
+                    "target": target,
+                    "model_name": model_name,
+                    "framework": "sklearn",
+                    "run_name": run_name,
+                    "metrics": metrics,
+                    "metric_space": metric_space_for(metrics),
+                    "best_params": {str(key): str(value) for key, value in search.best_params_.items()},
+                    "logged_model_name": ArtifactLayout.logged_model_name(target, model_name),
+                    "logged_model_uri": getattr(model_info, "model_uri", None),
+                    "registered_model_version": getattr(model_info, "registered_model_version", None),
+                    "champion": self._promote_champion(
+                        target, model_name, metrics,
+                        getattr(model_info, "registered_model_version", None),
+                    ),
+                    "explain": explain_summary,
+                },
+                ArtifactLayout.RUN_SUMMARY_FILE,
+                artifact_path=ArtifactLayout.META,
+            )
 
     def log_lightning_child_run(
         self,
@@ -526,49 +817,52 @@ class ChildRunLogger:
         metrics.update(validation_metrics or {})
         metrics.update(test_metrics or {})
 
+        # The unified metric set, computed from the prediction frame - which predict_step has already
+        # run through inverse_transform_targets, so these are in ORIGINAL target units. The
+        # train/val/test_loss and *_r2 values already in `metrics` come from the LightningModule and
+        # live in STANDARDIZED LOG1P space; both are kept, and metric_space_for() records which is
+        # which in the run summary so nobody has to infer it from the magnitudes.
+        #
+        # What used to be here instead: mean_test_score = -test_loss, mean_train_score = -val_loss.
+        # Those negations made the Lightning rows of the leaderboard negative while the sklearn rows
+        # under the same names were positive. Nothing is negated any more.
         if evaluation_df is not None and target in evaluation_df.columns and "prediction" in evaluation_df.columns:
-            try:
-                y_true = evaluation_df[target]
-                y_pred = evaluation_df["prediction"]
-                metrics.setdefault("r2_score", r2_score(y_true, y_pred))
-                metrics.setdefault("rmse_test", root_mean_squared_error(y_true, y_pred))
-            except Exception:
-                pass
-
-        if "test_loss" in metrics and "mean_test_score" not in metrics:
-            metrics["mean_test_score"] = -float(metrics["test_loss"])
-        if "rmse_test" in metrics and "mean_test_score" not in metrics:
-            metrics["mean_test_score"] = -float(metrics["rmse_test"])
-        if "val_loss" in metrics and "mean_train_score" not in metrics:
-            metrics["mean_train_score"] = -float(metrics["val_loss"])
-        if "r2_score" in metrics and "r2_test" not in metrics:
-            metrics["r2_test"] = metrics["r2_score"]
+            metrics.update(regression_metrics(evaluation_df[target], evaluation_df["prediction"]))
 
         if evaluation_df is not None:
-            target_eval_frames = list(self._iter_lightning_target_eval_frames(evaluation_df, target=target, model_name=model_name))
-            if target_eval_frames:
-                per_target_r2_scores = []
-                for target_frame, target_name, _prediction_column in target_eval_frames:
-                    if target_name in target_frame.columns and "prediction" in target_frame.columns:
-                        try:
-                            score = r2_score(target_frame[target_name], target_frame["prediction"])
-                            metrics[f"r2_score_{target_name}"] = score
-                            per_target_r2_scores.append(score)
-                        except Exception:
-                            pass
-                if per_target_r2_scores and "r2_score" not in metrics:
-                    metrics["r2_score"] = float(np.mean(per_target_r2_scores))
+            target_eval_frames = list(
+                self._iter_lightning_target_eval_frames(evaluation_df, target=target, model_name=model_name)
+            )
+            per_target_r2_scores = []
+            for target_frame, target_name, _prediction_column in target_eval_frames:
+                if target_name not in target_frame.columns or "prediction" not in target_frame.columns:
+                    continue
+                per_target = regression_metrics(
+                    target_frame[target_name],
+                    target_frame["prediction"],
+                    suffix=f"_{target_name}",
+                )
+                metrics.update(per_target)
+                r2_key = f"r2_test_{target_name}"
+                if r2_key in per_target:
+                    per_target_r2_scores.append(per_target[r2_key])
+
+            # On a multi-target run the trainer hands each child an empty metric dict and a
+            # single-target frame, so the loop above is what produces that child's numbers. When the
+            # frame really is multi-target, the run-level r2_test is the mean across targets.
+            if per_target_r2_scores and "r2_test" not in metrics:
+                metrics["r2_test"] = float(np.mean(per_target_r2_scores))
 
         self._log_metric_dict(metrics)
 
         if best_model_path:
-            mlflow.log_artifact(best_model_path, artifact_path="checkpoints")
+            self._log_checkpoint(best_model_path)
 
         if evaluation_df is not None:
             self._log_table_artifact(
                 evaluation_df,
-                filename=_eval_results_filename(run_target, model_name),
-                artifact_path=EVAL_RESULTS_ARTIFACT_PATH,
+                filename=ArtifactLayout.EVAL_RESULTS_FILE,
+                artifact_path=ArtifactLayout.EVAL_RESULTS,
             )
 
         self._log_split_summary(bundle, evaluation_df, run_target)
@@ -576,17 +870,32 @@ class ChildRunLogger:
         pred_obs_logged = False
         if evaluation_df is not None:
             try:
-                pred_obs_logged = self._log_lightning_pred_obs_artifact(
-                    evaluation_df,
-                    target=target,
-                    model_name=model_name,
-                )
                 target_eval_frames = list(
                     self._iter_lightning_target_eval_frames(evaluation_df, target=target, model_name=model_name)
                 )
+                # One target writes plots/pred_obs.png, so it lines up with every other run in the
+                # compare view. Several targets nest under plots/<target>/, because they would
+                # otherwise write the same leaf and silently overwrite one another.
+                nest_by_target = len(target_eval_frames) > 1
+
+                if not target_eval_frames:
+                    pred_obs_logged = self._log_lightning_pred_obs_artifact(
+                        evaluation_df,
+                        target=target,
+                        model_name=model_name,
+                        artifact_path=ArtifactLayout.plots_path(),
+                    )
+
                 for target_frame, target_name, _prediction_column in target_eval_frames:
                     pred_obs_logged = (
-                        self._log_lightning_pred_obs_artifact(target_frame, target=target_name, model_name=model_name)
+                        self._log_lightning_pred_obs_artifact(
+                            target_frame,
+                            target=target_name,
+                            model_name=model_name,
+                            artifact_path=ArtifactLayout.plots_path(
+                                target_name if nest_by_target else None
+                            ),
+                        )
                         or pred_obs_logged
                     )
             except Exception:
@@ -594,36 +903,63 @@ class ChildRunLogger:
 
         model_logged = False
         model_logging_error = None
+        # Not a bare swallow any more: FAIL_ON_MODEL_ERROR re-raises, matching the sklearn trainer's
+        # policy. Silently recording "serialized_model_logged": false in a JSON file meant a run
+        # could look complete while having saved no usable model at all.
         try:
-            input_example = None
-            if evaluation_df is not None:
-                target_columns = self._resolve_lightning_target_names(evaluation_df, target)
-                feature_columns = [
-                    column
-                    for column in evaluation_df.columns
-                    if column not in set(target_columns) | {"prediction", "target_name", "target_names", "model_name"}
-                    and not column.startswith("prediction_")
-                ]
-                if feature_columns:
-                    input_example = evaluation_df[feature_columns]
-            model_logged = self._log_lightning_serialized_model(model=model, model_name=model_name, input_example=input_example)
+            # The bundle, not the eval frame. The eval frame is the model's OUTPUT side - test
+            # features next to predictions - and feeding it as an input example is what produced
+            # the pt2 tracing failure. The bundle is what the model actually consumes, so the
+            # example and signature are derived from it.
+            model_logged = self._log_lightning_serialized_model(
+                model=model,
+                model_name=model_name,
+                target=run_target,
+                bundle=bundle,
+                best_model_path=best_model_path,
+                config=config,
+            )
         except Exception as exc:
+            if bool(getattr(config, "FAIL_ON_MODEL_ERROR", False)):
+                raise
             model_logged = False
-            model_logging_error = str(exc)
+            model_logging_error = f"{type(exc).__name__}: {exc}"
+
+        explain_summary = self._log_shap_artifacts(
+            config=config,
+            target=run_target,
+            model_name=model_name,
+            backend="lightning",
+            payload={"model": model, "bundle": bundle, "target": run_target},
+        )
 
         summary = {
             "target": target,
             "model_name": model_name,
             "framework": "lightning",
             "metrics": metrics,
+            "metric_space": metric_space_for(metrics),
             "best_model_path": best_model_path,
+            # The checkpoint is logged as checkpoints/best.ckpt so runs stay comparable; this is
+            # where its Lightning-assigned epoch/step name survives.
+            "checkpoint_filename": os.path.basename(best_model_path) if best_model_path else None,
+            "logged_model_name": ArtifactLayout.logged_model_name(run_target, model_name),
+            "registered_model_version": getattr(self, "_registered_version", None),
+            "champion": self._promote_champion(
+                run_target, model_name, metrics, getattr(self, "_registered_version", None)
+            ),
             "pred_obs_artifact_logged": pred_obs_logged,
             "serialized_model_logged": model_logged,
             "serialized_model_logging_error": model_logging_error,
+            "explain": explain_summary,
         }
         summary["run_name"] = run_name
         summary["resolved_target"] = run_target
-        self._write_json_artifact(summary, f"lightning_run_summary_{run_target}_{model_name}.json", artifact_path="lightning_metadata")
+        self._write_json_artifact(
+            summary,
+            ArtifactLayout.RUN_SUMMARY_FILE,
+            artifact_path=ArtifactLayout.META,
+        )
 
 class ParentRunLogger:
     def __init__(self):
@@ -656,13 +992,39 @@ class ParentRunLogger:
                 "run_id": run.info.run_id,
                 "target": target,
                 "model": model_name,
+                "framework": run_data.tags.get("framework", "sklearn"),
             }
-            # Collect all logged metrics (like rmse_test, r2_test, etc.)
+            # Collect all logged metrics (rmse_test, r2_test, mae_test, ...)
             row.update(run_data.metrics)
-
-            rows.append(row)
+            rows.append(self._backfill_legacy_metrics(row))
 
         return pd.DataFrame(rows)
+
+    @staticmethod
+    def _backfill_legacy_metrics(row: dict) -> dict:
+        """Give a pre-unification run the current metric names so it still plots.
+
+        Runs recorded before yg_eo_soilnet.metrics existed logged `mean_test_score`, which meant a
+        POSITIVE cv RMSE on a sklearn run and a NEGATIVE -test_loss on a Lightning one. abs() is
+        what makes those two comparable again on a single axis; it is a best effort for display
+        only, which is why the row is tagged rather than silently patched.
+
+        The Lightning value is still a loss in standardized log1p space, not an RMSE in target
+        units, so a legacy Lightning row is comparable to other legacy Lightning rows and not much
+        else. Re-running the model is the only way to get a real number.
+        """
+        if "rmse_test" in row:
+            return row
+
+        legacy_score = row.get("mean_test_score")
+        if legacy_score is None:
+            return row
+
+        row["rmse_test"] = abs(float(legacy_score))
+        row["legacy_metrics"] = True
+        if "r2_test" not in row and "r2_score" in row:
+            row["r2_test"] = row["r2_score"]
+        return row
 
     def _collect_eval_dfs(self,parent_run_id: str):
         client = mlflow.tracking.MlflowClient() # type: ignore
@@ -769,19 +1131,19 @@ class ParentRunLogger:
             mlflow.log_artifact(leaderboard_path)
 
         # --- Plots ---
-        # Make leaderboard plot
-        fig = plot_leaderboard_scatter(leaderboard_df, metric_x="mean_test_score", metric_y="r2_score")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fig_path = os.path.join(tmpdir, "leaderboard.png")
-            fig.savefig(fig_path, bbox_inches="tight")
-            plt.close(fig)
-            mlflow.log_artifact(fig_path, artifact_path="leaderboard_plots")
+        # rmse_test against r2_test: both are in original target units for both families, so an
+        # XGBoost point and a soil_cnn point on this axis now mean the same thing. The old pair was
+        # (mean_test_score, r2_score), which put positive sklearn RMSEs and negative Lightning
+        # losses on one axis in three different units.
+        log_figure(
+            plot_leaderboard_scatter(leaderboard_df, metric_x="rmse_test", metric_y="r2_test"),
+            "leaderboard.png",
+            ArtifactLayout.LEADERBOARD_PLOTS,
+        )
 
         eval_dfs = self._collect_eval_dfs(parent_run_id)
-        fig = create_parent_pred_obs(eval_dfs)
-        if fig is not None:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                fig_path = os.path.join(tmpdir, "pred_error_plot.png")
-                fig.savefig(fig_path, bbox_inches="tight")
-                mlflow.log_artifact(fig_path, artifact_path="leaderboard_plots")
-                plt.close(fig)
+        log_figure(
+            create_parent_pred_obs(eval_dfs),
+            "pred_error_plot.png",
+            ArtifactLayout.LEADERBOARD_PLOTS,
+        )

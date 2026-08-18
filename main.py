@@ -9,8 +9,9 @@ from config import Config
 from yg_eo_soilnet.models.config_fatories.lightning_config_factory import LightningConfigFactory
 from yg_eo_soilnet.seeding import seed_everything
 from yg_eo_soilnet.trainers.lightning_trainer import LightningTrainer
+from yg_eo_soilnet.tracking import configure_tracking, tracking_settings
 import mlflow
-import datetime 
+import datetime
 import time
 import shutil
 import re
@@ -210,14 +211,9 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     mlflow.enable_system_metrics_logging()
-    EXPERIMENT_NAME = "Soil_Model_Training_Experiment"
-    # Set up MLflow tracking
-    try:
-        mlflow.set_experiment(EXPERIMENT_NAME)
-    except mlflow.exceptions.MlflowException: # type: ignore
-    # Restore or create a new experiment if previously deleted
-        mlflow.create_experiment(EXPERIMENT_NAME)
-        mlflow.set_experiment(EXPERIMENT_NAME)
+    # Before any run starts: an experiment's artifact_location is fixed when it is created, so this
+    # is what keeps a run's metadata and its artifacts in the same directory.
+    configure_tracking(tracking_settings(args.config_path))
     
     if mlflow.active_run():
         mlflow.end_run()

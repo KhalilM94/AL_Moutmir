@@ -85,6 +85,7 @@ class SoilSequenceBuilder:
 
         static_features, static_categoricals = split_feature_blocks(static_df, blocks)
         targets = static_df[target_columns].to_numpy(dtype=np.float32)
+        label_features, label_feature_names = self._extract_label_features(static_df)
         point_ids = (
             static_df[point_col].tolist() if point_col in static_df.columns else list(range(len(static_df)))
         )
@@ -108,6 +109,8 @@ class SoilSequenceBuilder:
             categorical_feature_names=list(blocks.categorical_columns),
             targets=targets,
             target_names=target_columns,
+            label_features=label_features,
+            label_feature_names=label_feature_names,
             sequences=sequences,
             sequence_times=sequence_times,
             sequence_validity=sequence_validity,
@@ -117,6 +120,48 @@ class SoilSequenceBuilder:
         bundle.validate()
         self._log_summary(bundle)
         return bundle
+
+    # --- measured lab values ----------------------------------------------
+
+    def _extract_label_features(self, static_df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
+        """Every LABEL_COLUMNS value the static frame carries, kept OUT of the feature blocks.
+
+        Deliberately bypasses ``filter_schema``, whose whole job is to remove these. What authorises
+        that is ``CARRY_LABEL_COLUMNS``: with the flag off this returns nothing, so the bundle and
+        every batch collated from it are identical to a build that had never heard of lab values.
+        Carrying them does not make them predictors either - nothing reads them unless a model names
+        them in ``auxiliary_label_columns``, which is an explicit, per-column opt-out of that rail
+        for the case where the value is genuinely measured at inference time too.
+
+        Reading the flag here rather than trusting the frame is what keeps the joint-file and
+        split-file layouts in agreement. DataManager carries the labels across the targets join
+        under the same flag, so "what may a model select?" is answered by the flag plus
+        LABEL_COLUMNS, never by which files the data happens to be split into.
+
+        Rows are NOT dropped for a missing value. Lab coverage varies from complete to ~37% absent
+        across these columns, so requiring finiteness here would let the choice of an auxiliary
+        column silently delete a third of the dataset. The datamodule median-fills from the train
+        split and passes a validity flag instead.
+        """
+        if not getattr(self.config, "CARRY_LABEL_COLUMNS", False):
+            return np.empty((len(static_df), 0), dtype=np.float32), []
+
+        label_columns = [
+            str(column)
+            for column in (getattr(self.config, "LABEL_COLUMNS", []) or [])
+            if str(column) in static_df.columns
+        ]
+        label_columns = list(dict.fromkeys(label_columns))
+        if not label_columns:
+            return np.empty((len(static_df), 0), dtype=np.float32), []
+
+        values = np.column_stack(
+            [pd.to_numeric(static_df[column], errors="coerce").to_numpy(dtype=np.float64) for column in label_columns]
+        )
+        # Infinities join the missing: an inf reaching the standardizer would poison the column
+        # statistic, and there is no meaningful lab value it could represent.
+        values[~np.isfinite(values)] = np.nan
+        return values.astype(np.float32), label_columns
 
     # --- temporal assembly ------------------------------------------------
 
@@ -264,6 +309,27 @@ class SoilSequenceBuilder:
             f"Built sequence bundle over {bundle.num_points} point(s) with "
             f"{bundle.static_features.shape[1] if bundle.static_features.size else 0} static feature(s)"
         )
+        if bundle.label_dim:
+            # Reported with the missing share because that is what decides whether a column is
+            # usable as an auxiliary input: a 37%-absent column is mostly train-median by the time
+            # the model sees it, which is a different feature from the one its name suggests.
+            sparse = sorted(
+                (
+                    (name, bundle.label_missing_fraction(name))
+                    for name in bundle.label_feature_names
+                    if bundle.label_missing_fraction(name) > 0
+                ),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            self.logger.info(
+                f"  {bundle.label_dim} measured lab column(s) available as auxiliary inputs"
+                + (
+                    f"; most incomplete: {', '.join(f'{name} ({share:.1%} missing)' for name, share in sparse[:3])}"
+                    if sparse
+                    else "; all complete"
+                )
+            )
         for modality_name in sorted(bundle.sequences):
             counts = bundle.observation_counts(modality_name)
             if counts.size == 0:

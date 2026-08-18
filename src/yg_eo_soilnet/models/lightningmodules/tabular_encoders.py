@@ -268,11 +268,24 @@ class TabularStaticEncoder(nn.Module):
                 "'x_categorical'"
             )
 
+        embedded = self.embeddings(x_categorical) if self.embeddings.num_features else None
+        return self.forward_with_embedding(x_static, embedded)
+
+    def forward_with_embedding(
+        self, x_static: torch.Tensor, embedded: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Same as :meth:`forward` but taking an ALREADY-EMBEDDED categorical block.
+
+        Split out for gradient-based attribution. Embedding lookups are indexed by int64 and are
+        not differentiable with respect to their input, so an explainer cannot perturb
+        ``x_categorical`` directly; it perturbs the embedding vectors instead and sums the
+        attribution back over each feature's slice. Passing the embedding in is what makes that
+        possible without duplicating this concatenation.
+        """
         parts: list[torch.Tensor] = []
         if self.num_continuous > 0:
             parts.append(self.continuous_norm(x_static))
-        if self.embeddings.num_features:
-            embedded = self.embeddings(x_categorical)
+        if embedded is not None:
             parts.append(embedded.to(dtype=x_static.dtype))
 
         features = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)

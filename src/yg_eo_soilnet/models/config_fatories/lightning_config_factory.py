@@ -260,6 +260,11 @@ class LightningConfigFactory:
             "categorical_cardinalities": getattr(datamodule, "categorical_cardinalities", None),
             "categorical_vocabularies": getattr(datamodule, "categorical_vocabularies", None),
             "categorical_feature_names": getattr(datamodule, "categorical_feature_names", None),
+            # The lab columns available as auxiliary inputs, and the targets they must not
+            # duplicate. Both are needed at construction: the model resolves the names it was
+            # configured with into positions, and refuses any that is also being fitted.
+            "auxiliary_available_names": getattr(datamodule, "label_feature_names", None),
+            "target_names": getattr(datamodule, "target_names", None),
         }
         # An empty list is "this dataset has no categoricals", not data worth offering - without it
         # in the sentinel set a model would be handed [] as though it were a real shape.
