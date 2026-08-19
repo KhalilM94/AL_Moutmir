@@ -63,8 +63,9 @@ def test_log_lightning_child_run_logs_metrics_artifacts_and_tags(monkeypatch, tm
         model=fake_model,
     )
 
-    # Two calls now: the run identity, then the checkpoint's original filename.
-    assert set_tags.call_count == 2
+    # Three calls: the run identity, the checkpoint's original filename, and the model-logging
+    # outcome, which is tagged so a run that saved no model cannot look like one that did.
+    assert set_tags.call_count == 3
     log_params.assert_any_call({
         "LIGHTNING_BATCH_SIZE": 8,
         "LIGHTNING_VAL_SIZE": 0.2,

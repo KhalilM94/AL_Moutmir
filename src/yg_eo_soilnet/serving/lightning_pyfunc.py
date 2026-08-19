@@ -185,13 +185,29 @@ def bundle_from_frame(frame: pd.DataFrame, state: Mapping[str, Any]):
         if categorical_names
         else np.empty((n_rows, 0), dtype=object)
     )
-    # Lab auxiliaries are optional: a model built without auxiliary_label_columns never reads them.
-    present_labels = [name for name in label_names if name in frame.columns]
-    label_features = (
-        frame[present_labels].to_numpy(dtype=np.float32)
-        if len(present_labels) == len(label_names) and label_names
-        else np.empty((n_rows, 0), dtype=np.float32)
-    )
+    # The lab block is rebuilt at FULL ROSTER WIDTH, with each supplied column at its own roster
+    # position and the rest left NaN.
+    #
+    # Width, because the model index_selects roster positions: it reads only the few columns named
+    # in auxiliary_label_columns, but it addresses them by where they sit in the roster it was built
+    # against, and it refuses a batch of any other width. Handing it just the supplied columns
+    # produced "Batch carries 0 lab column(s) ... against 24" and silently stopped every model being
+    # logged, hence registered.
+    #
+    # Position rather than order of appearance, because a shifted column would feed the model a
+    # different measurement under the right name without raising anything.
+    #
+    # NaN rather than zero, because NaN is the bundle's own convention for absent (see
+    # SoilSequenceBundle.label_features) and SoilSequenceDataModule._standardize_labels median-fills
+    # it from the training split and flags it in the validity channel - so a column the caller did
+    # not supply arrives marked as unmeasured instead of as a real zero.
+    if label_names:
+        label_features = np.full((n_rows, len(label_names)), np.nan, dtype=np.float32)
+        for index, name in enumerate(label_names):
+            if name in frame.columns:
+                label_features[:, index] = frame[name].to_numpy(dtype=np.float32)
+    else:
+        label_features = np.empty((n_rows, 0), dtype=np.float32)
 
     sequences: dict[str, list[np.ndarray]] = {}
     sequence_times: dict[str, list[np.ndarray]] = {}
@@ -327,6 +343,80 @@ class SoilSequencePyfunc:
             f"prediction_{index}" for index in range(predictions.shape[1])
         ]
         return pd.DataFrame(predictions, columns=names)
+
+
+def example_from_state(
+    state: Mapping[str, Any],
+    static_frame: pd.DataFrame | None = None,
+    n_rows: int = 3,
+    sequence_length: int = 4,
+    auxiliary_columns: Any = None,
+) -> pd.DataFrame:
+    """A schema-correct serving frame built from ``preprocessing_state`` alone - no bundle needed.
+
+    The no-dataset sibling of :func:`build_input_example`. A checkpoint carries every column name and
+    every fitted statistic, so a valid example can be assembled long after the training data is out
+    of reach - which is what lets a model that failed to package be recovered from its checkpoint
+    rather than retrained.
+
+    ``static_frame`` supplies real measured values for whichever static columns it happens to carry;
+    anything absent falls back to the stored training mean. Means rather than zeros: the data the
+    caller sends is in RAW units, and a zero would be an outlier for most covariates, whereas the
+    training mean is by construction inside the range the model was fitted on.
+
+    Note what cannot come from a run's ``eval_results.csv``: it holds the static block and the
+    predictions, never the lab roster and never the ragged sequences. Those are always synthesized
+    here.
+    """
+    static_names = list(state.get("static_feature_names") or [])
+    static_mean = list(state.get("static_mean") or [])
+    categorical_names = list(state.get("categorical_feature_names") or [])
+    vocabularies = list(state.get("categorical_vocabularies") or [])
+    label_names = list(state.get("label_feature_names") or [])
+    label_mean = list(state.get("label_mean") or [])
+    modality_columns = {
+        str(name): list(columns)
+        for name, columns in (state.get("modality_column_names") or {}).items()
+    }
+    sequence_mean = state.get("sequence_mean") or {}
+
+    data: dict[str, Any] = {POINT_ID_COLUMN: [f"point_{index}" for index in range(n_rows)]}
+
+    for index, name in enumerate(static_names):
+        if static_frame is not None and name in static_frame.columns:
+            column = pd.to_numeric(static_frame[name], errors="coerce").to_numpy(dtype=np.float64)
+            values = np.resize(column[np.isfinite(column)], n_rows) if np.isfinite(column).any() else None
+            if values is not None:
+                data[name] = values
+                continue
+        fallback = float(static_mean[index]) if index < len(static_mean) else 0.0
+        data[name] = np.full(n_rows, fallback, dtype=np.float64)
+
+    for index, name in enumerate(categorical_names):
+        # A real vocabulary entry, not a placeholder: an unknown label would land on the reserved
+        # out-of-vocabulary index and quietly exercise a different embedding row than production.
+        vocabulary = vocabularies[index] if index < len(vocabularies) else []
+        data[name] = [str(vocabulary[0]) if vocabulary else "unknown"] * n_rows
+
+    # Only the columns the model actually reads reach the signature; the rest of the roster is
+    # reconstructed at its own position by bundle_from_frame. Passed in rather than read from the
+    # state because the selection is a MODEL hyper-parameter - the state describes the data.
+    for name in list(auxiliary_columns or []):
+        index = label_names.index(name) if name in label_names else -1
+        fallback = float(label_mean[index]) if 0 <= index < len(label_mean) else 0.0
+        data[name] = np.full(n_rows, fallback, dtype=np.float64)
+
+    for modality, columns in modality_columns.items():
+        means = list(sequence_mean.get(modality) or [])
+        per_band = [float(means[index]) if index < len(means) else 0.0 for index in range(len(columns))]
+        data[time_column(modality)] = [
+            [2020.0 + step / 4.0 for step in range(sequence_length)] for _ in range(n_rows)
+        ]
+        data[values_column(modality)] = [
+            [list(per_band) for _ in range(sequence_length)] for _ in range(n_rows)
+        ]
+
+    return pd.DataFrame(data)
 
 
 def build_input_example(model, bundle, n_rows: int = 3) -> pd.DataFrame:

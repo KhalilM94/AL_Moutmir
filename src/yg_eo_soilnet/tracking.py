@@ -81,12 +81,12 @@ def resolve_tracking_uri(config=None) -> str:
     return configured or default_tracking_uri()
 
 
-def configure_tracking(config=None, experiment_name: str | None = None) -> str:
-    """Point MLflow at the configured tracking root and experiment; return the experiment name.
+def configure_tracking_uri(config=None) -> str:
+    """Point MLflow at the tracking root, without touching the current experiment.
 
-    Must run before any run starts - including the implicit one that
-    ``SklearnDataSplitter.split_data`` triggers by calling ``mlflow.log_artifacts`` - or the run
-    lands in whatever experiment happened to be current.
+    Split out because resuming an existing run by id must NOT switch experiments: MLflow refuses
+    ``start_run(run_id=...)`` when the active experiment is not the one that run belongs to, so a
+    caller that only wants to reach an existing run needs the URI without the rest.
     """
     tracking_uri = resolve_tracking_uri(config)
 
@@ -94,6 +94,17 @@ def configure_tracking(config=None, experiment_name: str | None = None) -> str:
         os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
     mlflow.set_tracking_uri(tracking_uri)
+    return tracking_uri
+
+
+def configure_tracking(config=None, experiment_name: str | None = None) -> str:
+    """Point MLflow at the configured tracking root and experiment; return the experiment name.
+
+    Must run before any run starts - including the implicit one that
+    ``SklearnDataSplitter.split_data`` triggers by calling ``mlflow.log_artifacts`` - or the run
+    lands in whatever experiment happened to be current.
+    """
+    configure_tracking_uri(config)
 
     name = experiment_name or str(
         getattr(config, "MLFLOW_EXPERIMENT_NAME", DEFAULT_EXPERIMENT_NAME) or DEFAULT_EXPERIMENT_NAME

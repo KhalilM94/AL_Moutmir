@@ -43,13 +43,13 @@ CARRY_LABEL_COLUMNS: true
 # The subset of LABEL_COLUMNS to actually fit models for in this run. A name on either side is
 # treated as a label and kept out of the features; only these get models fitted.
 TARGET_COLUMNS:
-  - organic_matter_g_kg
+  # - organic_matter_g_kg
   # - organic_matter_pct
-  # - clay_pct
-  # - sand_pct
-  # - total_silt_pct
-  # - ph_water
-  # - caco3_pct_total
+  - clay_pct
+  - sand_pct
+  - total_silt_pct
+  - ph_water
+  - caco3_pct_total
 
 PREDICTOR_COLUMNS: []
 

@@ -201,3 +201,84 @@ def test_the_lightning_path_honours_the_registration_switch(monkeypatch, tmp_pat
 
     expected = "om_soil_cnn" if enabled else None
     assert captured["registered_model_name"] == expected
+
+
+# --- a failed model log cannot look like a success ---------------------------
+# This is what let the auxiliary-column regression run unnoticed: the model failed to log, nothing
+# was registered, and the run still finished looking healthy because the only evidence was inside
+# meta/run_summary.json.
+
+
+def _run_lightning_child(monkeypatch, *, log_model_raises: bool):
+    import mlflow.pyfunc
+    import mlflow.pytorch
+    import pandas as pd
+
+    import yg_eo_soilnet.logger.mlflow_loggers as loggers
+
+    tags: dict = {}
+    monkeypatch.setattr(loggers.mlflow, "set_tags", lambda values: tags.update(values))
+    monkeypatch.setattr(loggers.mlflow, "log_params", MagicMock())
+    monkeypatch.setattr(loggers.mlflow, "log_metric", MagicMock())
+    monkeypatch.setattr(loggers.mlflow, "log_artifact", MagicMock())
+    monkeypatch.setattr("yg_eo_soilnet.artifacts.mlflow.log_artifact", MagicMock())
+    monkeypatch.setattr(mlflow.pytorch, "save_model", lambda *a, **k: None)
+
+    def log_model(**kwargs):
+        if log_model_raises:
+            raise ValueError("Batch carries 0 lab column(s) but this model resolved 24")
+        return SimpleNamespace(registered_model_version="1")
+
+    monkeypatch.setattr(mlflow.pyfunc, "log_model", log_model)
+
+    summaries: list[dict] = []
+    logger = loggers.ChildRunLogger()
+    monkeypatch.setattr(logger, "_write_json_artifact", lambda payload, *a, **k: summaries.append(payload))
+    monkeypatch.setattr(logger, "_promote_champion", lambda *a, **k: {"promoted": False})
+
+    logger.log_lightning_child_run(
+        config=SimpleNamespace(EXPLAIN_ENABLED=False),
+        target="om",
+        model_name="soil_cnn",
+        evaluation_df=pd.DataFrame({"om": [1.0, 2.0, 3.0], "prediction": [1.1, 2.1, 2.9]}),
+        validation_metrics={},
+        test_metrics={},
+        model=SimpleNamespace(),
+    )
+    return tags, summaries[-1]
+
+
+def test_a_failed_model_log_is_tagged_on_the_run(monkeypatch) -> None:
+    """Visible in the MLflow run list, not only inside an artifact nobody opens."""
+    tags, summary = _run_lightning_child(monkeypatch, log_model_raises=True)
+
+    assert tags["model_logged"] == "false"
+    assert "Batch carries 0 lab column" in tags["model_logging_error"]
+    assert summary["serialized_model_logged"] is False
+
+
+def test_a_failed_model_log_does_not_kill_the_run(monkeypatch) -> None:
+    """A fitted model should not be lost to a packaging problem."""
+    _tags, summary = _run_lightning_child(monkeypatch, log_model_raises=True)
+
+    assert summary["metrics"]["rmse_test"] > 0  # the run still recorded its results
+
+
+def test_a_successful_model_log_is_tagged_too(monkeypatch) -> None:
+    """The absence of a tag is not evidence, so the success case is tagged as well."""
+    tags, summary = _run_lightning_child(monkeypatch, log_model_raises=False)
+
+    assert tags["model_logged"] == "true"
+    assert "model_logging_error" not in tags
+    assert summary["serialized_model_logged"] is True
+
+
+def test_a_failed_model_log_warns(monkeypatch, caplog) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        _run_lightning_child(monkeypatch, log_model_raises=True)
+
+    assert any("NO servable model" in record.getMessage() for record in caplog.records)
+    # The actual cause must be in the line, not just "something failed".
+    assert any("Batch carries 0 lab column" in record.getMessage() for record in caplog.records)

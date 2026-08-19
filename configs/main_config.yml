@@ -3,14 +3,14 @@ common:
   data:
     root: "/home/kmisbah/CESBIO/AL_Moutmir/Soil_Datasets/soil_dataset_20251118_140815"
     # Static features. Targets may live in this same file (joint) or be listed separately below.
-    static: 'Morocco_Static_Covariates_Processed_V_110826.csv'
-    # static: "Morocco_roadsafe_6k_with_ts_features_and_covariates_V_110826.csv"
+    # static: 'Morocco_Static_Covariates_Processed_V_110826.csv'
+    static: "Morocco_roadsafe_6k_with_ts_features_and_covariates_V_110826.csv"
     # Omit / leave null when `static` is a joint file that already carries the target columns.
     # Lab targets live in their own file; lat/lon are carried across from it on the join.
-    targets: 'Morocco_soil_targets_uuid_roadsafe_6ksample_V_110826.csv'
+    # targets: 'Morocco_soil_targets_uuid_roadsafe_6ksample_V_110826.csv'
     
     # Time-series always arrives separately: a single file, or a folder of per-modality shards.
-    timeseries: 'Morocco_Soil_Predictors_2017_2025_TS_with_indices_V_110826.csv'
+    # timeseries: 'Morocco_Soil_Predictors_2017_2025_TS_with_indices_V_110826.csv'
     # Optional index.json listing exact paths per source (static_features / targets / timeseries).
     manifest: null
   POINT_ID_COLUMN: "uuid"

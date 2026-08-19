@@ -24,6 +24,7 @@ from mlflow.models import infer_signature
 
 import os
 import importlib
+import logging
 import shutil
 import tempfile
 from typing import Any
@@ -374,6 +375,7 @@ class ChildRunLogger:
         bundle=None,
         best_model_path: str | None = None,
         config=None,
+        input_example=None,
     ) -> bool:
         """Log the model as an mlflow.pyfunc so it can be loaded and served.
 
@@ -397,12 +399,15 @@ class ChildRunLogger:
             stage_serving_package,
         )
 
+        # A caller may hand in a prepared example - relog.py rebuilds a model from a checkpoint and
+        # has no bundle to derive one from. Everything else about the logging path is identical, so
+        # a recovered model is packaged exactly like a freshly trained one.
         sequence_bundle = getattr(getattr(bundle, "datamodule", None), "sequence_bundle", None)
+        if input_example is None and sequence_bundle is not None:
+            input_example = build_input_example(model, sequence_bundle, n_rows=3)
 
         signature = None
-        input_example = None
-        if sequence_bundle is not None:
-            input_example = build_input_example(model, sequence_bundle, n_rows=3)
+        if input_example is not None:
             predictions = SoilSequencePyfunc(model).predict(None, input_example)
             signature = infer_signature(input_example, predictions)
 
@@ -469,6 +474,35 @@ class ChildRunLogger:
         path = os.path.join(staging, "torch_model")
         mlflow.pytorch.save_model(publishable, path, serialization_format="pickle")
         return path
+
+    @staticmethod
+    def _tag_model_logging(target: str, model_name: str, logged: bool, error: str | None) -> None:
+        """Make the outcome of model logging visible on the run itself.
+
+        A failure here is not fatal - a fitted model should not be thrown away over a packaging
+        problem - but it must not be silent either, because a run with no servable model looks
+        exactly like a healthy one in the MLflow run list.
+        """
+        tags = {"model_logged": str(bool(logged)).lower()}
+        if error:
+            # Truncated: MLflow rejects very long tag values, and the full text is in the run
+            # summary. This is the pointer, not the record.
+            tags["model_logging_error"] = str(error)[:450]
+
+        try:
+            mlflow.set_tags(tags)
+        except Exception:
+            # Tagging is a diagnostic; failing to tag must not take the run down with it.
+            pass
+
+        if not logged:
+            logging.getLogger(__name__).warning(
+                "Model logging FAILED for %s_%s: the run has NO servable model and nothing was "
+                "registered. %s",
+                target,
+                model_name,
+                error or "no error recorded",
+            )
 
     def _promote_champion(self, target: str, model_name: str, metrics: dict, version) -> dict:
         """Move the champion alias onto this version when it beats the incumbent.
@@ -924,6 +958,13 @@ class ChildRunLogger:
                 raise
             model_logged = False
             model_logging_error = f"{type(exc).__name__}: {exc}"
+
+        # Tagged on the run, not just recorded in an artifact. A model-logging failure used to leave
+        # the run looking clean - it finished, its metrics were there, and the only evidence sat
+        # inside meta/run_summary.json - so a run that saved NO servable model was indistinguishable
+        # from one that did until somebody thought to open the JSON. The success case is tagged for
+        # the same reason: the absence of a tag is not evidence.
+        self._tag_model_logging(run_target, model_name, model_logged, model_logging_error)
 
         explain_summary = self._log_shap_artifacts(
             config=config,
