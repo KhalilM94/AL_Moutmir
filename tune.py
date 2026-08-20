@@ -159,6 +159,11 @@ def main() -> None:
     with mlflow.start_run(run_name=f"{study_name}_data"):
         scikit_datamodule = ScikitDataModule(config, logger, DataManager(config, logger))
         split_data = scikit_datamodule.prepare()
+        # `split_data` carries the run's shared split_plan, and build_lightning_input copies the
+        # dict, so every trial's datamodule resolves the SAME split. Rebuilding it per trial would
+        # re-fit the scaler and the vocabulary against a different train set and quietly invalidate
+        # the objective - which is why val_size/test_size/seed stay unsearchable in overrides.py.
+        mlflow.log_params(split_data["split_plan"].describe())
         data = build_lightning_input(
             args.entry, registry_entry, config, split_data, logger=logger, data_manager=scikit_datamodule.data_manager
         )

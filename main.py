@@ -3,6 +3,7 @@ from yg_eo_soilnet.logger.training_logger import TrainingLogger
 from yg_eo_soilnet.models.config_fatories.model_config_factory import ModelConfigFactory
 from yg_eo_soilnet.data_manager import DataManager
 from yg_eo_soilnet.datamodules.scikit.scikit_datamodule import ScikitDataModule
+from yg_eo_soilnet.datamodules.split_plan_provider import SplitPlanProvider
 from yg_eo_soilnet.utils import LogTransformer
 from yg_eo_soilnet.logger.mlflow_loggers import ParentRunLogger
 from config import Config
@@ -124,7 +125,13 @@ class SoilModelTraining:
         self.sklearn_logger = self.sklearn_logger_wrapper.get_logger()
 
         self.data_manager = DataManager(self.config, self.logger)
-        self.scikit_datamodule = ScikitDataModule(self.config, self.logger, self.data_manager)
+        # One split for the whole run, decided before either family touches the data. Held here
+        # rather than inside a family so both get the SAME object: sklearn and Lightning used to
+        # split independently, and a Lightning test point was usually an sklearn training point.
+        self.split_plan_provider = SplitPlanProvider(self.config, self.logger, self.data_manager)
+        self.scikit_datamodule = ScikitDataModule(
+            self.config, self.logger, self.data_manager, split_plan_provider=self.split_plan_provider
+        )
         # Spatial clustering splitter
         self.model_configs = ModelConfigFactory(self.config.MODEL_REGISTRY, random_state=self.config.RANDOM_SEED)
         self.lightning_model_configs = LightningConfigFactory(
@@ -255,15 +262,26 @@ def main():
             )
             trainer.logger.info("Running in full training mode...")
 
+            # Decide the split ONCE, for every training family, before either of them touches the
+            # data. Both then select their own rows out of it, so `rmse_test` means the same thing
+            # on both sides of the leaderboard.
+            stage_start = time.perf_counter()
+            split_plan = trainer.split_plan_provider.plan()
+            mlflow.log_params(split_plan.describe())
+            trainer.logger.info(
+                f"split plan built in {time.perf_counter() - stage_start:.2f}s | {split_plan.counts()}"
+            )
+
             # Split data
             stage_start = time.perf_counter()
-            split_data = trainer.scikit_datamodule.split(processed_data)
+            split_data = trainer.scikit_datamodule.split(processed_data, split_plan)
             trainer.logger.info(
                 f"split_data completed in {time.perf_counter() - stage_start:.2f}s | X_train={getattr(split_data.get('X_train'), 'shape', 'n/a')} | X_test={getattr(split_data.get('X_test'), 'shape', 'n/a')}"
             )
 
             stage_start = time.perf_counter()
-            # Train models; the Lightning layer builds its own spatiotemporal graph on demand
+            # Train models; the Lightning layer builds its own spatiotemporal graph on demand, but
+            # reads the split plan carried in `split_data` rather than splitting for itself.
             trainer.train_models(split_data)
             trainer.logger.info(f"train_models completed in {time.perf_counter() - stage_start:.2f}s")
 

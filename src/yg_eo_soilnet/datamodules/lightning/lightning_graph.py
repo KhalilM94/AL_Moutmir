@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 from lightning.pytorch import LightningDataModule
 
 from yg_eo_soilnet.datamodules.lightning.spatiotemporal_graph import SpatiotemporalGraph
+from yg_eo_soilnet.datamodules.splitting import SplitPlan
 
 
 def _as_tensor(value, dtype=None):
@@ -87,6 +88,7 @@ class SingleNodeGraphDataModule(LightningDataModule):
         seed: int = 42,
         shuffle: bool = False,
         target_transform: Optional[str] = None,
+        split_plan: Optional["SplitPlan"] = None,
     ):
         super().__init__()
         self.spatiotemporal_graph = deepcopy(SpatiotemporalGraph.from_mapping(spatiotemporal_graph))
@@ -98,6 +100,9 @@ class SingleNodeGraphDataModule(LightningDataModule):
         self.batch_size = batch_size
         self.val_size = val_size
         self.test_size = test_size
+        # The run's shared split; when present it decides train/val/test and the ratios above are
+        # ignored. See the sequence datamodule for the same contract.
+        self.split_plan = split_plan
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers and num_workers > 0
@@ -446,20 +451,57 @@ class SingleNodeGraphDataModule(LightningDataModule):
         return x_frame, y_frame
 
     def _split_indices(self, num_rows: int):
-        """Split graph nodes into train/val/test. `test_size` and `val_size` are distinct."""
-        indices = np.arange(num_rows)
+        """Train/val/test node indices.
+
+        Resolved from the run's shared :class:`SplitPlan` when one was supplied, so the graph family
+        holds out the same points as sklearn and the sequence family. Otherwise it falls back to the
+        local ratio carve, in which `test_size` and `val_size` apply sequentially.
+        """
+        empty = np.array([], dtype=np.int64)
+        indices = np.arange(num_rows, dtype=np.int64)
         if num_rows <= 1:
-            return indices, np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+            return indices, empty, empty
+
+        if self.split_plan is not None:
+            return self._planned_split_indices(num_rows)
+
+        test_idx, train_val_idx = self._carve_out(indices, self.test_size)
+        if train_val_idx.size <= 1:
+            return train_val_idx, empty, test_idx
+
+        val_idx, train_idx = self._carve_out(train_val_idx, self.val_size)
+        return train_idx, val_idx, test_idx
+
+    def _carve_out(self, indices: np.ndarray, fraction: float):
+        """Split off `fraction` of `indices`, returning ``(held_out, remainder)``.
+
+        A fraction of 0 means "no holdout", which ``train_test_split`` rejects outright rather than
+        treating as empty. Handling it here is what keeps ``val_size=0``/``test_size=0`` usable -
+        this module used to call ``train_test_split`` directly and raised on both.
+        """
+        fraction = min(max(float(fraction), 0.0), 0.9)
+        if fraction <= 0.0:
+            return np.array([], dtype=np.int64), np.asarray(indices, dtype=np.int64)
 
         from sklearn.model_selection import train_test_split
 
-        test_fraction = min(max(float(self.test_size), 0.0), 0.9)
-        train_val_idx, test_idx = train_test_split(
-            indices, test_size=test_fraction, random_state=self.seed, shuffle=True
+        remainder, held_out = train_test_split(
+            indices, test_size=fraction, random_state=self.seed, shuffle=True
         )
-        if len(train_val_idx) <= 1:
-            return np.asarray(train_val_idx, dtype=np.int64), np.array([], dtype=np.int64), np.asarray(test_idx, dtype=np.int64)
+        return np.asarray(held_out, dtype=np.int64), np.asarray(remainder, dtype=np.int64)
 
-        val_fraction = min(max(float(self.val_size), 0.0), 0.9)
-        train_idx, val_idx = train_test_split(train_val_idx, test_size=val_fraction, random_state=self.seed, shuffle=True)
-        return np.asarray(train_idx, dtype=np.int64), np.asarray(val_idx, dtype=np.int64), np.asarray(test_idx, dtype=np.int64)
+    def _planned_split_indices(self, num_rows: int):
+        """Resolve the shared plan against this graph's own node ordering."""
+        point_ids = list(self.spatiotemporal_graph.point_ids)
+        if len(point_ids) != num_rows:
+            raise ValueError(
+                f"The graph carries {len(point_ids)} point id(s) for {num_rows} node(s); the shared "
+                f"split cannot be resolved."
+            )
+        train_idx, val_idx, test_idx = self.split_plan.split_indices(point_ids)
+        if train_idx.size == 0:
+            raise ValueError(
+                "The shared split plan left this datamodule with no training nodes. Check "
+                "split.population_policy and the eligibility of this family's rows."
+            )
+        return train_idx, val_idx, test_idx

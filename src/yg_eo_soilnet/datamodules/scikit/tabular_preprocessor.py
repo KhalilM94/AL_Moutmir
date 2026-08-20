@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import numpy as np
 import pandas as pd
+
+from yg_eo_soilnet.datamodules.frame_cleaning import assert_columns_are_dense_enough
 
 
 class TabularPreprocessor:
@@ -44,6 +47,14 @@ class TabularPreprocessor:
         categorical_cols = [
             col for col in self.config.CATEGORICAL_FEATURES if col in X.columns and col not in self.config.EXCLUDE_CATEGORICAL
         ]
+        # The same gate the Lightning builders apply, so a column too empty to impute stops BOTH
+        # families. This side never deleted rows over a gap - it median-filled and handed the result
+        # to the model as if measured - which is why a 99.7%-blank column could reach XGBoost as a
+        # feature without anything being said. Checked on the continuous block only: a missing
+        # category is encoded as its own value rather than imputed.
+        self.assert_covariates_are_dense_enough(
+            data, [column for column in valid_feature_columns if column not in categorical_cols]
+        )
         if categorical_cols:
             self.logger.info(
                 "Categorical encoding will be applied per model in the training pipeline "
@@ -56,4 +67,36 @@ class TabularPreprocessor:
             "y": data_cleaned[target_columns],
             "lat": data_cleaned[lat_col],
             "lon": data_cleaned[lon_col],
+            # The join key. `filter_schema` strips the id column out of X, so without carrying it
+            # here the sklearn split could not be keyed on point id - and therefore could not be
+            # shared with the Lightning families, whose row sets differ.
+            "point_ids": self._point_ids(data_cleaned),
         }
+
+    def assert_covariates_are_dense_enough(self, data: pd.DataFrame, columns) -> None:
+        """Apply the shared sparsity gate to this family's continuous features."""
+        assert_columns_are_dense_enough(
+            data,
+            columns,
+            max_missing_ratio=float(getattr(self.config, "MAX_MISSING_COLUMN_RATIO", 0.2)),
+            label="the sklearn feature matrix",
+            logger=self.logger,
+            allow=getattr(self.config, "ALLOW_SPARSE_COLUMNS", ()) or (),
+            fail=bool(getattr(self.config, "FAIL_ON_SPARSE_COLUMNS", True)),
+        )
+
+    def usable_point_ids(self, data: pd.DataFrame) -> pd.Index:
+        """Point ids this family can use. Consumed by the unified splitter.
+
+        Every row qualifies: preprocessing drops all-null *columns*, never rows. The method exists
+        so the splitter can ask each family the same question and log an honest delta.
+        """
+        return pd.Index(self._point_ids(data).to_numpy())
+
+    def _point_ids(self, data: pd.DataFrame) -> pd.Series:
+        point_col = getattr(self.config, "POINT_ID_COLUMN", "point_id")
+        if point_col in data.columns:
+            return data[point_col]
+        # No id column in the source: fall back to positional ids so the plan still has a key. Both
+        # families derive it from the same frame in the same order, so they agree.
+        return pd.Series(np.arange(len(data)), index=data.index, name=point_col)

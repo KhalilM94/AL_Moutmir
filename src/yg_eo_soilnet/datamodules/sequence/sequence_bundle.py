@@ -23,8 +23,18 @@ class SoilSequenceBundle:
     """
 
     point_ids: list[Any] = field(default_factory=list)
+    # NaN is PRESERVED here, exactly as in label_features below: the fill value is a train-split
+    # median and at build time the split does not exist yet. A covariate gap used to delete the whole
+    # row instead, which on one real dataset turned 5761 points into 17.
     static_features: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
     static_feature_names: list[str] = field(default_factory=list)
+    # (n_points, len(static_validity_names)) bool: True where the covariate was measured rather than
+    # median-filled. Only columns that ACTUALLY have gaps appear - a constant-True channel doubles
+    # the static width and carries nothing. Empty means no covariate had a gap, which reads as
+    # all-True. Matches what SimpleImputer(add_indicator=True, features='missing-only') emits on the
+    # sklearn side, so the two families flag the same set.
+    static_validity: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=bool))
+    static_validity_names: list[str] = field(default_factory=list)
     # Categorical covariates as RAW LABELS, (n_points, n_categorical) object dtype. Deliberately not
     # encoded here: a vocabulary must be fitted on the training split alone, and at build time the
     # split does not exist yet. The datamodule fits it in setup(), beside the scaler.
@@ -128,7 +138,11 @@ class SoilSequenceBundle:
         Every message names the offending point id (and column where known), because a bare
         "non-finite value" on a 5,700-point bundle is not actionable.
         """
-        self._validate_numeric_array("static_features", self.static_features, self.static_feature_names)
+        # static_features is deliberately NOT run through _validate_numeric_array, for the same
+        # reason label_features below is not: a missing covariate is legitimate and becomes a
+        # train-median fill once the split is known. Requiring finiteness here is what forced the
+        # builder to delete the row instead. Targets are still checked - a point with no label has
+        # nothing to teach.
         self._validate_numeric_array("targets", self.targets, self.target_names)
 
         num_points = len(self.point_ids)
@@ -136,6 +150,23 @@ class SoilSequenceBundle:
             raise ValueError(
                 f"static_features has {self.static_features.shape[0]} row(s) but there are {num_points} point(s)"
             )
+
+        validity = np.asarray(self.static_validity)
+        if validity.ndim == 2 and validity.shape[1]:
+            if validity.shape[0] != num_points:
+                raise ValueError(
+                    f"static_validity has {validity.shape[0]} row(s) but there are {num_points} point(s)"
+                )
+            if validity.shape[1] != len(self.static_validity_names):
+                raise ValueError(
+                    f"static_validity has {validity.shape[1]} column(s) but "
+                    f"{len(self.static_validity_names)} validity feature name(s)"
+                )
+            unknown = [name for name in self.static_validity_names if name not in self.static_feature_names]
+            if unknown:
+                raise ValueError(
+                    f"static_validity_names must be a subset of static_feature_names; unknown: {unknown}"
+                )
 
         # Categorical labels are raw and unencoded, so there is no finiteness to check here - a
         # missing label is legitimate and becomes the reserved index once the vocabulary is fitted.

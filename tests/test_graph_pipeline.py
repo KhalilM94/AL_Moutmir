@@ -231,6 +231,8 @@ def test_data_manager_cleans_non_finite_graph_rows_before_build(tmp_path: Path, 
             "static_2": [20.0, np.nan, 22.0],
         }
     )
+    # One NaN in three rows is 33% of the column, which the sparsity gate rejects outright. This
+    # test is about the graph path still DROPPING such a row, so the gate is opened for it.
     timeseries_df = pd.DataFrame(
         {
             "point_id": [1, 1, 2, 2, 3, 3],
@@ -267,6 +269,7 @@ def test_data_manager_cleans_non_finite_graph_rows_before_build(tmp_path: Path, 
         SPATIAL_RADIUS=2.0,
         BASELINE_METHOD="knn",
         BASELINE_K_NEIGHBORS=1,
+        MAX_MISSING_COLUMN_RATIO=1.0,
     )
 
     manager = DataManager(config=config, logger=logger)
@@ -1280,3 +1283,80 @@ def test_train_loader_drops_a_trailing_partial_batch_but_predict_keeps_every_row
     assert datamodule.predict_dataloader().drop_last is False
     predicted_rows = sum(batch.x_static.shape[0] for batch in datamodule.predict_dataloader())
     assert predicted_rows == len(datamodule.y_test_frame_)
+
+
+# --- the shared split plan -------------------------------------------------
+
+
+def _graph_bundle(tmp_path: Path, logger):
+    static_path, timeseries_path = _write_graph_csvs(tmp_path)
+    config = SimpleNamespace(
+        DATA_FOLDER=str(tmp_path),
+        DATA_FILE="static.csv",
+        STATIC_CSV_PATH=str(static_path),
+        TIMESERIES_CSV_PATH=str(timeseries_path),
+        POINT_ID_COLUMN="point_id",
+        LAT_COLUMN="lat",
+        LON_COLUMN="lon",
+        TIME_COLUMN="month",
+        TEMPORAL_FEATURES_ENABLED=True,
+        MODALITY_PREFIX_MAP={"S1": "S1_", "S2": "S2_", "MODIS": "MODIS_"},
+        S1_COLUMNS=[],
+        S2_COLUMNS=[],
+        MODIS_COLUMNS=[],
+        TARGET_COLUMNS=["target_a"],
+        ELIMINATED_FEATURES=[],
+        TEST_SIZE=0.33,
+        LIGHTNING_VAL_SIZE=0.33,
+        RANDOM_SEED=42,
+        SPATIAL_RADIUS=2.0,
+        BASELINE_K_NEIGHBORS=1,
+    )
+    manager = DataManager(config=config, logger=logger)
+    return SpatiotemporalGraphBuilder(manager.config, manager.logger, manager).build()
+
+
+def test_a_zero_val_size_no_longer_raises(tmp_path: Path, logger) -> None:
+    """This module called train_test_split directly, which rejects test_size=0 outright.
+
+    The sequence datamodule has always handled it; the graph one raised, so the two families could
+    not even be configured the same way.
+    """
+    pytest.importorskip("torch")
+    bundle = _graph_bundle(tmp_path, logger)
+
+    datamodule = SingleNodeGraphDataModule(
+        spatiotemporal_graph=bundle, batch_size=len(bundle.point_ids), val_size=0.0, test_size=0.0, seed=42
+    )
+    datamodule.setup("fit")
+
+    assert datamodule.val_idx_.size == 0
+    assert datamodule.test_idx_.size == 0
+    assert datamodule.train_idx_.size == len(bundle.point_ids)
+
+
+def test_a_split_plan_decides_the_graph_holdout(tmp_path: Path, logger) -> None:
+    """The graph family resolves the same shared plan as sklearn and the sequence family."""
+    pytest.importorskip("torch")
+    from yg_eo_soilnet.datamodules.splitting import SplitPlan
+
+    bundle = _graph_bundle(tmp_path, logger)
+    point_ids = list(bundle.point_ids)
+    assignments = pd.Series("train", index=pd.Index(point_ids, name="point_id"), dtype=object)
+    assignments.iloc[0] = "test"
+    plan = SplitPlan(
+        assignments=assignments,
+        strategy="random",
+        test_size=0.33,
+        val_size=0.0,
+        seed=42,
+        population_policy="intersect",
+    )
+
+    datamodule = SingleNodeGraphDataModule(
+        spatiotemporal_graph=bundle, batch_size=len(point_ids), val_size=0.33, test_size=0.33, split_plan=plan
+    )
+    datamodule.setup("fit")
+
+    assert {point_ids[i] for i in datamodule.test_idx_} == {point_ids[0]}
+    assert datamodule.train_idx_.size == len(point_ids) - 1

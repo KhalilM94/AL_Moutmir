@@ -70,7 +70,15 @@ class PipelineBuilder:
     def _build_preprocessor(self, model: BaseEstimator, categorical_cols: List[str], numeric_cols: List[str]) -> ColumnTransformer:
         is_tree_model = self._is_tree_based_model(model)
 
-        numeric_steps: List[Tuple[str, BaseEstimator]] = [('imputer', SimpleImputer(strategy='median'))]
+        # add_indicator appends a measured-vs-filled flag, matching the validity channels the
+        # Lightning datamodules carry - so a gap means the same thing to both families instead of
+        # being silently indistinguishable from a real measurement on this side. Its default
+        # features='missing-only' emits a flag ONLY for columns that had gaps in the fold it was
+        # fitted on, which is the same "only where there is something to flag" rule. Staying inside
+        # the Pipeline keeps it fitted per fold under GridSearchCV, so it cannot leak.
+        numeric_steps: List[Tuple[str, BaseEstimator]] = [
+            ('imputer', SimpleImputer(strategy='median', add_indicator=True))
+        ]
         if not is_tree_model:
             numeric_steps.append(('scaler', RobustScaler()))
 
@@ -96,6 +104,10 @@ class PipelineBuilder:
             transformers.append((
                 'cat',
                 Pipeline([
+                    # No add_indicator here: OrdinalEncoder already maps a missing category to its
+                    # own reserved value, and OneHotEncoder gives it its own column, so the flag
+                    # would duplicate information the encoding already carries. That matches the
+                    # Lightning side, where a blank category becomes the reserved embedding index.
                     ('imputer', SimpleImputer(strategy='most_frequent')),
                     ('encoder', categorical_encoder),
                 ]),

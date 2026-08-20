@@ -30,7 +30,7 @@ GradientBoosting:
     # model__max_depth: [5, 13, 21]
 
 XGBoost:
-  enabled: false
+  enabled: true
   modeltype: "ml"
   import_path: xgboost.XGBRegressor
   init_args:
@@ -51,7 +51,7 @@ XGBoost:
 TabICL:
   # Pretrained tabular foundation model: fit() does in-context learning, it does not train weights.
   # First fit downloads tabicl-regressor-v2-*.ckpt from the HuggingFace hub.
-  enabled: true
+  enabled: false
   modeltype: "ml"
   import_path: tabicl.TabICLRegressor
   # Each worker loads the full checkpoint, so the default -1 would fan that out over every CV fold

@@ -10,6 +10,8 @@ from yg_eo_soilnet.datamodules.categorical import (
     split_feature_blocks,
 )
 from yg_eo_soilnet.datamodules.frame_cleaning import (
+    assert_columns_are_dense_enough,
+    build_finite_row_mask,
     drop_non_finite_rows,
     sanitize_numeric_columns,
 )
@@ -56,12 +58,21 @@ class SoilSequenceBuilder:
         self.logger = logger
         self.data_manager = data_manager
 
-    def build(self, sequence_data_args: Optional[Mapping[str, Any]] = None) -> SoilSequenceBundle:
-        sequence_data_args = dict(sequence_data_args or {})
-        dataset = self.data_manager.load_dataset()
-        static_df = dataset.tabular
-        point_col = dataset.point_id_column
+    def clean_static_frame(self, static_df: pd.DataFrame, dataset) -> tuple[pd.DataFrame, Any]:
+        """Schema-filter, resolve the categorical blocks, gate sparse covariates and drop bad rows.
 
+        Split out of :meth:`build` so :meth:`usable_point_ids` answers "which points can this family
+        actually use?" with the *same* rule the builder applies, rather than a second copy of it
+        that can drift. The unified splitter needs that answer before any bundle exists.
+
+        A row now dies only for a missing TARGET or point id. It used to die for a missing
+        *covariate* too, which meant three columns that were 99.7% blank could - and on one real
+        dataset did - reduce 5761 points to 17. Covariate gaps are median-filled and flagged by the
+        datamodule instead; columns too empty for that to be honest are rejected outright by
+        :func:`assert_columns_are_dense_enough` above, so nothing reaching the fill is fabricated
+        wholesale.
+        """
+        point_col = dataset.point_id_column
         target_columns = list(dataset.target_columns)
         missing_targets = [column for column in target_columns if column not in static_df.columns]
         if missing_targets:
@@ -72,18 +83,49 @@ class SoilSequenceBuilder:
             self.config, static_df, feature_frame.columns, logger=self.logger
         )
         feature_columns = list(blocks.continuous_columns)
-        # Only the continuous block is checked for finiteness. A missing category is no longer a
-        # reason to delete the point: it becomes the reserved embedding index instead, so a blank
-        # texture costs one covariate rather than the whole soil sample.
-        static_df = drop_non_finite_rows(
+        assert_columns_are_dense_enough(
+            static_df,
+            feature_columns,
+            max_missing_ratio=float(getattr(self.config, "MAX_MISSING_COLUMN_RATIO", 0.2)),
+            label="the static sequence source",
+            logger=self.logger,
+            allow=getattr(self.config, "ALLOW_SPARSE_COLUMNS", ()) or (),
+            fail=bool(getattr(self.config, "FAIL_ON_SPARSE_COLUMNS", True)),
+        )
+        # Targets only. A missing category becomes the reserved embedding index and a missing
+        # continuous covariate becomes a train-median fill plus a validity flag; neither is a reason
+        # to delete the soil sample. A missing LABEL is, because there is nothing to learn from it.
+        cleaned = drop_non_finite_rows(
             static_df,
             logger=self.logger,
             label="static sequence source",
             required_columns=[point_col, *target_columns],
-            numeric_columns=[*feature_columns, *target_columns],
+            numeric_columns=list(target_columns),
         )
+        return cleaned, blocks
+
+    def usable_point_ids(self, static_df: Optional[pd.DataFrame] = None) -> pd.Index:
+        """Point ids that survive this family's cleaning. Consumed by the unified splitter."""
+        dataset = self.data_manager.load_dataset()
+        frame = dataset.tabular if static_df is None else static_df
+        cleaned, _ = self.clean_static_frame(frame, dataset)
+        point_col = dataset.point_id_column
+        if point_col not in cleaned.columns:
+            return pd.Index(range(len(cleaned)))
+        return pd.Index(cleaned[point_col].to_numpy())
+
+    def build(self, sequence_data_args: Optional[Mapping[str, Any]] = None) -> SoilSequenceBundle:
+        sequence_data_args = dict(sequence_data_args or {})
+        dataset = self.data_manager.load_dataset()
+        point_col = dataset.point_id_column
+        target_columns = list(dataset.target_columns)
+
+        static_df, blocks = self.clean_static_frame(dataset.tabular, dataset)
 
         static_features, static_categoricals = split_feature_blocks(static_df, blocks)
+        static_validity, static_validity_names = self._static_validity(
+            static_df, list(blocks.continuous_columns)
+        )
         targets = static_df[target_columns].to_numpy(dtype=np.float32)
         label_features, label_feature_names = self._extract_label_features(static_df)
         point_ids = (
@@ -104,7 +146,9 @@ class SoilSequenceBuilder:
         bundle = SoilSequenceBundle(
             point_ids=point_ids,
             static_features=static_features,
-            static_feature_names=feature_columns,
+            static_feature_names=list(blocks.continuous_columns),
+            static_validity=static_validity,
+            static_validity_names=static_validity_names,
             static_categoricals=static_categoricals,
             categorical_feature_names=list(blocks.categorical_columns),
             targets=targets,
@@ -120,6 +164,37 @@ class SoilSequenceBuilder:
         bundle.validate()
         self._log_summary(bundle)
         return bundle
+
+    # --- covariate gaps ---------------------------------------------------
+
+    def _static_validity(
+        self, static_df: pd.DataFrame, feature_columns: list[str]
+    ) -> tuple[np.ndarray, list[str]]:
+        """Measured-vs-missing flags, for the continuous covariates that actually have gaps.
+
+        Only gappy columns get a flag. A fully populated column would contribute a constant-True
+        channel: it doubles the static width, carries no information, and costs the model parameters
+        to ignore it. This mirrors what sklearn's ``SimpleImputer(add_indicator=True)`` does on the
+        other family with ``features='missing-only'``, so both sides emit the same set.
+        """
+        rows = len(static_df)
+        gappy = [
+            column
+            for column in feature_columns
+            if column in static_df.columns
+            and not bool(build_finite_row_mask(static_df, numeric_columns=[column]).all())
+        ]
+        if not gappy:
+            return np.empty((rows, 0), dtype=bool), []
+
+        validity = np.column_stack(
+            [build_finite_row_mask(static_df, numeric_columns=[column]).to_numpy(dtype=bool) for column in gappy]
+        )
+        self.logger.info(
+            f"Carrying measured-vs-filled flags for {len(gappy)} continuous covariate(s) with gaps: "
+            + ", ".join(gappy)
+        )
+        return validity, gappy
 
     # --- measured lab values ----------------------------------------------
 

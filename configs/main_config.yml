@@ -17,7 +17,72 @@ common:
   LAT_COLUMN: "lat"
   LON_COLUMN: "lon"
   RANDOM_SEED: 42
-  TEST_SIZE: 0.3
+  # TEST_SIZE deliberately absent: the holdout now lives in `split:` below, and having both would
+  # give the run two sources of truth for the same number. It is still read as a fallback for
+  # configs that predate this block.
+
+  # --- the train/val/test split, decided ONCE for every training family --------------------
+  # Previously each family split for itself: sklearn carved 70/30 off the tabular frame while the
+  # Lightning datamodules carved 64/16/20 off a bundle rebuilt from the same CSVs. The holdouts
+  # overlapped, so a Lightning test point was usually an sklearn TRAINING point - and both families
+  # publish the result as `rmse_test` on one leaderboard axis. This block replaces both.
+  #
+  # The split is keyed on POINT_ID_COLUMN, not on row position: the families disagree about which
+  # rows are usable, so positions do not mean the same thing on both sides while a point id does.
+  split:
+    # random        - i.i.d. holdout over point ids.
+    # spatial_group - cluster first, then hold out WHOLE clusters, so no cluster straddles two
+    #                 splits. Prefer this when spatial autocorrelation would otherwise let a test
+    #                 point be predicted from its neighbour a few metres away in train.
+    strategy: random
+    # Both are fractions of the FULL eligible population, NOT of the remainder. Asking for 0.2 gets
+    # 20%. (The old sequential carve is why the Lightning registry carried the note "without this,
+    # train was 0.7*0.7=0.49".) train is whatever is left: 0.64 here.
+    test_size: 0.15
+    val_size: 0.15
+    seed: 42
+    # How to handle points only some families can use - the sequence builder drops rows with
+    # non-finite covariates that the tabular preprocessor keeps.
+    #   intersect  - split over the points EVERY active family can use, so the test set is
+    #                identical row for row and metrics are strictly comparable. Costs sklearn rows.
+    #   assign_all - label every point; each family takes the subset it holds. Test sets share
+    #                membership, but sklearn's is a superset.
+    # The per-family delta is logged either way. Flip this key to A/B the two.
+    population_policy: intersect
+    # Floor on what `intersect` may leave behind, as a fraction of the source frame. Below it the
+    # run stops and names the narrowest family instead of quietly training everything on that
+    # family's tiny population. Raise it to be stricter; 0 disables the check.
+    min_population_ratio: 0.5
+    # Path to a previously written data_splits/split_assignments.parquet. Set it to freeze the
+    # test set across runs even as the source data grows. null rebuilds the split each run.
+    plan_path: null
+    # Read only when strategy is spatial_group. Any BaseSpatialClusterStrategy.
+    group:
+      class_path: yg_eo_soilnet.clustering_utils.KMeansClusterStrategy
+      params:
+        n_clusters: 12
+        # cell_size_m: 5000   # SpatialGridClusterStrategy instead of KMeans
+
+  # --- data quality: one missingness rule for every training family ------------------------
+  # A blank covariate used to mean two different things depending on who was reading it. sklearn
+  # median-filled it and handed the result to the model as if it were measured; the Lightning
+  # builders deleted every affected row. On one real dataset three columns that were 99.7% blank
+  # cost the sequence family 5744 of 5761 points - and nothing said so.
+  #
+  # Now there is one rule, applied by both:
+  #   blank on MORE than max_missing_column_ratio of rows -> the run STOPS and names the column
+  #   blank on LESS                                       -> median-filled and flagged, row kept
+  # A validity flag is carried only for columns that actually have gaps, so a fully populated
+  # dataset (like the current one) is completely unaffected.
+  data_quality:
+    max_missing_column_ratio: 0.2
+    # Names exempted from the check: kept and imputed however sparse they are. Use when the
+    # imputed value is genuinely wanted, not to silence a warning.
+    allow_sparse_columns: []
+    # false downgrades the stop to a warning and trains anyway. Off by default because the whole
+    # point is that this failure used to be silent.
+    fail_on_sparse_columns: true
+
   FAIL_IF_ALL_MODELS_FAIL_FOR_TARGET: true
   FAIL_ON_MODEL_ERROR: false
   DATA_SPEC_PATH: "data_spec.yml"

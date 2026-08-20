@@ -42,6 +42,8 @@ class LightningConfigFactory:
         # re-fits normalization and vocabularies in setup(), which dominates the cost of a short
         # trial. Sharing is safe because setup() is idempotent and a datamodule holds no model state.
         self.datamodule_cache = datamodule_cache
+        # Lazily built in _resolve_split_plan, and only when `data` carries no plan of its own.
+        self._split_plan_provider = None
 
     @staticmethod
     def _dynamic_import(import_path: str):
@@ -145,8 +147,10 @@ class LightningConfigFactory:
 
         datamodule_kwargs = deepcopy(spec.get("datamodule_init_args", {}))
         datamodule_kwargs.setdefault("batch_size", getattr(self.config, "LIGHTNING_BATCH_SIZE", 32))
-        datamodule_kwargs.setdefault("val_size", getattr(self.config, "LIGHTNING_VAL_SIZE", 0.2))
-        datamodule_kwargs.setdefault("test_size", getattr(self.config, "TEST_SIZE", 0.2))
+        # Fallbacks only. When a split_plan is injected below it decides train/val/test and these
+        # are ignored - they matter only for a datamodule built without the shared plan.
+        datamodule_kwargs.setdefault("val_size", getattr(self.config, "SPLIT_VAL_SIZE", 0.2))
+        datamodule_kwargs.setdefault("test_size", getattr(self.config, "SPLIT_TEST_SIZE", 0.2))
         datamodule_kwargs.setdefault("num_workers", getattr(self.config, "LIGHTNING_NUM_WORKERS", 0))
         datamodule_kwargs.setdefault("pin_memory", getattr(self.config, "LIGHTNING_PIN_MEMORY", False))
         datamodule_kwargs.setdefault(
@@ -169,8 +173,14 @@ class LightningConfigFactory:
                 payload = self._build_sequence_bundle(spec)
             datamodule_kwargs["sequence_bundle"] = payload
 
+        split_plan = self._resolve_split_plan(data)
+        if split_plan is not None and self._accepts_kwarg(datamodule_cls, "split_plan"):
+            datamodule_kwargs["split_plan"] = split_plan
+
         if self.datamodule_cache is not None:
-            cache_key = (*cache_key, id(payload))
+            # The plan joins the payload in the identity part of the key: two runs of the same entry
+            # under different splits are different datamodules, and must not share a cache slot.
+            cache_key = (*cache_key, id(payload), id(split_plan))
             cached = self.datamodule_cache.get(cache_key)
             if cached is not None:
                 return cached
@@ -212,6 +222,30 @@ class LightningConfigFactory:
         if "spatial_graph_enabled" in init_args and "spatial_graph_enabled" not in graph_data_args:
             graph_data_args["spatial_graph_enabled"] = init_args["spatial_graph_enabled"]
         return graph_data_args
+
+    def _resolve_split_plan(self, data: Mapping[str, Any]):
+        """The run's shared split, from the payload dict or from the provider.
+
+        Without this the Lightning families split for themselves and their holdout overlapped the
+        sklearn one - which is the whole reason the shared plan exists. Falling back to the provider
+        rather than to a private split matters: `data` carries a plan only when the caller went
+        through main.py or tune.py, and a directly-constructed factory must not quietly diverge.
+        """
+        plan = data.get("split_plan")
+        if plan is not None:
+            return plan
+        if self.data_manager is None:
+            return None
+        from yg_eo_soilnet.datamodules.split_plan_provider import SplitPlanProvider
+
+        if getattr(self, "_split_plan_provider", None) is None:
+            self._split_plan_provider = SplitPlanProvider(self.config, self.logger, self.data_manager)
+        return self._split_plan_provider.plan()
+
+    @classmethod
+    def _accepts_kwarg(cls, target_cls: Any, name: str) -> bool:
+        accepted = cls._accepted_init_args(target_cls)
+        return accepted is None or name in accepted
 
     @staticmethod
     def _accepted_init_args(model_cls: Any) -> set[str] | None:

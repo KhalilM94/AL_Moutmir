@@ -33,13 +33,14 @@ defaults:
       save_top_k: 1
   datamodule_init_args:
     batch_size: 32
-    val_size: 0.2
-    test_size: 0.2         # splits apply sequentially: without this, train was 0.7*0.7=0.49
+    # val_size / test_size / seed deliberately absent. The train/val/test split is decided ONCE for
+    # every training family in main_config.yml's `split:` block, and injected here as a split_plan.
+    # Setting them here is what used to shadow common.TEST_SIZE - editing that key moved only the
+    # sklearn holdout while this file silently kept Lightning on its own, overlapping one.
     target_transform: log1p # null | log1p (log1p also standardizes in transformed space)
     num_workers: 11         # collate pickles the whole datamodule per worker
     pin_memory: false
     persistent_workers: false
-    seed: 42
     shuffle: true
   tags:
     framework: lightning

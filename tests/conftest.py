@@ -52,7 +52,19 @@ def toy_config() -> SimpleNamespace:
         POINT_ID_COLUMN="point_id",
         ENABLE_CLUSTERING=False,
         CLUSTERING_STRATEGY={"enabled": False, "class_path": "yg_eo_soilnet.models.KMeansClusterStrategy", "params": {}},
+        # The INNER cross-validation strategy, not the holdout.
         SPLIT_STRATEGY="kfold",
+        # The shared holdout, decided once for every training family. See datamodules/splitting.py.
+        SPLIT_HOLDOUT_STRATEGY="random",
+        SPLIT_TEST_SIZE=0.25,
+        SPLIT_VAL_SIZE=0.25,
+        SPLIT_SEED=42,
+        SPLIT_POPULATION_POLICY="intersect",
+        SPLIT_PLAN_PATH=None,
+        SPLIT_MIN_POPULATION_RATIO=0.5,
+        SPLIT_GROUP_STRATEGY={},
+        LAT_COLUMN="lat",
+        LON_COLUMN="lon",
         IGNORE_BANDS=[],
         EXISTING_HS_FEATURES={"enabled": False, "ignore": False, "prefix": "S2_", "band_count": 6, "band_names": []},
         COLUMNS_TO_TRANSFORM=["target_a"],
@@ -61,7 +73,37 @@ def toy_config() -> SimpleNamespace:
         EXCLUDE_CATEGORICAL=[],
         ELIMINATED_FEATURES=[],
         MODEL_REGISTRY={},
+        LIGHTNING_MODEL_REGISTRY={},
     )
+
+
+@pytest.fixture
+def split_plan_for(toy_config, logger):
+    """Build the shared split plan over a toy frame, the way the provider does for a real run.
+
+    Tests that hand a preprocessed dict straight to the splitter cannot use SplitPlanProvider,
+    which loads the dataset from disk - but they still have to supply a plan, because deciding the
+    split is no longer the sklearn family's job.
+    """
+    from yg_eo_soilnet.datamodules.splitting import UnifiedSplitter
+
+    def build(frame, **overrides):
+        for key, value in overrides.items():
+            setattr(toy_config, key, value)
+        point_col = toy_config.POINT_ID_COLUMN
+        ids = frame[point_col] if point_col in frame.columns else pd.Series(range(len(frame)))
+        coordinates = pd.DataFrame(
+            {
+                toy_config.LAT_COLUMN: frame[toy_config.LAT_COLUMN].to_numpy(),
+                toy_config.LON_COLUMN: frame[toy_config.LON_COLUMN].to_numpy(),
+            },
+            index=pd.Index(ids.to_numpy()),
+        )
+        return UnifiedSplitter(toy_config, logger).build_plan(
+            pd.Index(ids.to_numpy()), coordinates=coordinates
+        )
+
+    return build
 
 
 @pytest.fixture

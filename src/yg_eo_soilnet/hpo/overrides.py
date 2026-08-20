@@ -48,7 +48,12 @@ FACTORY_RESOLVED_MODEL_KEYS = frozenset(
 # scaler, the categorical vocabulary and target_mean_/target_scale_ on the train split, so varying
 # any of these changes what val_loss and val_r2 are even measuring. Pinning them in `fixed` is fine;
 # searching over them is not.
-SPLIT_DEFINING_DATAMODULE_KEYS = frozenset({"val_size", "test_size", "seed"})
+#
+# `val_size`/`test_size`/`seed` are inert once the shared split plan is injected - the study builds
+# one plan up front and every trial resolves it - but they stay listed so a search space written
+# against the old contract fails loudly rather than looking like it worked. `split_plan` is the
+# live one: overriding it per trial is exactly the invalidation the other three used to cause.
+SPLIT_DEFINING_DATAMODULE_KEYS = frozenset({"val_size", "test_size", "seed", "split_plan"})
 
 
 def to_builtin(value: Any) -> Any:
@@ -114,11 +119,18 @@ def validate_override_keys(dotted_keys: Iterable[str], *, searched: bool) -> Non
                 f"  {dotted}: resolved from the datamodule by LightningConfigFactory._build_model; "
                 f"overriding it breaks the model/datamodule shape contract."
             )
+        elif prefix == "datamodule" and key == "split_plan":
+            problems.append(
+                f"  {dotted}: the split is decided once for the whole run, in main_config.yml's "
+                f"`split:` block, and shared with the sklearn family. A per-trial plan would make "
+                f"the trials incomparable with each other and with the leaderboard."
+            )
         elif searched and prefix == "datamodule" and key in SPLIT_DEFINING_DATAMODULE_KEYS:
             problems.append(
                 f"  {dotted}: changes the train/val/test split, and with it the fitted scaler, the "
                 f"categorical vocabulary and target_mean_/target_scale_. Trials would not be "
-                f"comparable. Pin it under 'fixed:' instead of searching it."
+                f"comparable. Set it in main_config.yml's `split:` block, which applies to the "
+                f"whole study, rather than searching it."
             )
     if problems:
         section = "params" if searched else "fixed"

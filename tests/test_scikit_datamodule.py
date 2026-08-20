@@ -99,29 +99,40 @@ def test_preprocess_drops_existing_hyperspectral_columns_by_prefix(toy_config, l
     assert list(processed["X"].columns) == ["cat", "feature"]
 
 
-def test_split_without_clustering(monkeypatch: pytest.MonkeyPatch, datamodule, toy_config, toy_dataframe) -> None:
-    from sklearn.model_selection import train_test_split
-
+def test_split_selects_this_family_rows_from_the_shared_plan(
+    monkeypatch: pytest.MonkeyPatch, datamodule, toy_dataframe, split_plan_for
+) -> None:
+    """The sklearn family no longer decides the split; it selects its rows out of the shared one."""
     processed = datamodule.preprocess(toy_dataframe)
     _stub_artifact_logging(monkeypatch)
+    plan = split_plan_for(toy_dataframe)
 
-    split = datamodule.split(processed)
+    split = datamodule.split(processed, plan)
 
-    expected = train_test_split(
-        processed["X"],
-        processed["y"],
-        processed["lat"],
-        processed["lon"],
-        test_size=toy_config.TEST_SIZE,
-        random_state=toy_config.RANDOM_SEED,
-    )
-
-    assert split["X_train"].shape[0] == expected[0].shape[0]
-    assert split["X_test"].shape[0] == expected[1].shape[0]
+    point_ids = processed["point_ids"].to_numpy()
+    expected_test = set(plan.point_ids_for("test"))
+    assert set(point_ids[split["X_test"].index]) == expected_test
+    # X_train is the FIT POOL: train ∪ val, because GridSearchCV k-folds inside it.
+    assert split["X_train"].shape[0] == len(plan.point_ids_for("train")) + len(plan.point_ids_for("val"))
+    assert split["X_train_only"].shape[0] == len(plan.point_ids_for("train"))
+    assert split["X_val"].shape[0] == len(plan.point_ids_for("val"))
     assert "groups_train" not in split
 
 
-def test_split_with_clustering(monkeypatch: pytest.MonkeyPatch, toy_config, toy_dataframe, logger) -> None:
+def test_split_without_a_plan_refuses_rather_than_inventing_one(
+    monkeypatch: pytest.MonkeyPatch, datamodule, toy_dataframe
+) -> None:
+    """A private split is exactly the bug the shared plan exists to prevent."""
+    processed = datamodule.preprocess(toy_dataframe)
+    _stub_artifact_logging(monkeypatch)
+
+    with pytest.raises(ValueError, match="needs the run's split_plan"):
+        datamodule.splitter.split_data(processed, split_plan=None)
+
+
+def test_split_with_clustering(
+    monkeypatch: pytest.MonkeyPatch, toy_config, toy_dataframe, logger, split_plan_for
+) -> None:
     class FakeClusterStrategy(BaseSpatialClusterStrategy):
         def __init__(self) -> None:
             self.plot_calls = []
@@ -141,8 +152,8 @@ def test_split_with_clustering(monkeypatch: pytest.MonkeyPatch, toy_config, toy_
         def load_splitter_from_config(self):
             return self.strategy
 
-    toy_config.ENABLE_CLUSTERING = True
-    toy_config.CLUSTERING_STRATEGY = {
+    toy_config.SPLIT_HOLDOUT_STRATEGY = "spatial_group"
+    toy_config.SPLIT_GROUP_STRATEGY = {
         "enabled": True,
         "class_path": "yg_eo_soilnet.models.KMeansClusterStrategy",
         "params": {"n_clusters": 2},
@@ -155,11 +166,17 @@ def test_split_with_clustering(monkeypatch: pytest.MonkeyPatch, toy_config, toy_
     monkeypatch.setattr("yg_eo_soilnet.models.ModelConfigFactory", FakeFactory)
     _stub_artifact_logging(monkeypatch)
 
-    split = module.split(processed)
+    plan = split_plan_for(toy_dataframe)
+    split = module.split(processed, plan)
 
+    # The clusters the holdout was blocked on travel with the split, so GroupKFold inside the fit
+    # pool respects the same spatial structure the holdout did.
     assert "groups_train" in split
     assert "groups_test" in split
     assert set(split["groups_train"].unique()).issubset({1, 2})
+    # No cluster may straddle two splits - that is the whole point of a grouped holdout.
+    frame = plan.to_frame()
+    assert frame.groupby("cluster")["split"].nunique().max() == 1
 
 
 def test_split_sanitizes_features_with_the_full_schema_filter(monkeypatch: pytest.MonkeyPatch, toy_config, logger) -> None:
@@ -168,14 +185,17 @@ def test_split_sanitizes_features_with_the_full_schema_filter(monkeypatch: pytes
 
     captured = {}
 
-    def fake_split_data(processed_data, *, sanitize_features=None, model_config_factory=None):
+    def fake_split_data(processed_data, *, sanitize_features=None, model_config_factory=None, split_plan=None):
         captured["sanitize_features"] = sanitize_features
         return {}
 
     module = ScikitDataModule(toy_config, logger, DataManager(toy_config, logger))
     monkeypatch.setattr(module.splitter, "split_data", fake_split_data)
 
-    module.split({"X": pd.DataFrame(), "y": pd.DataFrame(), "lat": pd.Series(), "lon": pd.Series()})
+    module.split(
+        {"X": pd.DataFrame(), "y": pd.DataFrame(), "lat": pd.Series(), "lon": pd.Series()},
+        object(),
+    )
 
     frame = pd.DataFrame({"eliminated": [1], "keep_me": [2]})
     assert list(captured["sanitize_features"](frame).columns) == ["keep_me"]
@@ -202,9 +222,15 @@ def test_load_frame_joins_targets_when_static_frame_lacks_them(tmp_path: Path, t
 def test_clustering_with_a_non_strategy_raises_instead_of_returning_empty_splits(
     monkeypatch: pytest.MonkeyPatch, toy_config, toy_dataframe, logger
 ) -> None:
-    """Falling through used to yield empty frames and a KeyError('groups_train') much later."""
-    toy_config.ENABLE_CLUSTERING = True
-    toy_config.CLUSTERING_STRATEGY = {"enabled": False, "class_path": "a.b.C", "params": {}}
+    """Falling through used to yield empty frames and a KeyError('groups_train') much later.
+
+    The guard moved with the strategy: grouping is now decided by the unified splitter, so this is
+    where a mis-declared class_path has to be caught.
+    """
+    from yg_eo_soilnet.datamodules.splitting import UnifiedSplitter
+
+    toy_config.SPLIT_HOLDOUT_STRATEGY = "spatial_group"
+    toy_config.SPLIT_GROUP_STRATEGY = {"enabled": False, "class_path": "a.b.C", "params": {}}
 
     class NotAStrategy:
         def load_splitter_from_config(self):
@@ -213,13 +239,13 @@ def test_clustering_with_a_non_strategy_raises_instead_of_returning_empty_splits
         def __init__(self, *args, **kwargs):
             pass
 
-    module = ScikitDataModule(toy_config, logger, DataManager(toy_config, logger))
-    processed = module.preprocess(toy_dataframe)
-    _stub_artifact_logging(monkeypatch)
+    monkeypatch.setattr("yg_eo_soilnet.models.ModelConfigFactory", NotAStrategy)
 
+    coordinates = pd.DataFrame(
+        {"lat": toy_dataframe["lat"].to_numpy(), "lon": toy_dataframe["lon"].to_numpy()},
+        index=pd.Index(range(len(toy_dataframe))),
+    )
     with pytest.raises(TypeError, match="did not resolve to a BaseSpatialClusterStrategy"):
-        module.splitter.split_data(
-            processed,
-            sanitize_features=module.data_manager.filter_schema,
-            model_config_factory=NotAStrategy,
+        UnifiedSplitter(toy_config, logger).build_plan(
+            pd.Index(range(len(toy_dataframe))), coordinates=coordinates
         )

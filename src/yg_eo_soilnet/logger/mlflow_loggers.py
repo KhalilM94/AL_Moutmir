@@ -27,7 +27,7 @@ import importlib
 import logging
 import shutil
 import tempfile
-from typing import Any
+from typing import Any, Mapping
 
 
 # Kept as a module constant because callers outside this file import it. It is now sourced from
@@ -84,20 +84,61 @@ class ChildRunLogger:
         if datamodule is None:
             return
 
-        summary: dict[str, Any] = {}
-        metric_prefixes = {
-            "train": getattr(datamodule, "y_train_frame_", None),
-            "val": getattr(datamodule, "y_val_frame_", None),
-            "test": getattr(datamodule, "y_test_frame_", None),
-        }
+        self._write_split_summary(
+            {
+                "train": getattr(datamodule, "y_train_frame_", None),
+                "val": getattr(datamodule, "y_val_frame_", None),
+                "test": getattr(datamodule, "y_test_frame_", None),
+            },
+            evaluation_df,
+            target,
+        )
 
-        for split_name, frame in metric_prefixes.items():
+    @staticmethod
+    def _as_target_frame(values):
+        """A one-column frame for a Series, the frame itself for a DataFrame.
+
+        The two families genuinely hold the target differently and always will: the Lightning
+        datamodule carries every target column at once, while the sklearn trainer fits one target at
+        a time and hands over that column alone (``data['y_train'][target]``). Normalizing here
+        rather than at the call site means any future caller gets it right for free - assuming the
+        DataFrame shape is exactly what broke every sklearn run with
+        ``'Series' object has no attribute 'columns'``.
+        """
+        if isinstance(values, pd.Series):
+            return values.to_frame(name=values.name if values.name is not None else "target")
+        return values
+
+    def _write_split_summary(
+        self,
+        split_frames: Mapping[str, "pd.DataFrame | pd.Series | None"],
+        evaluation_df: pd.DataFrame | None,
+        target: str,
+    ) -> None:
+        """One eval_results/split_summary.json shape for BOTH families.
+
+        This used to be reachable only from the Lightning path - it early-returned without a
+        `bundle.datamodule` - so a sklearn run recorded nothing about what it held out. Now that the
+        two families share a split, the artifact they publish about it has to be comparable too.
+        The sklearn side has no `val` frame of its own: its fit pool is train ∪ val and it validates
+        by k-fold inside that pool, so what it reports under "train" is that whole pool.
+
+        Accepts a Series or a DataFrame per split; see :meth:`_as_target_frame`.
+        """
+        summary: dict[str, Any] = {}
+
+        for split_name, values in split_frames.items():
+            frame = self._as_target_frame(values)
             if frame is None or getattr(frame, "empty", True):
                 continue
             target_columns = [column for column in frame.columns if column != "target_name"]
             if not target_columns:
                 continue
-            column_name = target_columns[0]
+            # Prefer THIS run's target. The Lightning frames carry every target column, so taking
+            # the first one would describe some other target's distribution under this run's name.
+            # The sklearn side passes exactly one column, already named for this run's target, so
+            # both paths land on the same column and the artifact stays comparable.
+            column_name = target if target in target_columns else target_columns[0]
             stats = self._numeric_summary(frame[column_name])
             if not stats:
                 continue
@@ -756,6 +797,10 @@ class ChildRunLogger:
                 },
             )
 
+            # The same split_summary.json the Lightning path writes, so the two families' holdouts
+            # can be compared directly - which is the point of sharing one split plan.
+            self._write_split_summary({"train": y_train, "test": y_test}, None, target)
+
             # --- Run summary, the same shape the Lightning path writes ---
             self._write_json_artifact(
                 {
@@ -1146,7 +1191,10 @@ class ParentRunLogger:
             "TARGETS_FILE": getattr(trainer.config, "TARGETS_FILE", trainer.config.DATA_FILE),
             "ENABLE_CLUSTERING": trainer.config.ENABLE_CLUSTERING,
             "CLUSTERING_STRATEGY": trainer.config.CLUSTERING_STRATEGY if trainer.config.ENABLE_CLUSTERING else None,
-            "SPLIT_STRATEGY": trainer.config.SPLIT_STRATEGY
+            # The INNER cross-validation strategy. SPLIT_HOLDOUT_STRATEGY below is the holdout.
+            "SPLIT_STRATEGY": trainer.config.SPLIT_STRATEGY,
+            "SPLIT_HOLDOUT_STRATEGY": getattr(trainer.config, "SPLIT_HOLDOUT_STRATEGY", None),
+            "SPLIT_POPULATION_POLICY": getattr(trainer.config, "SPLIT_POPULATION_POLICY", None),
         })
         mlflow.log_params({
             "DATA_FOLDER": trainer.config.DATA_FOLDER,
@@ -1160,6 +1208,13 @@ class ParentRunLogger:
             "CLUSTERING_STRATEGY": trainer.config.CLUSTERING_STRATEGY.get('class_path').rsplit('.', 1)[1] if trainer.config.ENABLE_CLUSTERING else None,
             "cell_size_m": trainer.config.CLUSTERING_STRATEGY.get('params', {}).get('cell_size_m', None) if trainer.config.ENABLE_CLUSTERING else None,
             "n_clusters": trainer.config.CLUSTERING_STRATEGY.get('params', {}).get('n_clusters', None) if trainer.config.ENABLE_CLUSTERING else None,
+            # The shared holdout. TEST_SIZE was previously logged nowhere at all, so a finished run
+            # did not record how much data it held out, let alone which points.
+            "SPLIT_HOLDOUT_STRATEGY": getattr(trainer.config, "SPLIT_HOLDOUT_STRATEGY", None),
+            "SPLIT_TEST_SIZE": getattr(trainer.config, "SPLIT_TEST_SIZE", None),
+            "SPLIT_VAL_SIZE": getattr(trainer.config, "SPLIT_VAL_SIZE", None),
+            "SPLIT_SEED": getattr(trainer.config, "SPLIT_SEED", None),
+            "SPLIT_POPULATION_POLICY": getattr(trainer.config, "SPLIT_POPULATION_POLICY", None),
         })
 
         # 1. Fetch child runs

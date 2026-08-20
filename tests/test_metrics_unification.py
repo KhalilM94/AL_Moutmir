@@ -204,3 +204,79 @@ def test_parent_summary_plots_the_unified_axes(monkeypatch) -> None:
 
     assert captured["metric_x"] == "rmse_test"
     assert captured["metric_y"] == "r2_test"
+
+
+# --- the split summary, which BOTH families now write ---------------------------------------
+
+
+@pytest.fixture
+def captured_artifacts(monkeypatch, captured_metrics) -> dict:
+    """Collects the JSON artifacts ChildRunLogger writes, keyed by filename."""
+    written: dict = {}
+
+    def record(self, payload, filename, artifact_path=None):
+        written[filename] = payload
+
+    monkeypatch.setattr(ChildRunLogger, "_write_json_artifact", record)
+    return written
+
+
+def test_the_split_summary_accepts_the_sklearn_single_target_series(captured_artifacts) -> None:
+    """The regression test for `'Series' object has no attribute 'columns'`.
+
+    ModelTrainer fits one target at a time and hands over `data['y_train'][target]` - a Series, not
+    a frame. Assuming the Lightning shape here made every sklearn model fail at the end of an
+    otherwise successful fit, reported as "Training failed" by the trainer's own except block.
+    """
+    ChildRunLogger()._write_split_summary(
+        {
+            "train": pd.Series(OBSERVED, name="caco3_pct_total"),
+            "test": pd.Series(PREDICTED, name="caco3_pct_total"),
+        },
+        None,
+        "caco3_pct_total",
+    )
+
+    summary = captured_artifacts["split_summary.json"]
+    assert summary["train"]["target_column"] == "caco3_pct_total"
+    assert summary["train"]["count"] == len(OBSERVED)
+    assert summary["test"]["count"] == len(PREDICTED)
+
+
+def test_the_split_summary_picks_this_run_target_out_of_a_multi_target_frame(
+    captured_artifacts,
+) -> None:
+    """The Lightning shape. Taking column zero would describe some other target under this name."""
+    ChildRunLogger()._write_split_summary(
+        {"train": pd.DataFrame({"clay_pct": PREDICTED, "caco3_pct_total": OBSERVED})},
+        None,
+        "caco3_pct_total",
+    )
+
+    summary = captured_artifacts["split_summary.json"]
+    assert summary["train"]["target_column"] == "caco3_pct_total"
+    assert summary["train"]["mean"] == pytest.approx(float(OBSERVED.mean()))
+
+
+def test_both_families_summarize_the_same_numbers_identically(captured_artifacts) -> None:
+    """The invariant the artifact exists for: same data in, same summary out, either shape."""
+    ChildRunLogger()._write_split_summary(
+        {"train": pd.Series(OBSERVED, name="caco3_pct_total")}, None, "caco3_pct_total"
+    )
+    sklearn_summary = dict(captured_artifacts["split_summary.json"])
+
+    ChildRunLogger()._write_split_summary(
+        {"train": pd.DataFrame({"caco3_pct_total": OBSERVED})}, None, "caco3_pct_total"
+    )
+    lightning_summary = dict(captured_artifacts["split_summary.json"])
+
+    assert sklearn_summary == lightning_summary
+
+
+def test_an_unnamed_series_still_summarizes(captured_artifacts) -> None:
+    """`to_frame()` needs a name; a nameless Series must not become a KeyError."""
+    ChildRunLogger()._write_split_summary(
+        {"train": pd.Series(OBSERVED)}, None, "caco3_pct_total"
+    )
+
+    assert captured_artifacts["split_summary.json"]["train"]["count"] == len(OBSERVED)

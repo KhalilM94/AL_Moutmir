@@ -34,6 +34,85 @@ def build_finite_row_mask(
     return mask
 
 
+class SparseColumnError(ValueError):
+    """A covariate is too empty to impute honestly. Carries the offenders for tests and callers."""
+
+    def __init__(self, message: str, offenders: "list[tuple[str, int, float]]"):
+        super().__init__(message)
+        self.offenders = offenders
+
+
+def column_missing_ratios(frame: pd.DataFrame, columns: Iterable[str]) -> "dict[str, float]":
+    """Fraction of rows on which each column is absent or non-finite.
+
+    Uses the same finiteness rule as :func:`build_finite_row_mask`, so what the gate measures and
+    what the cleaner acts on cannot diverge.
+    """
+    if frame.empty:
+        return {column: 0.0 for column in columns if column in frame.columns}
+
+    ratios: "dict[str, float]" = {}
+    for column in dict.fromkeys(columns):
+        if column not in frame.columns:
+            continue
+        mask = build_finite_row_mask(frame, numeric_columns=[column])
+        ratios[column] = float((~mask).sum()) / float(len(frame))
+    return ratios
+
+
+def assert_columns_are_dense_enough(
+    frame: pd.DataFrame,
+    columns: Iterable[str],
+    *,
+    max_missing_ratio: float,
+    label: str,
+    logger: Any,
+    allow: Iterable[str] = (),
+    fail: bool = True,
+) -> "list[tuple[str, int, float]]":
+    """Refuse to train on a covariate too empty to impute honestly.
+
+    Imputing a column that is 99% blank does not recover information - it fabricates a constant and
+    presents it as a measurement. Both training families used to do something silent and wrong with
+    such a column: sklearn median-filled it and handed it to the model as a feature, while the
+    Lightning builders deleted every affected row and trained on whatever survived (on one real
+    dataset, 17 points out of 5761). This is the single place that decides a column is past saving,
+    so the families cannot drift apart on it again.
+
+    Returns the offenders as ``(column, missing_rows, missing_ratio)``, worst first, so a caller
+    running in warn-only mode can still report them.
+    """
+    allowed = set(allow or ())
+    ratios = column_missing_ratios(frame, columns)
+    offenders = [
+        (column, int(round(ratio * len(frame))), ratio)
+        for column, ratio in ratios.items()
+        if ratio > max_missing_ratio and column not in allowed
+    ]
+    offenders.sort(key=lambda item: item[2], reverse=True)
+    if not offenders:
+        return []
+
+    listed = "\n".join(
+        f"  {column}: blank on {missing} of {len(frame)} rows ({ratio:.1%})"
+        for column, missing, ratio in offenders
+    )
+    message = (
+        f"{len(offenders)} covariate(s) in {label} are blank on more than "
+        f"{max_missing_ratio:.1%} of rows, so imputing them would fabricate most of the column "
+        f"rather than recover it:\n{listed}\n"
+        f"Either drop them - add the names to IGNORED_COLUMNS/ELIMINATED_FEATURES in "
+        f"data_spec.yml - or, if the imputed values are genuinely wanted, list them under "
+        f"common.data_quality.allow_sparse_columns. Raising "
+        f"common.data_quality.max_missing_column_ratio above {max(r for _, _, r in offenders):.2f} "
+        f"would also let them through."
+    )
+    if fail:
+        raise SparseColumnError(message, offenders)
+    logger.warning(f"{message}\n(fail_on_sparse_columns is false, so the run continues.)")
+    return offenders
+
+
 def drop_non_finite_rows(
     frame: pd.DataFrame,
     *,
@@ -58,7 +137,47 @@ def drop_non_finite_rows(
     logger.warning(
         f"Dropped {dropped_count} row(s) with non-finite values from {label}; remaining rows: {len(kept_frame)}"
     )
+    if dropped_count and dropped_count > len(frame) // 2:
+        # A row dies if ANY required column is non-finite, so one nearly-empty covariate can take
+        # most of the dataset with it. Naming the worst offenders turns "the bundle has 17 points"
+        # into "these three columns are 99% empty", which is the difference between an unexplained
+        # collapse and a one-line fix in the schema config.
+        logger.warning(
+            f"That is most of {label}. Worst columns by rows lost: "
+            + ", ".join(
+                f"{name} ({count})"
+                for name, count in worst_non_finite_columns(
+                    frame, required_columns=required_columns, numeric_columns=numeric_columns
+                )
+            )
+            + ". Drop them via IGNORED_COLUMNS/ELIMINATED_FEATURES in data_spec.yml if they are "
+            "not worth the rows they cost."
+        )
     return kept_frame
+
+
+def worst_non_finite_columns(
+    frame: pd.DataFrame,
+    *,
+    required_columns: Iterable[str] = (),
+    numeric_columns: Iterable[str] = (),
+    limit: int = 5,
+) -> list[tuple[str, int]]:
+    """The columns responsible for the most dropped rows, worst first."""
+    counts: list[tuple[str, int]] = []
+    for column in dict.fromkeys([*required_columns, *numeric_columns]):
+        if column not in frame.columns:
+            continue
+        column_mask = build_finite_row_mask(
+            frame,
+            required_columns=[column] if column in set(required_columns) else (),
+            numeric_columns=[column] if column in set(numeric_columns) else (),
+        )
+        lost = int((~column_mask).sum())
+        if lost:
+            counts.append((column, lost))
+    counts.sort(key=lambda item: item[1], reverse=True)
+    return counts[:limit]
 
 
 def encode_categorical_features(

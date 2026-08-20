@@ -37,8 +37,11 @@
 # Two classes of key are refused (see hpo/overrides.py):
 #   - anything the factory resolves from the datamodule (static_dim, target_dim, categorical_*,
 #     grid_years, target_mean/scale/transform, ...) - overriding it breaks the shape contract
-#   - val_size / test_size / seed under `params` - varying the split re-fits the scaler, the
-#     vocabulary and target_mean_/target_scale_, so trials stop being comparable
+#   - val_size / test_size / seed under `params`, and split_plan anywhere - the split is decided
+#     ONCE for the whole run in main_config.yml's `split:` block and shared with the sklearn
+#     family. Varying it per trial re-fits the scaler, the vocabulary and
+#     target_mean_/target_scale_, so trials stop being comparable with each other and with the
+#     leaderboard. Change the split in `split:`, which applies to the whole study.
 
 # --- static covariates + entity embeddings; no temporal branch -------------------------------
 soil_tabular:

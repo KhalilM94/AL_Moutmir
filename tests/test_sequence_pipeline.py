@@ -811,3 +811,79 @@ def test_end_to_end_predictions_survive_a_ten_year_shift(tmp_path: Path, logger)
     # Not exact: a decade shifts which years are leap years, moving each date a fraction of a day
     # along the seasonal circle. The tolerance is that drift, not a modelling approximation.
     torch.testing.assert_close(predictions[0], predictions[1], atol=1e-3, rtol=1e-3)
+
+
+# --- the shared split plan -------------------------------------------------
+
+
+def _plan_over(point_ids, *, test_ids, val_ids=()):
+    """A hand-built SplitPlan, so the assertion names the exact points rather than a ratio."""
+    from yg_eo_soilnet.datamodules.splitting import SplitPlan
+
+    assignments = pd.Series("train", index=pd.Index(list(point_ids), name="point_id"), dtype=object)
+    assignments.loc[list(val_ids)] = "val"
+    assignments.loc[list(test_ids)] = "test"
+    return SplitPlan(
+        assignments=assignments,
+        strategy="random",
+        test_size=0.2,
+        val_size=0.2,
+        seed=42,
+        population_policy="intersect",
+    )
+
+
+def test_a_split_plan_decides_the_holdout_instead_of_val_size_and_test_size(tmp_path, logger):
+    """The datamodule stops splitting for itself once the run hands it the shared plan.
+
+    That is the whole fix: this family and the sklearn family used to carve independent holdouts
+    from the same data, so a test point here was usually a training point there.
+    """
+    bundle = _build_bundle(tmp_path, logger)
+    point_ids = list(bundle.point_ids)
+    plan = _plan_over(point_ids, test_ids=point_ids[:2], val_ids=point_ids[2:3])
+
+    datamodule = SoilSequenceDataModule(
+        bundle, batch_size=2, val_size=0.5, test_size=0.5, seed=7, split_plan=plan
+    )
+    datamodule.setup("fit")
+
+    assert {point_ids[i] for i in datamodule.test_idx_} == set(point_ids[:2])
+    assert {point_ids[i] for i in datamodule.val_idx_} == set(point_ids[2:3])
+    # val_size=0.5 / test_size=0.5 would have given 3 test points; the plan wins.
+    assert datamodule.train_idx_.size == len(point_ids) - 3
+
+
+def test_points_the_plan_does_not_cover_are_used_by_no_split(tmp_path, logger):
+    """Expected under population_policy=intersect, where other families dropped those points."""
+    bundle = _build_bundle(tmp_path, logger)
+    point_ids = list(bundle.point_ids)
+    plan = _plan_over(point_ids[:-1], test_ids=point_ids[:1])
+
+    datamodule = SoilSequenceDataModule(bundle, batch_size=2, split_plan=plan)
+    datamodule.setup("fit")
+
+    covered = datamodule.train_idx_.size + datamodule.val_idx_.size + datamodule.test_idx_.size
+    assert covered == len(point_ids) - 1
+
+
+def test_a_plan_that_leaves_no_training_points_raises_rather_than_training_on_nothing(tmp_path, logger):
+    bundle = _build_bundle(tmp_path, logger)
+    point_ids = list(bundle.point_ids)
+    plan = _plan_over(point_ids, test_ids=point_ids)
+
+    datamodule = SoilSequenceDataModule(bundle, batch_size=2, split_plan=plan)
+
+    with pytest.raises(ValueError, match="no training points"):
+        datamodule.setup("fit")
+
+
+def test_without_a_plan_the_legacy_ratio_carve_still_applies(tmp_path, logger):
+    """Standalone and serving use construct a datamodule with no plan; that must keep working."""
+    bundle = _build_bundle(tmp_path, logger)
+
+    datamodule = SoilSequenceDataModule(bundle, batch_size=2, val_size=0.25, test_size=0.25, seed=3)
+    datamodule.setup("fit")
+
+    assert datamodule.test_idx_.size > 0
+    assert datamodule.train_idx_.size > 0

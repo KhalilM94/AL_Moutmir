@@ -12,6 +12,7 @@ from lightning.pytorch import LightningDataModule
 
 from yg_eo_soilnet.datamodules.categorical import CategoricalEncoder
 from yg_eo_soilnet.datamodules.sequence.sequence_bundle import SoilSequenceBundle
+from yg_eo_soilnet.datamodules.splitting import SplitPlan
 
 
 class _PointDataset(Dataset):
@@ -56,6 +57,7 @@ class SoilSequenceDataModule(LightningDataModule):
         shuffle: bool = False,
         target_transform: Optional[str] = None,
         max_sequence_length: Optional[int] = None,
+        split_plan: Optional["SplitPlan"] = None,
     ):
         super().__init__()
         self.sequence_bundle = deepcopy(SoilSequenceBundle.from_mapping(sequence_bundle))
@@ -68,6 +70,10 @@ class SoilSequenceDataModule(LightningDataModule):
         self.batch_size = batch_size
         self.val_size = val_size
         self.test_size = test_size
+        # The run's shared split. When present it decides train/val/test and `val_size`/`test_size`
+        # are ignored - the point being that this datamodule and the sklearn family hold out the
+        # same points. None keeps the legacy ratio carve, which standalone and test use rely on.
+        self.split_plan = split_plan
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers and num_workers > 0
@@ -89,6 +95,9 @@ class SoilSequenceDataModule(LightningDataModule):
         # Standardization statistics, fitted on the train split only in setup().
         self.static_mean_: Optional[np.ndarray] = None
         self.static_scale_: Optional[np.ndarray] = None
+        # The FILL value for a missing covariate, kept separately from the mean for the same reason
+        # label_median_ below is: a skewed column's mean sits somewhere no sample actually is.
+        self.static_median_: Optional[np.ndarray] = None
         # Categorical vocabulary, fitted on the train split only in setup() for the same reason the
         # scaler is: a category seen only in validation or test must reach the model as "unknown",
         # exactly as an unseen category would at inference time.
@@ -108,7 +117,13 @@ class SoilSequenceDataModule(LightningDataModule):
         # The shape contract the Lightning config factory reads off the datamodule. Note the
         # deliberate absence of `temporal_steps` and `edge_attr_dim`: the model is length-agnostic
         # and graph-free, and the factory only injects attributes that actually exist here.
-        self.static_dim = int(np.asarray(self.sequence_bundle.static_features).shape[1])
+        # Validity channels widen the static block, so static_dim counts them: the model's first
+        # Linear must match what _collate_points actually hands it. Only covariates that genuinely
+        # have gaps carry a flag, so a complete dataset leaves this exactly as it was.
+        self.static_validity_names = list(self.sequence_bundle.static_validity_names)
+        self.static_dim = int(
+            np.asarray(self.sequence_bundle.static_features).shape[1] + len(self.static_validity_names)
+        )
         self.target_dim = int(np.asarray(self.sequence_bundle.targets).shape[1])
         self.static_feature_names = list(self.sequence_bundle.static_feature_names)
         # Categorical shape contract. The names are known now, but the cardinalities are not: they
@@ -150,7 +165,12 @@ class SoilSequenceDataModule(LightningDataModule):
         return {
             "static_mean": as_list(self.static_mean_),
             "static_scale": as_list(self.static_scale_),
+            "static_median": as_list(self.static_median_),
             "static_feature_names": list(self.static_feature_names),
+            # Which covariates carry a measured-vs-filled flag, and therefore how wide x_static is.
+            # Without this a served model would rebuild the flags from whatever the request happens
+            # to be missing and hand the network a different width than it was trained on.
+            "static_validity_names": list(self.static_validity_names),
             "sequence_mean": {name: as_list(values) for name, values in self.sequence_mean_.items()},
             "sequence_scale": {name: as_list(values) for name, values in self.sequence_scale_.items()},
             "modality_column_names": {
@@ -191,6 +211,11 @@ class SoilSequenceDataModule(LightningDataModule):
 
         self.static_mean_ = as_array(state.get("static_mean"))
         self.static_scale_ = as_array(state.get("static_scale"))
+        self.static_median_ = as_array(state.get("static_median"))
+        # Restored rather than re-derived, so x_static keeps the width the model was trained with
+        # even when the incoming request happens to be missing a different set of covariates.
+        if "static_validity_names" in state:
+            self.static_validity_names = [str(name) for name in (state.get("static_validity_names") or [])]
         self.target_mean_ = as_array(state.get("target_mean"))
         self.target_scale_ = as_array(state.get("target_scale"))
         self.label_mean_ = as_array(state.get("label_mean"))
@@ -324,9 +349,21 @@ class SoilSequenceDataModule(LightningDataModule):
 
         static_features = np.asarray(self.sequence_bundle.static_features)
         if static_features.size:
-            train_static = self._finite(static_features[indices])
-            self.static_mean_ = train_static.mean(axis=0).astype(np.float32)
-            self.static_scale_ = self._safe_scale(train_static.std(axis=0))
+            # Median-filled from the TRAIN rows only, exactly as the lab values below are: a
+            # covariate gap costs one imputed value rather than the whole soil sample, and the fill
+            # value must not be able to see validation or test. Statistics are computed AFTER the
+            # fill so the model's inputs and the standardizer agree about where a filled cell lands.
+            train_static = np.asarray(static_features[indices], dtype=np.float64)
+            measured = np.isfinite(train_static)
+            counts = measured.sum(axis=0)
+            median = np.zeros(train_static.shape[1], dtype=np.float64)
+            for column in range(train_static.shape[1]):
+                if counts[column]:
+                    median[column] = np.median(train_static[measured[:, column], column])
+            filled = np.where(measured, train_static, median)
+            self.static_median_ = median.astype(np.float32)
+            self.static_mean_ = filled.mean(axis=0).astype(np.float32)
+            self.static_scale_ = self._safe_scale(filled.std(axis=0))
 
         targets = np.asarray(self.sequence_bundle.targets)
         if targets.size:
@@ -416,10 +453,43 @@ class SoilSequenceDataModule(LightningDataModule):
         self.categorical_cardinalities = encoder.cardinalities
         self.categorical_vocabularies = encoder.vocabularies
 
-    def _standardize_static(self, values: np.ndarray) -> np.ndarray:
-        if self.static_mean_ is None or values.size == 0:
-            return self._finite(values).astype(np.float32)
-        return ((self._finite(values) - self.static_mean_) / self.static_scale_).astype(np.float32)
+    def _standardize_static(self, values: np.ndarray, validity: Optional[np.ndarray] = None) -> np.ndarray:
+        """Covariates -> standardized, missing cells filled from the train median.
+
+        `_finite` is not the fill: it maps NaN to 0, which after centring is a fabricated value
+        sitting wherever 0 happens to fall. The train median is where the column actually is. The
+        flags for the gappy columns are appended here so the model can tell the two apart, and are
+        computed from the RAW values before the fill, since afterwards the information is gone.
+        """
+        if values.size == 0:
+            return np.asarray(values, dtype=np.float32)
+
+        raw = np.asarray(values, dtype=np.float64)
+        measured = np.isfinite(raw)
+        filled = raw if self.static_median_ is None else np.where(measured, raw, self.static_median_)
+
+        if self.static_mean_ is None:
+            standardized = self._finite(filled).astype(np.float32)
+        else:
+            standardized = ((self._finite(filled) - self.static_mean_) / self.static_scale_).astype(np.float32)
+
+        flags = self._static_validity_channels(measured, validity)
+        if flags.size:
+            standardized = np.concatenate([standardized, flags], axis=1)
+        return standardized
+
+    def _static_validity_channels(
+        self, measured: np.ndarray, validity: Optional[np.ndarray]
+    ) -> np.ndarray:
+        """The measured-vs-filled flags, restricted to the covariates that actually have gaps."""
+        if not self.static_validity_names:
+            return np.empty((measured.shape[0], 0), dtype=np.float32)
+        if validity is not None and np.asarray(validity).size:
+            return np.asarray(validity, dtype=np.float32).reshape(measured.shape[0], -1)
+        # No precomputed mask (a caller standardizing raw rows, e.g. at serving time): derive the
+        # flags from the values themselves, taking the same columns in the same order.
+        positions = [self.static_feature_names.index(name) for name in self.static_validity_names]
+        return measured[:, positions].astype(np.float32)
 
     def _standardize_labels(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Lab values -> ``(standardized, validity)``, filling what is missing from the train median.
@@ -472,9 +542,15 @@ class SoilSequenceDataModule(LightningDataModule):
         bundle = self.sequence_bundle
 
         static_features = np.asarray(bundle.static_features)
+        static_validity = np.asarray(bundle.static_validity)
         targets = np.asarray(bundle.targets)
-        x_static = self._standardize_static(static_features[indices]) if static_features.size else np.empty(
-            (indices.size, 0), dtype=np.float32
+        x_static = (
+            self._standardize_static(
+                static_features[indices],
+                static_validity[indices] if static_validity.size else None,
+            )
+            if static_features.size
+            else np.empty((indices.size, 0), dtype=np.float32)
         )
         y = self._standardize_targets(targets[indices]) if targets.size else np.empty(
             (indices.size, 0), dtype=np.float32
@@ -590,11 +666,19 @@ class SoilSequenceDataModule(LightningDataModule):
         return x_frame, y_frame
 
     def _split_indices(self, num_rows: int):
-        """Split points into train/val/test. `test_size` and `val_size` apply sequentially."""
+        """Train/val/test point indices.
+
+        Resolved from the run's shared :class:`SplitPlan` when one was supplied, so this family and
+        the sklearn family hold out the same points. Otherwise it falls back to the local ratio
+        carve, in which `test_size` and `val_size` apply sequentially.
+        """
         empty = np.array([], dtype=np.int64)
         indices = np.arange(num_rows, dtype=np.int64)
         if num_rows <= 1:
             return indices, empty, empty
+
+        if self.split_plan is not None:
+            return self._planned_split_indices(num_rows)
 
         test_idx, train_val_idx = self._carve_out(indices, self.test_size)
         if train_val_idx.size <= 1:
@@ -602,6 +686,37 @@ class SoilSequenceDataModule(LightningDataModule):
 
         val_idx, train_idx = self._carve_out(train_val_idx, self.val_size)
         return train_idx, val_idx, test_idx
+
+    def _planned_split_indices(self, num_rows: int):
+        """Resolve the shared plan against this bundle's own point ordering."""
+        point_ids = list(self.sequence_bundle.point_ids)
+        if len(point_ids) != num_rows:
+            raise ValueError(
+                f"The bundle carries {len(point_ids)} point id(s) for {num_rows} row(s); the shared "
+                f"split cannot be resolved."
+            )
+        train_idx, val_idx, test_idx = self.split_plan.split_indices(point_ids)
+        assigned = train_idx.size + val_idx.size + test_idx.size
+        if assigned < num_rows:
+            # Expected under population_policy=intersect: these are points the other families
+            # could not use, so the shared plan deliberately gives them no split.
+            self._log(
+                f"{num_rows - assigned} of {num_rows} point(s) are outside the shared split "
+                f"population and are used by no split "
+                f"(population_policy={self.split_plan.population_policy})."
+            )
+        if train_idx.size == 0:
+            raise ValueError(
+                "The shared split plan left this datamodule with no training points. Check "
+                "split.population_policy and the eligibility of this family's rows."
+            )
+        return train_idx, val_idx, test_idx
+
+    def _log(self, message: str) -> None:
+        """Best-effort info logging; a LightningDataModule has no logger of its own."""
+        import logging
+
+        logging.getLogger(__name__).info(message)
 
     def _carve_out(self, indices: np.ndarray, fraction: float):
         """Split off `fraction` of `indices`, returning (held_out, remainder).

@@ -16,6 +16,14 @@ def test_parse_args_supports_cli_overrides(monkeypatch: pytest.MonkeyPatch) -> N
     assert args.config_path == "custom.yml"
 
 
+def _fake_plan():
+    """A stand-in SplitPlan: main() only reads describe() and counts() off it."""
+    return SimpleNamespace(
+        describe=MagicMock(return_value={"split_strategy": "random"}),
+        counts=MagicMock(return_value={"train": 2, "val": 1, "test": 1}),
+    )
+
+
 def test_main_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_trainer = SimpleNamespace(
         config=SimpleNamespace(config_path="config.yml", registry_path="registry.yml"),
@@ -24,6 +32,9 @@ def test_main_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
             preprocess=MagicMock(return_value="processed"),
             split=MagicMock(return_value={"X_train": "x"}),
         ),
+        # main() decides the split once, before either family sees the data, and logs its
+        # provenance - so a stub trainer has to offer the provider.
+        split_plan_provider=SimpleNamespace(plan=MagicMock(return_value=_fake_plan())),
         logger=SimpleNamespace(info=MagicMock(), error=MagicMock()),
         logger_wrapper=SimpleNamespace(log_file=None),
         train_models=MagicMock(),
@@ -36,6 +47,10 @@ def test_main_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main_module.mlflow, "active_run", MagicMock(return_value=None))
     monkeypatch.setattr(main_module.mlflow, "end_run", MagicMock())
     monkeypatch.setattr(main_module.mlflow, "log_param", MagicMock())
+    # log_params too, not just log_param: an unstubbed one auto-starts a REAL run against the
+    # default tracking store and never ends it, which surfaces three test files later as
+    # "Run with UUID ... is already active".
+    monkeypatch.setattr(main_module.mlflow, "log_params", MagicMock())
     monkeypatch.setattr(main_module.mlflow, "log_artifact", MagicMock())
     monkeypatch.setattr(main_module.datetime, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda fmt: "20260703_120000")))
     monkeypatch.setattr(main_module, "SoilModelTraining", MagicMock(return_value=fake_trainer))
@@ -58,7 +73,10 @@ def test_main_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
 
     fake_trainer.scikit_datamodule.load_frame.assert_called_once()
     fake_trainer.scikit_datamodule.preprocess.assert_called_once_with("raw")
-    fake_trainer.scikit_datamodule.split.assert_called_once_with("processed")
+    # The shared plan is handed to the sklearn family rather than each family splitting for itself.
+    fake_trainer.scikit_datamodule.split.assert_called_once_with(
+        "processed", fake_trainer.split_plan_provider.plan.return_value
+    )
     fake_trainer.train_models.assert_called_once()
     fake_parent_logger.log_parent_summary.assert_called_once_with("run-123", fake_trainer)
 
@@ -71,6 +89,9 @@ def test_main_logs_and_reraises_on_error(monkeypatch: pytest.MonkeyPatch) -> Non
             preprocess=MagicMock(),
             split=MagicMock(),
         ),
+        # main() decides the split once, before either family sees the data, and logs its
+        # provenance - so a stub trainer has to offer the provider.
+        split_plan_provider=SimpleNamespace(plan=MagicMock(return_value=_fake_plan())),
         logger=SimpleNamespace(info=MagicMock(), error=MagicMock()),
         logger_wrapper=SimpleNamespace(log_file=None),
         train_models=MagicMock(),
@@ -82,6 +103,10 @@ def test_main_logs_and_reraises_on_error(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(main_module.mlflow, "active_run", MagicMock(return_value=None))
     monkeypatch.setattr(main_module.mlflow, "end_run", MagicMock())
     monkeypatch.setattr(main_module.mlflow, "log_param", MagicMock())
+    # log_params too, not just log_param: an unstubbed one auto-starts a REAL run against the
+    # default tracking store and never ends it, which surfaces three test files later as
+    # "Run with UUID ... is already active".
+    monkeypatch.setattr(main_module.mlflow, "log_params", MagicMock())
     monkeypatch.setattr(main_module.mlflow, "log_artifact", MagicMock())
     monkeypatch.setattr(main_module.datetime, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda fmt: "20260703_120000")))
     monkeypatch.setattr(main_module, "SoilModelTraining", MagicMock(return_value=failing_trainer))
@@ -113,6 +138,9 @@ def test_main_skips_artifact_upload_when_logger_file_disabled(monkeypatch: pytes
             preprocess=MagicMock(return_value="processed"),
             split=MagicMock(return_value={"X_train": "x"}),
         ),
+        # main() decides the split once, before either family sees the data, and logs its
+        # provenance - so a stub trainer has to offer the provider.
+        split_plan_provider=SimpleNamespace(plan=MagicMock(return_value=_fake_plan())),
         logger=SimpleNamespace(info=MagicMock(), error=MagicMock()),
         logger_wrapper=SimpleNamespace(log_file=None),
         train_models=MagicMock(),
@@ -125,6 +153,10 @@ def test_main_skips_artifact_upload_when_logger_file_disabled(monkeypatch: pytes
     monkeypatch.setattr(main_module.mlflow, "active_run", MagicMock(return_value=None))
     monkeypatch.setattr(main_module.mlflow, "end_run", MagicMock())
     monkeypatch.setattr(main_module.mlflow, "log_param", MagicMock())
+    # log_params too, not just log_param: an unstubbed one auto-starts a REAL run against the
+    # default tracking store and never ends it, which surfaces three test files later as
+    # "Run with UUID ... is already active".
+    monkeypatch.setattr(main_module.mlflow, "log_params", MagicMock())
     log_artifact = MagicMock()
     monkeypatch.setattr(main_module.mlflow, "log_artifact", log_artifact)
     monkeypatch.setattr(main_module.datetime, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda fmt: "20260703_120000")))
@@ -161,6 +193,9 @@ def test_main_exports_mlflow_experiment_when_enabled(monkeypatch: pytest.MonkeyP
             preprocess=MagicMock(return_value="processed"),
             split=MagicMock(return_value={"X_train": "x"}),
         ),
+        # main() decides the split once, before either family sees the data, and logs its
+        # provenance - so a stub trainer has to offer the provider.
+        split_plan_provider=SimpleNamespace(plan=MagicMock(return_value=_fake_plan())),
         logger=SimpleNamespace(info=MagicMock(), error=MagicMock()),
         logger_wrapper=SimpleNamespace(log_file=None),
         train_models=MagicMock(),
@@ -182,6 +217,10 @@ def test_main_exports_mlflow_experiment_when_enabled(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(main_module.mlflow, "active_run", MagicMock(return_value=None))
     monkeypatch.setattr(main_module.mlflow, "end_run", MagicMock())
     monkeypatch.setattr(main_module.mlflow, "log_param", MagicMock())
+    # log_params too, not just log_param: an unstubbed one auto-starts a REAL run against the
+    # default tracking store and never ends it, which surfaces three test files later as
+    # "Run with UUID ... is already active".
+    monkeypatch.setattr(main_module.mlflow, "log_params", MagicMock())
     monkeypatch.setattr(main_module.mlflow, "log_artifact", MagicMock())
     monkeypatch.setattr(main_module.mlflow, "get_tracking_uri", MagicMock(return_value=f"file://{tracking_root}"))
     monkeypatch.setattr(main_module.mlflow, "get_experiment", MagicMock(return_value=SimpleNamespace(name=experiment_name)))

@@ -45,10 +45,10 @@ CARRY_LABEL_COLUMNS: true
 TARGET_COLUMNS:
   # - organic_matter_g_kg
   # - organic_matter_pct
-  - clay_pct
-  - sand_pct
-  - total_silt_pct
-  - ph_water
+  # - clay_pct
+  # - sand_pct
+  # - total_silt_pct
+  # - ph_water
   - caco3_pct_total
 
 PREDICTOR_COLUMNS: []
@@ -70,7 +70,9 @@ IGNORED_COLUMNS: &ignored_columns
   - sand_median_0_30cm
   - soc_median_0_30cm
   - swc_median_0_30cm
-
+  - ClimDef_trend_slope
+  - SM_trend_slope
+  - ETa_trend_slope
 ELIMINATED_FEATURES: *ignored_columns
 
 CATEGORICAL_FEATURES:

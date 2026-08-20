@@ -192,7 +192,67 @@ class Config:
         self.CLUSTERING_STRATEGY = self._get_config('CLUSTERING_STRATEGY', None)
         self.CLUSTERING_STRATEGY = self._normalize_mapping(self.CLUSTERING_STRATEGY)
         self.ENABLE_CLUSTERING = self.CLUSTERING_STRATEGY.get('enabled', False)
+        # The INNER cross-validation strategy for sklearn's GridSearchCV ('kfold'/'groupkfold').
+        # Not the holdout: that is SPLIT_HOLDOUT_STRATEGY below. The two are different decisions and
+        # the names are kept distinct on purpose.
         self.SPLIT_STRATEGY = self._get_config('SPLIT_STRATEGY', 'kfold')
+
+        # --- the unified train/val/test holdout, shared by every training family ---------------
+        # One split, decided once over POINT_ID_COLUMN before the family fork, so sklearn and
+        # Lightning score on the same test points. See datamodules/splitting.py.
+        self.SPLIT_CONFIG = {
+            **self._normalize_mapping(self.config.get('split', {})),
+            **self._normalize_mapping(self.COMMON_CONFIG.get('split', {})),
+        }
+        # ENABLE_CLUSTERING is the legacy spelling of split.strategy: spatial_group. A config that
+        # only ever turned clustering on keeps the grouped holdout it had - and now the Lightning
+        # families get it too, which they never did before.
+        legacy_grouped = 'spatial_group' if self.ENABLE_CLUSTERING else 'random'
+        self.SPLIT_HOLDOUT_STRATEGY = self._get_split_config(
+            'strategy', 'SPLIT_HOLDOUT_STRATEGY', legacy_grouped
+        )
+        # TEST_SIZE is honoured as the fallback so a config predating `split:` keeps working.
+        self.SPLIT_TEST_SIZE = self._get_split_config('test_size', 'SPLIT_TEST_SIZE', self.TEST_SIZE)
+        self.SPLIT_VAL_SIZE = self._get_split_config(
+            'val_size', 'SPLIT_VAL_SIZE', self._get_config('LIGHTNING_VAL_SIZE', 0.2)
+        )
+        self.SPLIT_SEED = self._get_split_config('seed', 'SPLIT_SEED', self.RANDOM_SEED)
+        self.SPLIT_POPULATION_POLICY = self._get_split_config(
+            'population_policy', 'SPLIT_POPULATION_POLICY', 'intersect'
+        )
+        self.SPLIT_PLAN_PATH = self._get_split_config('plan_path', 'SPLIT_PLAN_PATH', None)
+        # Floor on what `intersect` may leave behind. Intersecting is only sound while the families
+        # roughly agree on which rows are usable; below this the narrowest family is dictating the
+        # whole run's population, which is a data problem to fix rather than a split to accept.
+        self.SPLIT_MIN_POPULATION_RATIO = self._get_split_config(
+            'min_population_ratio', 'SPLIT_MIN_POPULATION_RATIO', 0.5
+        )
+        self.SPLIT_GROUP_STRATEGY = self._normalize_mapping(
+            self._get_split_config('group', 'SPLIT_GROUP_STRATEGY', None)
+        ) or dict(self.CLUSTERING_STRATEGY)
+        if 'test_size' in self.SPLIT_CONFIG and 'TEST_SIZE' in getattr(self, 'COMMON_CONFIG', {}):
+            print(
+                "[Warning] Both TEST_SIZE and split.test_size are set; split.test_size wins for the "
+                "unified holdout. Remove TEST_SIZE to avoid the ambiguity."
+            )
+
+        # --- data quality: one missingness rule for every training family ----------------------
+        # A covariate blank on more than MAX_MISSING_COLUMN_RATIO of rows stops the run; anything
+        # under it is median-filled and flagged rather than costing the whole row. See
+        # datamodules/frame_cleaning.assert_columns_are_dense_enough.
+        self.DATA_QUALITY_CONFIG = {
+            **self._normalize_mapping(self.config.get('data_quality', {})),
+            **self._normalize_mapping(self.COMMON_CONFIG.get('data_quality', {})),
+        }
+        self.MAX_MISSING_COLUMN_RATIO = self._get_data_quality_config(
+            'max_missing_column_ratio', 'MAX_MISSING_COLUMN_RATIO', 0.2
+        )
+        self.ALLOW_SPARSE_COLUMNS = self._get_data_quality_config(
+            'allow_sparse_columns', 'ALLOW_SPARSE_COLUMNS', []
+        )
+        self.FAIL_ON_SPARSE_COLUMNS = self._get_data_quality_config(
+            'fail_on_sparse_columns', 'FAIL_ON_SPARSE_COLUMNS', True
+        )
 
         # Target and feature configuration
         self.IGNORE_BANDS = self._get_ignore_bands([])
@@ -314,6 +374,33 @@ class Config:
     def _get_temporal_config(self, temporal_key: str, flat_key: str, default: Any) -> Any:
         if temporal_key in self.TEMPORAL_FEATURES and self.TEMPORAL_FEATURES[temporal_key] is not None:
             return self.TEMPORAL_FEATURES[temporal_key]
+        return self._get_config(flat_key, default)
+
+    def _get_split_config(self, split_key: str, flat_key: str, default: Any) -> Any:
+        """Read `split.<split_key>`, falling back to a flat key and then the default.
+
+        Mirrors _get_temporal_config, so the nested `split:` block behaves like `temporal:` - an
+        env var of the flat name still overrides everything, which is what makes an A/B of
+        SPLIT_POPULATION_POLICY a one-liner.
+        """
+        env_value = os.environ.get(flat_key)
+        if env_value is None and split_key in self.SPLIT_CONFIG and self.SPLIT_CONFIG[split_key] is not None:
+            return self.SPLIT_CONFIG[split_key]
+        return self._get_config(flat_key, default)
+
+    def _get_data_quality_config(self, quality_key: str, flat_key: str, default: Any) -> Any:
+        """Read `data_quality.<quality_key>`, falling back to a flat key and then the default.
+
+        Same shape as _get_split_config, so an env var of the flat name still overrides the YAML -
+        which is what makes MAX_MISSING_COLUMN_RATIO=0.9 a one-liner when triaging a new dataset.
+        """
+        env_value = os.environ.get(flat_key)
+        if (
+            env_value is None
+            and quality_key in self.DATA_QUALITY_CONFIG
+            and self.DATA_QUALITY_CONFIG[quality_key] is not None
+        ):
+            return self.DATA_QUALITY_CONFIG[quality_key]
         return self._get_config(flat_key, default)
 
     def _get_sklearn_categorical_config(self, key: str, default: Any) -> Any:

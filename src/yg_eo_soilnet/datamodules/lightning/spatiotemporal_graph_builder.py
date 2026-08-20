@@ -7,6 +7,7 @@ import pandas as pd
 from sklearn.neighbors import NearestNeighbors
 
 from yg_eo_soilnet.datamodules.frame_cleaning import (
+    assert_columns_are_dense_enough,
     build_finite_row_mask,
     drop_non_finite_rows,
     encode_categorical_features,
@@ -34,10 +35,22 @@ class SpatiotemporalGraphBuilder:
         self.logger = logger
         self.data_manager = data_manager
 
-    def build(self, graph_data_args: Optional[Mapping[str, Any]] = None) -> SpatiotemporalGraph:
-        graph_data_args = dict(graph_data_args or {})
-        dataset = self.data_manager.load_dataset()
-        static_df = dataset.tabular
+    def clean_static_frame(self, static_df, dataset):
+        """Schema-filter, ordinal-encode categoricals, gate sparse covariates and drop bad rows.
+
+        Split out of :meth:`build` so :meth:`usable_point_ids` applies the *same* rule rather than a
+        second copy of it. Note this family is stricter than the sequence one: it also requires
+        finite coordinates, because a node with no position cannot be placed in the graph.
+
+        It is also the one family that still DELETES a row for a missing covariate rather than
+        filling and flagging it. The sparsity gate below caps how bad that can get - a column past
+        the threshold stops the run everywhere - and the per-family population guard in
+        SplitPlanProvider makes any remaining shrinkage loud rather than silent. Converting this
+        path properly means threading validity through the graph bundle and its baseline residuals;
+        `soil_graph` is enabled:false and superseded by `soil_sequence`, so that is deliberately not
+        done here. Enable the graph family and this asymmetry becomes real - check the population
+        the guard reports before trusting a comparison against the other two.
+        """
         point_col = dataset.point_id_column
         lat_col = dataset.lat_column
         lon_col = dataset.lon_column
@@ -53,12 +66,45 @@ class SpatiotemporalGraphBuilder:
         feature_frame = self.data_manager.filter_schema(static_df, target_columns)
         static_df, feature_columns = self._encode_categorical_features(static_df, feature_frame.columns)
 
+        assert_columns_are_dense_enough(
+            static_df,
+            feature_columns,
+            max_missing_ratio=float(getattr(self.config, "MAX_MISSING_COLUMN_RATIO", 0.2)),
+            label="the static graph source",
+            logger=self.logger,
+            allow=getattr(self.config, "ALLOW_SPARSE_COLUMNS", ()) or (),
+            fail=bool(getattr(self.config, "FAIL_ON_SPARSE_COLUMNS", True)),
+        )
+
         static_df = self._drop_non_finite_rows(
             static_df,
             label="static graph source",
             required_columns=[point_col, lat_col, lon_col, *target_columns],
             numeric_columns=[lat_col, lon_col, *feature_columns, *target_columns],
         )
+        return static_df, feature_columns
+
+    def usable_point_ids(self, static_df=None):
+        """Point ids that survive this family's cleaning. Consumed by the unified splitter."""
+        import pandas as pd
+
+        dataset = self.data_manager.load_dataset()
+        frame = dataset.tabular if static_df is None else static_df
+        cleaned, _ = self.clean_static_frame(frame, dataset)
+        point_col = dataset.point_id_column
+        if point_col not in cleaned.columns:
+            return pd.Index(range(len(cleaned)))
+        return pd.Index(cleaned[point_col].to_numpy())
+
+    def build(self, graph_data_args: Optional[Mapping[str, Any]] = None) -> SpatiotemporalGraph:
+        graph_data_args = dict(graph_data_args or {})
+        dataset = self.data_manager.load_dataset()
+        point_col = dataset.point_id_column
+        lat_col = dataset.lat_column
+        lon_col = dataset.lon_column
+        target_columns = list(dataset.target_columns)
+
+        static_df, feature_columns = self.clean_static_frame(dataset.tabular, dataset)
 
         convert_coordinates_to_utm = bool(graph_data_args.get("convert_coordinates_to_utm", False))
         coordinate_crs = graph_data_args.get("coordinate_crs", "EPSG:4326")

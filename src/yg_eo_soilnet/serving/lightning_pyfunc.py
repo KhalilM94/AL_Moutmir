@@ -52,6 +52,9 @@ SERVING_MODULES: tuple[str, ...] = (
     "datamodules/sequence",
     "datamodules/categorical.py",
     "datamodules/frame_cleaning.py",
+    # The sequence datamodule imports SplitPlan for its type hint and for the shared-split branch.
+    # It is deliberately dependency-free (numpy + pandas only), so it costs serving nothing.
+    "datamodules/splitting.py",
     "utils.py",
 )
 
