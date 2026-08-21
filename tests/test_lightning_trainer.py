@@ -343,17 +343,22 @@ def test_lightning_trainer_fans_out_multitarget_child_runs(monkeypatch) -> None:
 
     trainer.train(target="target_a__target_b", data={}, model_bundles={"toy_lightning": bundle})
 
-    assert logger.log_lightning_child_run.call_count == 2
-    logged_targets = [call.kwargs["target"] for call in logger.log_lightning_child_run.call_args_list]
-    assert logged_targets == ["target_a", "target_b"]
-    first_eval_df = logger.log_lightning_child_run.call_args_list[0].kwargs["evaluation_df"]
-    second_eval_df = logger.log_lightning_child_run.call_args_list[1].kwargs["evaluation_df"]
-    assert list(first_eval_df.columns) == ["feature_1", "target_a", "prediction", "target_name", "target_names"]
-    assert list(second_eval_df.columns) == ["feature_1", "target_b", "prediction", "target_name", "target_names"]
+    # One call, whole frame. The trainer used to open a run per target and hand each one a
+    # single-target frame with EMPTY metric dicts, which is why val_loss and test_loss never
+    # reached MLflow on a multi-target run. The logger owns the run tree now, so the real metrics
+    # travel with the model and it does the per-target fan-out itself.
+    logger.log_lightning_child_run.assert_called_once()
+    call = logger.log_lightning_child_run.call_args
+    assert call.kwargs["target"] == "target_a__target_b"
+    assert call.kwargs["validation_metrics"] == {"val_loss": 0.25}
+    assert call.kwargs["test_metrics"] == {"test_loss": 0.5}
+    assert list(call.kwargs["evaluation_df"].columns) == list(evaluation_df.columns)
 
 
-def test_lightning_trainer_builds_target_specific_frame_without_duplicate_target_columns() -> None:
-    trainer = LightningTrainer(config=SimpleNamespace(), logger=MagicMock())
+def test_the_logger_splits_a_joint_frame_into_one_frame_per_target() -> None:
+    """The fan-out both families now share, in the one place it lives."""
+    from yg_eo_soilnet.logger.mlflow_loggers import ChildRunLogger
+
     evaluation_df = pd.DataFrame(
         {
             "feature_1": [10.0, 11.0],
@@ -366,11 +371,17 @@ def test_lightning_trainer_builds_target_specific_frame_without_duplicate_target
         }
     )
 
-    target_frame = trainer._build_target_evaluation_frame(evaluation_df, "target_a", ["target_a", "target_b"])
+    frames = list(
+        ChildRunLogger()._iter_target_eval_frames(
+            evaluation_df, target="target_a__target_b", model_name="toy_lightning"
+        )
+    )
 
-    assert target_frame is not None
-    assert list(target_frame.columns) == ["feature_1", "target_a", "prediction", "target_name", "target_names"]
-    assert target_frame["target_a"].tolist() == [1.0, 2.0]
+    assert [name for _frame, name, _column in frames] == ["target_a", "target_b"]
+    first, _name, column = frames[0]
+    assert column == "prediction_target_a"
+    assert first["target_a"].tolist() == [1.0, 2.0]
+    assert first["prediction"].tolist() == [1.1, 1.9]
 
 # --- checkpoint round-trip -------------------------------------------------
 # A real fit -> checkpoint -> restore was untested, so a numpy value leaking into

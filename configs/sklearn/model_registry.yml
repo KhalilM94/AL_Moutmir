@@ -1,11 +1,21 @@
 # Seeding: entries do not set random_state. Every estimator that exposes one inherits RANDOM_SEED
 # from main_config.yml, and the same value seeds the CV folds. Set `random_seed:` on an entry to
 # deviate from the run's seed; only put random_state in init_args to pin one model regardless of it.
+#
+# multi_target: declares what an entry can do with SEVERAL targets, and is only consulted when
+# TARGET_COLUMNS names more than one.
+#   native      the estimator fits a 2-D y itself, so MULTI_TARGET_MODE: joint gives it one model
+#               with one output per target
+#   per_target  force one model per target for this entry, whatever the global mode says
+#   (absent)    the entry cannot take a 2-D y; a joint run falls back to one model per target for
+#               it, with a warning
 
 PLSRegression:
   enabled: False
   modeltype: "ml"
   import_path: sklearn.cross_decomposition.PLSRegression
+  # PLS2 regresses several responses onto shared latent components; multi-output is the point of it.
+  multi_target: native
   params:
     model__n_components: [2, 4, 6, 8, 10, 12, 14, 16, 18]
 
@@ -13,6 +23,8 @@ Ridge:
   enabled: False
   modeltype: "ml"
   import_path: sklearn.linear_model.Ridge
+  # Ridge solves for a coefficient matrix, one column per target, in a single fit.
+  multi_target: native
   params:
     model__alpha: [0.01, 0.1, 1, 10, 100, 1000]
 
@@ -30,17 +42,21 @@ GradientBoosting:
     # model__max_depth: [5, 13, 21]
 
 XGBoost:
-  enabled: true
+  enabled: false
   modeltype: "ml"
   import_path: xgboost.XGBRegressor
+  # XGBoost fits a 2-D y since 1.6. multi_strategy picks how: one_output_per_tree builds a separate
+  # tree per target (the default), multi_output_tree puts a vector in each leaf and shares splits.
+  multi_target: native
   init_args:
+    multi_strategy: "multi_output_tree"
     objective: "reg:squarederror"  #"reg:quantileerror"
     # quantile_alpha: [0.5]
     tree_method: "hist" 
     # device: "cuda"
   params:
-    model__n_estimators: [50]
-    model__max_depth: [6] # 3, 4, 5, 6, 7, 8, 9, 10, 
+    model__n_estimators: [50, 100, 150, 200]
+    model__max_depth: [6, 8] # 3, 4, 5, 6, 7, 8, 9, 10, 
     model__learning_rate: [0.05]
     # model__subsample: [0.8]
     # model__reg_alpha: [0, 0.1, 1]
@@ -57,11 +73,21 @@ TabICL:
   # Each worker loads the full checkpoint, so the default -1 would fan that out over every CV fold
   # and every grid point at once. Keep this at 1 unless you have the memory to spare.
   search_n_jobs: 1
+  # MEMORY. The bottleneck is the column-embedding tensor, shaped
+  # (batch_size, n_rows, n_columns, embed_dim). n_columns is the dangerous factor here: this
+  # dataset has ~207 features and ~5.7k rows held in context, so the tensor is multiple GB per
+  # ensemble member. `offload_mode: auto` picks a home for it based on free memory, and on a small
+  # GPU it spills to host RAM - a run on a 4 GB card and 15 GB of RAM was OOM-killed by the kernel
+  # partway through its first target, twice, with 13.4 GB of shmem resident.
+  # If that happens, in rough order of effect: lower `batch_size` (8 -> 2), set
+  # `offload_mode: "disk"` with a `disk_offload_dir`, lower `n_estimators`, or cut the feature
+  # count. Left at the defaults here because changing them changes the fitted model.
   init_args:
     n_estimators: 8      # ensemble members; lower is faster, 4 is usually enough to compare
     device: "cuda"     # default None auto-detects
     # batch_size: 8      # lower if the first fit runs out of memory
-    # offload_mode: "cpu"
+    # offload_mode: "cpu"   # or "disk" with disk_offload_dir, when host RAM is the constraint
+    # disk_offload_dir: "/tmp/tabicl_offload"
   # Deliberately empty: TabICL is designed to need no tuning, and every grid point is a full
   # checkpoint inference pass. GridSearchCV still cross-validates the single default config.
   params: {}

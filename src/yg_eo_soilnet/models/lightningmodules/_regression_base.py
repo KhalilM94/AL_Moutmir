@@ -59,8 +59,14 @@ class SoilRegressionLightningBase(LightningModule):
         scheduler_patience: int,
         scheduler_min_lr: float,
         scheduler_monitor: str,
+        target_names: Optional[Any] = None,
     ) -> None:
         self.target_dim = int(target_dim)
+        # Only set when the subclass has not already: SoilCNNLightningModule assigns its own after
+        # this call. Used to NAME the per-target metrics below, so a joint run's r2 can be read per
+        # target instead of only in aggregate.
+        if not getattr(self, "target_names", None):
+            self.target_names = [str(name) for name in (target_names or [])]
         self.learning_rate = float(learning_rate)
         self.optimizer_name = str(optimizer_name).lower()
         self.weight_decay = float(weight_decay)
@@ -104,7 +110,8 @@ class SoilRegressionLightningBase(LightningModule):
         self.loss_name = str(loss_name).lower()
         self.huber_delta = float(huber_delta)
         self.loss_fn = self._build_loss_fn(self.loss_name, self.huber_delta)
-        self._metric_state: dict[str, dict[str, float]] = {}
+        # stage -> {"n": float, and one length-target_dim float64 tensor per running sum}
+        self._metric_state: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _build_loss_fn(loss_name: str, huber_delta: float):
@@ -164,18 +171,41 @@ class SoilRegressionLightningBase(LightningModule):
     # run has collapsed toward the target mean. Accumulated by hand because torchmetrics is not a
     # dependency of this project.
 
+    def _metric_target_names(self) -> list[str]:
+        """Names for the head's outputs, one per column, for metric keys."""
+        names = [str(name) for name in (getattr(self, "target_names", None) or [])]
+        if len(names) == self.target_dim:
+            return names
+        return [f"target_{index}" for index in range(self.target_dim)]
+
     def _accumulate_metrics(self, stage: str, predictions: torch.Tensor, targets: torch.Tensor) -> None:
-        state = self._metric_state.setdefault(
-            stage, {"n": 0.0, "sum_y": 0.0, "sum_y2": 0.0, "sum_p": 0.0, "sum_p2": 0.0, "sse": 0.0}
-        )
-        predictions = predictions.reshape(-1).double()
-        targets = targets.reshape(-1).double()
-        state["n"] += float(targets.numel())
-        state["sum_y"] += float(targets.sum())
-        state["sum_y2"] += float((targets**2).sum())
-        state["sum_p"] += float(predictions.sum())
-        state["sum_p2"] += float((predictions**2).sum())
-        state["sse"] += float(((predictions - targets) ** 2).sum())
+        # Summed over the BATCH axis only, so every accumulator is one value per target. Flattening
+        # both axes - which is what this used to do - pools every target into a single r2. That is
+        # not the mean of the per-target scores and it hides a target that has collapsed behind one
+        # that has not, which on a joint run is exactly the failure worth seeing.
+        predictions = predictions.double().reshape(-1, self.target_dim)
+        targets = targets.double().reshape(-1, self.target_dim)
+        state = self._metric_state.setdefault(stage, {})
+        if not state:
+            # Kept on the CPU so the accumulator does not pin accelerator memory for the epoch, and
+            # so the addends below can be moved to it unconditionally.
+            zeros = torch.zeros(self.target_dim, dtype=torch.float64)
+            state.update(
+                {
+                    "n": 0.0,
+                    "sum_y": zeros.clone(),
+                    "sum_y2": zeros.clone(),
+                    "sum_p": zeros.clone(),
+                    "sum_p2": zeros.clone(),
+                    "sse": zeros.clone(),
+                }
+            )
+        state["n"] += float(targets.shape[0])
+        state["sum_y"] += targets.sum(dim=0).cpu()
+        state["sum_y2"] += (targets**2).sum(dim=0).cpu()
+        state["sum_p"] += predictions.sum(dim=0).cpu()
+        state["sum_p2"] += (predictions**2).sum(dim=0).cpu()
+        state["sse"] += ((predictions - targets) ** 2).sum(dim=0).cpu()
 
     def _log_epoch_metrics(self, stage: str) -> None:
         state = self._metric_state.pop(stage, None)
@@ -185,15 +215,43 @@ class SoilRegressionLightningBase(LightningModule):
         count = state["n"]
         target_variance = state["sum_y2"] / count - (state["sum_y"] / count) ** 2
         prediction_variance = state["sum_p2"] / count - (state["sum_p"] / count) ** 2
-        if target_variance <= 1e-12:
-            return
 
-        # In standardized space this is exactly 1 - MSE, which is how a run's health can be read
-        # straight off test_loss.
-        r2 = 1.0 - (state["sse"] / count) / target_variance
-        std_ratio = (max(prediction_variance, 0.0) ** 0.5) / (target_variance**0.5)
-        self.log(f"{stage}_r2", r2, on_step=False, on_epoch=True, prog_bar=stage == "val")
-        self.log(f"{stage}_pred_std_ratio", std_ratio, on_step=False, on_epoch=True)
+        names = self._metric_target_names()
+        r2_scores: list[float] = []
+        std_ratios: list[float] = []
+        for index, name in enumerate(names):
+            variance = float(target_variance[index])
+            # A constant target has no variance to explain, so r2 is undefined rather than zero.
+            # Skipped per column: one degenerate target must not suppress the others' metrics.
+            if variance <= 1e-12:
+                continue
+            # In standardized space this is exactly 1 - MSE, which is how a run's health can be read
+            # straight off test_loss.
+            r2 = 1.0 - (float(state["sse"][index]) / count) / variance
+            std_ratio = (max(float(prediction_variance[index]), 0.0) ** 0.5) / (variance**0.5)
+            r2_scores.append(r2)
+            std_ratios.append(std_ratio)
+            if len(names) > 1:
+                self.log(f"{stage}_r2_{name}", r2, on_step=False, on_epoch=True)
+                self.log(f"{stage}_pred_std_ratio_{name}", std_ratio, on_step=False, on_epoch=True)
+
+        if not r2_scores:
+            return
+        # The unsuffixed pair is the MEAN across targets, which is what makes it comparable with a
+        # per-target run's single value. A single target leaves it numerically unchanged.
+        self.log(
+            f"{stage}_r2",
+            sum(r2_scores) / len(r2_scores),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=stage == "val",
+        )
+        self.log(
+            f"{stage}_pred_std_ratio",
+            sum(std_ratios) / len(std_ratios),
+            on_step=False,
+            on_epoch=True,
+        )
 
     def on_train_epoch_start(self) -> None:
         self._metric_state.pop("train", None)

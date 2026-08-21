@@ -45,11 +45,19 @@ CARRY_LABEL_COLUMNS: true
 TARGET_COLUMNS:
   # - organic_matter_g_kg
   # - organic_matter_pct
-  # - clay_pct
-  # - sand_pct
-  # - total_silt_pct
+  - clay_pct
+  - sand_pct
+  - total_silt_pct
   # - ph_water
-  - caco3_pct_total
+  # - caco3_pct_total
+
+# How several targets become models. Ignored when TARGET_COLUMNS has one entry.
+#   joint       one model with a target_dim-wide head over every target, sharing a representation
+#   per_target  one independent model per target
+# Both families obey this. A registry entry may override it with its own `multi_target:` key; an
+# sklearn entry must additionally declare `multi_target: native` to be eligible for a joint fit,
+# since most scikit estimators cannot take a 2-D y.
+MULTI_TARGET_MODE: joint
 
 PREDICTOR_COLUMNS: []
 

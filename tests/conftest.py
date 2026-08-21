@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,40 @@ SRC_ROOT = PROJECT_ROOT / "src"
 for path in (str(PROJECT_ROOT), str(SRC_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
+
+
+@pytest.fixture(autouse=True)
+def isolated_mlflow_tracking(tmp_path_factory):
+    """Give every test its own throwaway tracking store, and let none inherit an open run.
+
+    Two problems this removes. Tests that touch MLflow incidentally used to write into the repo's
+    real ``mlruns/`` - and since the trainers open their own runs rather than the logger doing it,
+    that is now most of them. And a test that left a run active made the NEXT test fail with
+    "Run with UUID ... is already active", a failure that moves around as the suite is reordered
+    and blames the wrong test.
+
+    Tests that set their own tracking URI still win: this runs first and they override it.
+    """
+    import mlflow
+
+    previous_uri = mlflow.get_tracking_uri()
+    previous_allow = os.environ.get("MLFLOW_ALLOW_FILE_STORE")
+    # MLflow 3.14 refuses a filesystem backend without this; see yg_eo_soilnet.tracking.
+    os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
+    mlflow.set_tracking_uri(tmp_path_factory.mktemp("mlruns").as_uri())
+    # A bare directory has no experiment 0, and MLflow does not create the default one lazily, so
+    # the first start_run would fail with "Could not find experiment with ID 0".
+    mlflow.set_experiment("pytest")
+    try:
+        yield
+    finally:
+        while mlflow.active_run() is not None:
+            mlflow.end_run()
+        mlflow.set_tracking_uri(previous_uri)
+        if previous_allow is None:
+            os.environ.pop("MLFLOW_ALLOW_FILE_STORE", None)
+        else:
+            os.environ["MLFLOW_ALLOW_FILE_STORE"] = previous_allow
 
 
 @pytest.fixture

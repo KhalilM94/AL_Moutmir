@@ -13,6 +13,7 @@ from lightning.pytorch import LightningDataModule
 from yg_eo_soilnet.datamodules.categorical import CategoricalEncoder
 from yg_eo_soilnet.datamodules.sequence.sequence_bundle import SoilSequenceBundle
 from yg_eo_soilnet.datamodules.splitting import SplitPlan
+from yg_eo_soilnet.targets import select_target_columns
 
 
 class _PointDataset(Dataset):
@@ -58,9 +59,20 @@ class SoilSequenceDataModule(LightningDataModule):
         target_transform: Optional[str] = None,
         max_sequence_length: Optional[int] = None,
         split_plan: Optional["SplitPlan"] = None,
+        active_targets: Optional[list[str]] = None,
     ):
         super().__init__()
         self.sequence_bundle = deepcopy(SoilSequenceBundle.from_mapping(sequence_bundle))
+        # The subset of the bundle's targets this run fits. None keeps all of them, which is the
+        # joint head. Narrowed HERE, immediately after the copy, so everything below - target_dim,
+        # the per-column scaler, the y frames, the batch `y`, the serving state - follows from the
+        # two fields it rewrites and needs no per-target branch of its own.
+        self.active_targets = list(active_targets) if active_targets else None
+        narrowed, target_names, _ = select_target_columns(
+            self.sequence_bundle.targets, self.sequence_bundle.target_names, self.active_targets
+        )
+        self.sequence_bundle.targets = narrowed
+        self.sequence_bundle.target_names = target_names
         self.target_transform = None if target_transform is None else str(target_transform).lower()
         if self.target_transform not in {None, "none", "log1p"}:
             raise ValueError("target_transform must be None or 'log1p'")

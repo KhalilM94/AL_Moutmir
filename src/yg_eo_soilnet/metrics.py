@@ -85,12 +85,29 @@ METRIC_SPACE: dict[str, str] = {
 LEGACY_METRIC_NAMES: tuple[str, ...] = ("mean_test_score", "mean_train_score", "r2_test_legacy")
 
 
+def _reject_multi_column(name: str, values: Any) -> None:
+    """Raise when `values` carries more than one target column."""
+    array = np.asarray(values)
+    if array.ndim > 1 and array.shape[-1] > 1:
+        raise ValueError(
+            f"{name} has {array.shape[-1]} columns; regression_metrics scores ONE target at a time. "
+            "Pooling several would mix their units into a single meaningless number. Call it once "
+            "per target with suffix=f'_{target_name}'."
+        )
+
+
 def _finite_pairs(y_true: Any, y_pred: Any) -> tuple[np.ndarray, np.ndarray]:
     """Both series as float arrays, keeping only positions where BOTH are finite.
 
     Dropping per-array rather than pairwise would misalign them, which is why the mask is built
     from the conjunction.
+
+    Refuses a multi-column input. The reshape below would otherwise flatten several targets into
+    one pooled score - an RMSE mixing pH with g/kg, reported under a name that claims to describe
+    one target. Callers with several targets must call once per target with ``suffix``.
     """
+    _reject_multi_column("y_true", y_true)
+    _reject_multi_column("y_pred", y_pred)
     true_values = pd.to_numeric(pd.Series(np.asarray(y_true).reshape(-1)), errors="coerce").to_numpy(dtype=float)
     predicted_values = pd.to_numeric(pd.Series(np.asarray(y_pred).reshape(-1)), errors="coerce").to_numpy(dtype=float)
 
@@ -208,4 +225,22 @@ def metric_space_for(metric_names: Any) -> dict[str, str]:
     Unknown names are reported as ``"unknown"`` rather than dropped, so a metric someone adds
     without registering it here shows up as a gap instead of silently looking like original units.
     """
-    return {str(name): METRIC_SPACE.get(str(name), "unknown") for name in metric_names}
+    return {str(name): _space_of(str(name)) for name in metric_names}
+
+
+def _space_of(name: str) -> str:
+    """The space a metric name lives in, resolving per-target suffixes to their stem.
+
+    A joint run logs ``rmse_test_clay_pct`` and ``val_r2_clay_pct`` alongside the unsuffixed pair.
+    Those are the same quantity in the same space as their stem, so they are resolved by prefix
+    rather than needing one registry entry per configured target.
+    """
+    known = METRIC_SPACE.get(name)
+    if known is not None:
+        return known
+    # Longest first: "test_r2" must not match a name that "test_r2_..." also starts with by way of
+    # some shorter stem like "test_r".
+    for stem in sorted(METRIC_SPACE, key=len, reverse=True):
+        if name.startswith(f"{stem}_"):
+            return METRIC_SPACE[stem]
+    return "unknown"

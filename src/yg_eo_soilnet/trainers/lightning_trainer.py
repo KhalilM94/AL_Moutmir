@@ -20,6 +20,8 @@ except ImportError:  # pragma: no cover
 
 from yg_eo_soilnet.logger.mlflow_loggers import ChildRunLogger
 from yg_eo_soilnet.models.config_fatories.lightning_config_factory import LightningModelBundle
+from yg_eo_soilnet.targets import join_target_names
+from yg_eo_soilnet.tracking import start_child_run
 
 
 class _LightningMlflowEpochMetricCallback(LightningCallback):
@@ -90,8 +92,11 @@ class LightningTrainer:
             # different place than the HPO trial that chose these hyperparameters, so a tuned config
             # could never reproduce its score. LightningConfigFactory.build_lightning_configs seeds
             # per entry instead, immediately before it constructs each model.
-            run_name = model_name
-            with mlflow.start_run(run_name=run_name, nested=True):
+            # Named for the target GROUP, not bare. A joint run used to be called just "soil_cnn"
+            # while every other run in the experiment carried its target, which made the one run
+            # spanning several targets the hardest to identify.
+            run_name = f"{target}_{model_name}"
+            with start_child_run(run_name):
                 trainer = self._build_trainer(bundle)
                 bundle.datamodule.setup("fit")
                 # After setup (the scalers and vocabulary are fitted there) and before fit, so the
@@ -123,44 +128,24 @@ class LightningTrainer:
 
                 evaluation_df = self._build_evaluation_frame(bundle, trainer, target, ckpt_path=best_model_path)
 
-                target_names = self._resolve_evaluation_target_names(bundle, evaluation_df, target)
-                if len(target_names) > 1:
-                    for target_name in target_names:
-                        target_evaluation_df = self._build_target_evaluation_frame(
-                            evaluation_df,
-                            target_name,
-                            target_names,
-                        )
-                        if target_evaluation_df is None:
-                            continue
-                        with mlflow.start_run(run_name=f"{target_name}_{model_name}", nested=True):
-                            self.mlflow_logger.log_lightning_child_run(
-                                config=self.config,
-                                target=target_name,
-                                model_name=model_name,
-                                evaluation_df=target_evaluation_df,
-                                validation_metrics={},
-                                test_metrics={},
-                                best_model_path=best_model_path,
-                                extra_params=self._serialize_params(bundle),
-                                plot_functions={},
-                                bundle=bundle,
-                                model=bundle.model,
-                            )
-                else:
-                    self.mlflow_logger.log_lightning_child_run(
-                        config=self.config,
-                        target=target,
-                        model_name=model_name,
-                        evaluation_df=evaluation_df,
-                        validation_metrics=validation_metrics,
-                        test_metrics=test_metrics,
-                        best_model_path=best_model_path,
-                        extra_params=self._serialize_params(bundle),
-                        plot_functions={},
-                        bundle=bundle,
-                        model=bundle.model,
-                    )
+                # One call, whatever the target count. The logger owns the run tree now: it keeps
+                # the model, the curves and the aggregate metrics here and opens one child per
+                # target when there is more than one. This used to fan out here and hand each
+                # child empty metric dicts, which is why val_loss and test_loss never reached
+                # MLflow at all on a multi-target run.
+                self.mlflow_logger.log_lightning_child_run(
+                    config=self.config,
+                    target=target,
+                    model_name=model_name,
+                    evaluation_df=evaluation_df,
+                    validation_metrics=validation_metrics,
+                    test_metrics=test_metrics,
+                    best_model_path=best_model_path,
+                    extra_params=self._serialize_params(bundle),
+                    plot_functions={},
+                    bundle=bundle,
+                    model=bundle.model,
+                )
 
                 results[model_name] = LightningRunResult(
                     model_name=model_name,
@@ -297,82 +282,17 @@ class LightningTrainer:
             for column_index in range(prediction_values.shape[1]):
                 column_name = target_columns[column_index] if column_index < len(target_columns) else str(column_index)
                 eval_df[f"prediction_{column_name}"] = prediction_values[:, column_index]
-
-            canonical_prediction_name = target_columns[0] if target_columns else "0"
-            canonical_prediction_column = f"prediction_{canonical_prediction_name}"
-            if canonical_prediction_column in eval_df.columns:
-                eval_df["prediction"] = eval_df[canonical_prediction_column]
+            # No plain `prediction` column here. It used to alias target 0, so anyone reading
+            # eval_results.csv from a joint run got the first target's predictions under a name
+            # that claims to be the run's. Readers fan out over prediction_<target> instead.
 
         if len(target_names) > 1:
-            eval_df["target_name"] = "__".join(target_names)
-            eval_df["target_names"] = "__".join(target_names)
+            encoded = join_target_names(target_names)
+            eval_df["target_name"] = encoded
+            eval_df["target_names"] = encoded
         else:
             eval_df["target_name"] = target
         return eval_df
-
-    def _resolve_evaluation_target_names(
-        self,
-        bundle: LightningModelBundle,
-        evaluation_df: pd.DataFrame | None,
-        target: str,
-    ) -> list[str]:
-        if evaluation_df is not None and "target_names" in evaluation_df.columns and not evaluation_df["target_names"].empty:
-            encoded = str(evaluation_df["target_names"].iloc[0]).strip()
-            if encoded:
-                names = [name for name in encoded.split("__") if name]
-                if names:
-                    return names
-
-        datamodule = bundle.datamodule
-        target_frame = getattr(datamodule, "y_test_frame_", None)
-        target_names = list(getattr(datamodule, "target_names", []) or (target_frame.columns.tolist() if target_frame is not None else []))
-        if target_names:
-            return target_names
-
-        return [target]
-
-    def _build_target_evaluation_frame(
-        self,
-        evaluation_df: pd.DataFrame | None,
-        target_name: str,
-        target_names: list[str],
-    ) -> pd.DataFrame | None:
-        if evaluation_df is None or evaluation_df.empty:
-            return None
-
-        target_column = target_name if target_name in evaluation_df.columns else None
-        if target_column is None:
-            target_candidates = [column for column in evaluation_df.columns if column.startswith("target_")]
-            if len(target_candidates) == 1:
-                target_column = target_candidates[0]
-        if target_column is None:
-            return None
-
-        prediction_column = f"prediction_{target_name}"
-        if prediction_column not in evaluation_df.columns:
-            if "prediction" in evaluation_df.columns:
-                prediction_column = "prediction"
-            else:
-                prediction_candidates = [column for column in evaluation_df.columns if column.startswith("prediction_")]
-                prediction_column = prediction_candidates[0] if len(prediction_candidates) == 1 else None
-        if prediction_column is None:
-            return None
-
-        target_columns = set(target_names)
-        feature_columns = [
-            column
-            for column in evaluation_df.columns
-            if column not in target_columns
-            and column not in {"prediction", "target_name", "target_names", "model_name"}
-            and not column.startswith("prediction_")
-        ]
-
-        target_frame = evaluation_df[feature_columns + [target_column]].copy() if feature_columns else evaluation_df[[target_column]].copy()
-        target_frame[target_column] = evaluation_df[target_column].to_numpy()
-        target_frame["prediction"] = evaluation_df[prediction_column].to_numpy()
-        target_frame["target_name"] = target_name
-        target_frame["target_names"] = target_name
-        return target_frame
 
     def _flatten_predictions(self, predictions) -> np.ndarray | None:
         flattened = []

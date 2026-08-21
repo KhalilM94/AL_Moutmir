@@ -14,6 +14,7 @@ from lightning.pytorch import LightningDataModule
 
 from yg_eo_soilnet.datamodules.lightning.spatiotemporal_graph import SpatiotemporalGraph
 from yg_eo_soilnet.datamodules.splitting import SplitPlan
+from yg_eo_soilnet.targets import select_target_columns
 
 
 def _as_tensor(value, dtype=None):
@@ -89,9 +90,25 @@ class SingleNodeGraphDataModule(LightningDataModule):
         shuffle: bool = False,
         target_transform: Optional[str] = None,
         split_plan: Optional["SplitPlan"] = None,
+        active_targets: Optional[list[str]] = None,
     ):
         super().__init__()
         self.spatiotemporal_graph = deepcopy(SpatiotemporalGraph.from_mapping(spatiotemporal_graph))
+        # See the sequence datamodule for the contract: None keeps every target (the joint head),
+        # a list narrows to what this run fits, and everything downstream follows from the fields
+        # rewritten here. Residuals are narrowed alongside because they are validated against
+        # target_names and would otherwise disagree with it.
+        self.active_targets = list(active_targets) if active_targets else None
+        all_target_names = list(self.spatiotemporal_graph.target_names)
+        narrowed, target_names, indices = select_target_columns(
+            self.spatiotemporal_graph.targets, all_target_names, self.active_targets
+        )
+        self.spatiotemporal_graph.targets = narrowed
+        self.spatiotemporal_graph.target_names = target_names
+        if indices is not None:
+            residuals = np.asarray(self.spatiotemporal_graph.residuals)
+            if residuals.ndim == 2 and residuals.shape[1] == len(all_target_names):
+                self.spatiotemporal_graph.residuals = residuals[:, indices]
         self.target_transform = None if target_transform is None else str(target_transform).lower()
         if self.target_transform not in {None, "none", "log1p"}:
             raise ValueError("target_transform must be None or 'log1p'")

@@ -10,6 +10,7 @@ import numpy as np
 
 from yg_eo_soilnet.datamodules.lightning.spatiotemporal_graph_builder import SpatiotemporalGraphBuilder
 from yg_eo_soilnet.seeding import seed_everything
+from yg_eo_soilnet.targets import split_target_names
 
 
 @dataclass
@@ -55,9 +56,17 @@ class LightningConfigFactory:
         return getattr(module, attr_name)
 
     def build_lightning_configs(
-        self, target: str, data: Mapping[str, Any], seed: int | None = None
+        self,
+        target: str,
+        data: Mapping[str, Any],
+        seed: int | None = None,
+        entries: Any = None,
     ) -> dict[str, LightningModelBundle]:
         """Build one bundle per enabled entry.
+
+        `entries`, when given, restricts the build to those registry names. Used when entries
+        disagree about target grouping: building the others here only to discard them would pay for
+        a datamodule copy and setup() per discarded entry.
 
         `seed`, when given, is applied immediately before each model is constructed. Weight
         initialization draws from the global torch generator, so this is the only point at which
@@ -66,9 +75,12 @@ class LightningConfigFactory:
         selected it. Per entry rather than once for the whole loop, so a second enabled entry does
         not inherit the stream the first one consumed.
         """
+        wanted = None if entries is None else {str(name) for name in entries}
         bundles: dict[str, LightningModelBundle] = {}
         for name, spec in self.registry.items():
             if not spec.get("enabled", False):
+                continue
+            if wanted is not None and name not in wanted:
                 continue
 
             self._validate_entry(name, spec)
@@ -114,10 +126,13 @@ class LightningConfigFactory:
         return self.sequence_spec() is not None
 
     def covers_all_targets_in_one_run(self) -> bool:
-        """True when an enabled datamodule spans every point, and so every target, in one pass.
+        """Whether an enabled datamodule *can* span every target in one pass.
 
-        Both the graph and the sequence datamodules are built from the whole dataset at once, so a
-        multi-target run is one combined run rather than one run per target.
+        A CAPABILITY, not a decision. It used to be read as the multi-target switch, which was
+        misleading twice over: it is always True (``_build_datamodule`` accepts only 'graph' and
+        'sequence', and both are built from the whole dataset at once), and the head was a
+        ``Linear(..., target_dim)`` over every configured target regardless of what it returned.
+        What a run actually fits is now decided by MULTI_TARGET_MODE; see yg_eo_soilnet.targets.
         """
         return self.has_graph_input() or self.has_sequence_input()
 
@@ -158,8 +173,16 @@ class LightningConfigFactory:
         )
         datamodule_kwargs.setdefault("seed", fallback_seed)
 
+        # Which targets this run fits, decoded from the run label. The bundle is built over every
+        # configured target and cached across entries, so a per-target run narrows the datamodule
+        # rather than rebuilding the bundle. A joint run names every target and narrows nothing.
+        active_targets = split_target_names(target)
+        if active_targets and self._accepts_kwarg(datamodule_cls, "active_targets"):
+            datamodule_kwargs["active_targets"] = active_targets
+
         # Built before the payload is attached: the payload is a whole dataset, so it is identified
-        # by object identity rather than by value.
+        # by object identity rather than by value. `active_targets` is inside these kwargs, so two
+        # target groups over the same payload cannot collide in the cache.
         cache_key = (spec["datamodule_import_path"], repr(sorted(datamodule_kwargs.items())))
 
         if input_kind == "graph":
@@ -299,6 +322,11 @@ class LightningConfigFactory:
             # configured with into positions, and refuses any that is also being fitted.
             "auxiliary_available_names": getattr(datamodule, "label_feature_names", None),
             "target_names": getattr(datamodule, "target_names", None),
+            # Every target the RUN fits, not just this model's outputs. Under per-target grouping
+            # target_names holds one name, and checking auxiliary columns against it would let the
+            # model read another configured target as an input - the exact leak the check exists to
+            # stop. The leakage check uses this; the output layer uses target_names.
+            "fitted_target_names": list(getattr(self.config, "TARGET_COLUMNS", []) or []),
         }
         # An empty list is "this dataset has no categoricals", not data worth offering - without it
         # in the sentinel set a model would be handed [] as though it were a real shape.

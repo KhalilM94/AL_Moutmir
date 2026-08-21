@@ -10,7 +10,15 @@ from config import Config
 from yg_eo_soilnet.models.config_fatories.lightning_config_factory import LightningConfigFactory
 from yg_eo_soilnet.seeding import seed_everything
 from yg_eo_soilnet.trainers.lightning_trainer import LightningTrainer
-from yg_eo_soilnet.tracking import configure_tracking, tracking_settings
+from yg_eo_soilnet.tracking import (
+    close_stale_runs,
+    configure_tracking,
+    install_run_signal_handlers,
+    log_params_once,
+    run_owner_tags,
+    tracking_settings,
+)
+from yg_eo_soilnet.targets import join_target_names, resolve_target_groups
 import mlflow
 import datetime
 import time
@@ -156,53 +164,119 @@ class SoilModelTraining:
         )
         lightning_input = dict(data)
 
-        # Graph and sequence datamodules both span every point at once, so a multi-target run over
-        # either is one combined run rather than one run per target.
-        run_lightning_once = (
-            len(self.config.TARGET_COLUMNS) > 1
-            and self.lightning_model_configs.covers_all_targets_in_one_run()
+        # How several targets become models - one joint model with a wide head, or one model each -
+        # is now MULTI_TARGET_MODE, and both families read the same answer. Resolved per family
+        # because the sklearn side additionally needs the estimator to declare that it can fit a
+        # 2-D y; a Lightning head always can.
+        model_pipelines = self.model_configs.build_model_configs(
+            num_features=data[X_key].shape[1],
+            default_seed=self.config.RANDOM_SEED,
         )
-        combined_lightning_target = "__".join(self.config.TARGET_COLUMNS) if run_lightning_once else None
-
-        for target in self.config.TARGET_COLUMNS:
-            model_pipelines = self.model_configs.build_model_configs(
-                num_features=data[X_key].shape[1],
-                default_seed=self.config.RANDOM_SEED,
+        # Resolved per ENTRY, because joint capability is per estimator: PLS and Ridge take a 2-D y,
+        # GradientBoosting and TabICL do not. An entry that cannot falls back to one model per
+        # target with a warning rather than failing, so one unsupported estimator does not take the
+        # whole run down.
+        #
+        # Entries that agree on a grouping are then trained TOGETHER, in one call per group. That
+        # matters beyond tidiness: FAIL_IF_ALL_MODELS_FAIL_FOR_TARGET is a check across the models
+        # tried for a target, so splitting them into one call each would turn "every model failed"
+        # into "any model failed".
+        sklearn_groups: dict[tuple, dict] = {}
+        for model_name, pipeline in (model_pipelines or {}).items():
+            groups = resolve_target_groups(
+                self.config,
+                self.config.MODEL_REGISTRY.get(model_name, {}),
+                require_joint_support=True,
+                logger=self.logger,
+                entry_name=model_name,
             )
-            if model_pipelines:
-                trainer.train(
-                    target=target,
-                    data=data,
-                    model_pipelines=model_pipelines,
-                )
+            for target_group in groups:
+                sklearn_groups.setdefault(tuple(target_group), {})[model_name] = pipeline
 
-            if not run_lightning_once:
-                # `seed` so each model is constructed from a fixed RNG state rather than from
-                # whatever the preceding data work and sklearn training left behind. Without it a
-                # tuned config cannot reproduce the hyperparameter trial that produced it, and two
-                # production runs do not agree with each other either.
-                lightning_model_bundles = self.lightning_model_configs.build_lightning_configs(
-                    target=target, data=lightning_input, seed=int(self.config.RANDOM_SEED)
-                )
-                if lightning_model_bundles:
-                    self.lightning_trainer.train(
-                        target=target,
-                        data=lightning_input,
-                        model_bundles=lightning_model_bundles,
-                    )
+        # Same per-entry resolution on the Lightning side, so an entry may opt out of joint fitting
+        # without changing the mode for the rest. Entries that agree share one build.
+        lightning_groups: dict[tuple, list[str]] = {}
+        for entry_name, spec in self.config.LIGHTNING_MODEL_REGISTRY.items():
+            if not spec.get("enabled", False):
+                continue
+            for target_group in resolve_target_groups(self.config, spec):
+                lightning_groups.setdefault(tuple(target_group), []).append(entry_name)
 
-        if run_lightning_once and combined_lightning_target is not None:
+        # Logged on the PARENT run, before any child opens. Without it the run records how it split
+        # the data but not what it decided to fit, so "was this joint or per-target?" could only be
+        # guessed at from the child run names afterwards.
+        self._log_target_plan(sklearn_groups, lightning_groups)
+
+        for index, (target_group, pipelines) in enumerate(sklearn_groups.items(), start=1):
+            label = join_target_names(list(target_group))
+            # Progress, because a slow estimator spends tens of minutes per group with nothing to
+            # say. A silent gap is indistinguishable from a hang, which is how an OOM-killed run got
+            # mistaken for a bug in the grouping.
+            self.logger.info(f"[sklearn group {index}/{len(sklearn_groups)}] {label} - starting")
+            started = time.perf_counter()
+            trainer.train(
+                target=label,
+                targets=list(target_group),
+                data=data,
+                model_pipelines=pipelines,
+            )
+            self.logger.info(
+                f"[sklearn group {index}/{len(sklearn_groups)}] {label} - "
+                f"done in {(time.perf_counter() - started) / 60:.1f}min"
+            )
+
+        for index, (target_group, entry_names) in enumerate(lightning_groups.items(), start=1):
+            # `seed` so each model is constructed from a fixed RNG state rather than from
+            # whatever the preceding data work and sklearn training left behind. Without it a
+            # tuned config cannot reproduce the hyperparameter trial that produced it, and two
+            # production runs do not agree with each other either.
+            label = join_target_names(list(target_group))
+            self.logger.info(f"[lightning group {index}/{len(lightning_groups)}] {label} - starting")
+            started = time.perf_counter()
             lightning_model_bundles = self.lightning_model_configs.build_lightning_configs(
-                target=combined_lightning_target,
+                target=label,
                 data=lightning_input,
                 seed=int(self.config.RANDOM_SEED),
+                entries=entry_names,
             )
             if lightning_model_bundles:
                 self.lightning_trainer.train(
-                    target=combined_lightning_target,
+                    target=label,
                     data=lightning_input,
                     model_bundles=lightning_model_bundles,
                 )
+            self.logger.info(
+                f"[lightning group {index}/{len(lightning_groups)}] {label} - "
+                f"done in {(time.perf_counter() - started) / 60:.1f}min"
+            )
+
+    def _log_target_plan(self, sklearn_groups: Dict, lightning_groups: Dict) -> None:
+        """Record what this run decided to fit, on the parent run.
+
+        The mode and the groups TOGETHER are what identify a fallback: `MULTI_TARGET_MODE: joint`
+        beside per-target sklearn groups means an estimator declined the 2-D fit, which is
+        otherwise only visible as a warning in a log nobody kept.
+        """
+        def describe(groups) -> str:
+            return " | ".join(join_target_names(list(group)) for group in groups) or "(none)"
+
+        params = {
+            "MULTI_TARGET_MODE": getattr(self.config, "MULTI_TARGET_MODE", "joint"),
+            "TARGET_COLUMNS": ",".join(self.config.TARGET_COLUMNS) or "(none)",
+            "sklearn_target_groups": describe(sklearn_groups),
+            "lightning_target_groups": describe(lightning_groups),
+        }
+        self.logger.info(
+            f"Target plan: mode={params['MULTI_TARGET_MODE']} | "
+            f"sklearn={params['sklearn_target_groups']} | "
+            f"lightning={params['lightning_target_groups']}"
+        )
+        try:
+            # This is the sole writer of TARGET_COLUMNS on the parent run, and it runs at the START
+            # of training so a killed run still records what it set out to fit.
+            log_params_once(params, logger=self.logger)
+        except Exception as exc:  # pragma: no cover - never worth failing a run over
+            self.logger.warning(f"Could not log the target plan: {type(exc).__name__}: {exc}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -220,15 +294,23 @@ def main():
     mlflow.enable_system_metrics_logging()
     # Before any run starts: an experiment's artifact_location is fixed when it is created, so this
     # is what keeps a run's metadata and its artifacts in the same directory.
-    configure_tracking(tracking_settings(args.config_path))
-    
+    experiment_name = configure_tracking(tracking_settings(args.config_path))
+
     if mlflow.active_run():
         mlflow.end_run()
-    
+
+    # Before this run's own runs start, so the sweep cannot see them. Runs abandoned by a dead
+    # process sit at RUNNING forever - an OOM kill is a SIGKILL, so nothing in the killed process
+    # gets the chance to mark them. Ctrl-C and `kill` ARE catchable, hence the handlers too.
+    install_run_signal_handlers()
+    close_stale_runs(experiment_name)
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"Run_{timestamp}"
     mlflow_logger = ParentRunLogger()
     with mlflow.start_run(run_name=run_name) as main_run:
+        # Who owns this run, so a later process can tell "finished" from "abandoned".
+        mlflow.set_tags(run_owner_tags())
         # Initialize and run the training pipeline
         trainer = SoilModelTraining(
             run_name=run_name,

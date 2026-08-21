@@ -118,6 +118,187 @@ def configure_tracking(config=None, experiment_name: str | None = None) -> str:
     return name
 
 
+# --- run ownership and stale-run cleanup ----------------------------------------------------
+# An MLflow run that dies without unwinding stays RUNNING forever. `ActiveRun.__exit__` marks a run
+# FAILED on a normal exception, but it never runs when the process is SIGKILLed - which is what the
+# kernel's OOM killer sends. A run left RUNNING reads as "still working", or worse as a model that
+# was successfully made, and it is what made an OOM-killed multi-target run look like a bug in the
+# target grouping.
+#
+# The fix has to be a SWEEP rather than a signal handler, because SIGKILL cannot be caught. The
+# handlers below only cover the signals that can be.
+
+HOST_NAME_TAG = "host_name"
+HOST_PID_TAG = "host_pid"
+
+
+def run_owner_tags() -> dict[str, str]:
+    """Who is writing this run. Tagged so a later process can tell finished from abandoned."""
+    import socket
+
+    return {HOST_NAME_TAG: socket.gethostname(), HOST_PID_TAG: str(os.getpid())}
+
+
+def _process_is_alive(pid: int) -> bool:
+    """Whether a pid on THIS host still exists. Signal 0 checks without delivering anything."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Alive, owned by somebody else. Not ours to clean up either way.
+        return True
+    except (OverflowError, ValueError):
+        return False
+    return True
+
+
+def close_stale_runs(experiment_name: str | None = None, logger: Any = None) -> list[str]:
+    """Mark runs abandoned by a dead process as KILLED. Returns the run ids closed.
+
+    Deliberately narrow. Only a run that is RUNNING, tagged with THIS hostname, and whose recorded
+    pid no longer exists is touched. Sweeping on "status is RUNNING" alone would let one training
+    process terminate a second one running concurrently, which is a far worse failure than the
+    phantom runs this cleans up.
+    """
+    import socket
+
+    name = experiment_name or os.environ.get("MLFLOW_EXPERIMENT_NAME") or DEFAULT_EXPERIMENT_NAME
+    try:
+        client = mlflow.tracking.MlflowClient()  # type: ignore[attr-defined]
+        experiment = client.get_experiment_by_name(name)
+        if experiment is None:
+            return []
+        running = client.search_runs(
+            experiment_ids=[experiment.experiment_id],
+            filter_string="attributes.status = 'RUNNING'",
+            max_results=1000,
+        )
+    except Exception as exc:  # pragma: no cover - tracking store unreachable
+        # Never fatal: a failed sweep is cosmetic, and refusing to train because old runs could not
+        # be tidied would be the worse trade.
+        if logger is not None:
+            logger.warning(f"Could not sweep stale runs: {type(exc).__name__}: {exc}")
+        return []
+
+    hostname = socket.gethostname()
+    this_pid = os.getpid()
+    closed: list[str] = []
+    for run in running:
+        tags = run.data.tags
+        if tags.get(HOST_NAME_TAG) != hostname:
+            continue
+        raw_pid = tags.get(HOST_PID_TAG)
+        if raw_pid is None:
+            # Written before runs carried ownership tags. Left alone rather than guessed at.
+            continue
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            continue
+        if pid == this_pid or _process_is_alive(pid):
+            continue
+        try:
+            client.set_terminated(run.info.run_id, "KILLED")
+            closed.append(run.info.run_id)
+        except Exception as exc:  # pragma: no cover
+            if logger is not None:
+                logger.warning(f"Could not terminate stale run {run.info.run_id}: {exc}")
+
+    if closed and logger is not None:
+        logger.info(
+            f"Marked {len(closed)} abandoned run(s) as KILLED; their process is gone. "
+            "A run left RUNNING is usually one the OOM killer took."
+        )
+    return closed
+
+
+def start_child_run(run_name: str, tags: dict | None = None):
+    """Open a run for one model, nested under the current one when there is one.
+
+    `nested=True` is an ERROR when nothing is active, so hardcoding it ties the trainers to being
+    called from inside main.py's parent run. They are also used directly - by tests, and by anyone
+    driving a single model - and there a top-level run is the right thing. Deciding from
+    `active_run()` keeps both working.
+
+    Owner tags go on here rather than at each call site, so every run this project opens can be
+    told apart from an abandoned one by :func:`close_stale_runs`.
+    """
+    run = mlflow.start_run(run_name=run_name, nested=mlflow.active_run() is not None)
+    mlflow.set_tags({**run_owner_tags(), **(tags or {})})
+    return run
+
+
+def log_params_once(params: Any, logger: Any = None) -> None:
+    """Log params, skipping any key already recorded on this run with a DIFFERENT value.
+
+    MLflow params are immutable: re-logging the same value is fine, changing one raises. That
+    exception is worth avoiding rather than propagating, because of WHERE it lands. The parent run's
+    params are written partly at the start of training and partly in the summary at the end, so a
+    duplicated key does not fail fast - it fails after every model has been fitted, logged and
+    registered, and takes the summary, the leaderboard and the run's FINISHED status with it. One
+    such clash discarded the tail of an hour-long run.
+
+    Filtering BEFORE the call rather than catching after it: the file store's ``log_batch`` applies
+    params one at a time and raises partway through, so a rejected batch can leave some keys written
+    and others not.
+    """
+    params = dict(params)
+    if not params:
+        return
+
+    run = mlflow.active_run()
+    existing: dict = {}
+    if run is not None:
+        try:
+            existing = mlflow.tracking.MlflowClient().get_run(run.info.run_id).data.params  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - unreadable store; let log_params speak for itself
+            existing = {}
+
+    writable = {}
+    for key, value in params.items():
+        # str() is the form MLflow stores, so it is the form to compare against.
+        current = existing.get(str(key))
+        if current is not None and current != str(value):
+            if logger is not None:
+                logger.warning(
+                    f"Param {key!r} is already logged as {current!r} on this run; keeping that and "
+                    f"not overwriting it with {str(value)!r}. Two places are writing the same key."
+                )
+            continue
+        writable[key] = value
+
+    if writable:
+        mlflow.log_params(writable)
+
+
+def install_run_signal_handlers(logger: Any = None) -> None:
+    """End the active run stack as KILLED on SIGINT/SIGTERM, then re-raise.
+
+    Covers Ctrl-C and `kill`. It cannot cover SIGKILL - nothing can - which is why
+    :func:`close_stale_runs` exists as well.
+    """
+    import signal
+
+    def handler(signum, frame):
+        try:
+            while mlflow.active_run() is not None:
+                mlflow.end_run("KILLED")
+        except Exception:  # pragma: no cover - best effort during teardown
+            pass
+        if logger is not None:
+            logger.warning(f"Received signal {signum}; marked the active run(s) KILLED.")
+        # Restore the default and re-raise, so the exit status still says what happened.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(signum, handler)
+        except (ValueError, OSError):  # pragma: no cover - not on the main thread
+            pass
+
+
 CHAMPION_ALIAS = "champion"
 # The metric the promotion decision reads. It is the one that means the same thing for both
 # training families and is in the target's original units; yg_eo_soilnet.metrics is the authority

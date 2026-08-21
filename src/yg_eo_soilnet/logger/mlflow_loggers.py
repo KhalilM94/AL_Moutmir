@@ -12,6 +12,8 @@ from yg_eo_soilnet.metrics import (
     metric_space_for,
     regression_metrics,
 )
+from yg_eo_soilnet.targets import join_target_names, split_target_names
+from yg_eo_soilnet.tracking import log_params_once, run_owner_tags, start_child_run
 
 import pandas as pd
 import numpy as np
@@ -169,7 +171,7 @@ class ChildRunLogger:
             )
 
     @staticmethod
-    def _resolve_lightning_run_target_label(evaluation_df: pd.DataFrame | None, fallback_target: str) -> str:
+    def _resolve_run_target_label(evaluation_df: pd.DataFrame | None, fallback_target: str) -> str:
         if evaluation_df is not None and "target_names" in evaluation_df.columns and not evaluation_df["target_names"].empty:
             encoded = str(evaluation_df["target_names"].iloc[0]).strip()
             if encoded:
@@ -181,11 +183,11 @@ class ChildRunLogger:
         return fallback_target
 
     @staticmethod
-    def _resolve_lightning_target_names(evaluation_df: pd.DataFrame, fallback_target: str) -> list[str]:
+    def _resolve_target_names(evaluation_df: pd.DataFrame, fallback_target: str) -> list[str]:
         if "target_names" in evaluation_df.columns and not evaluation_df["target_names"].empty:
             encoded = str(evaluation_df["target_names"].iloc[0]).strip()
             if encoded:
-                names = [name for name in encoded.split("__") if name]
+                names = split_target_names(encoded)
                 if names:
                     return names
 
@@ -200,8 +202,8 @@ class ChildRunLogger:
         ]
         return target_columns[:1] if target_columns else []
 
-    def _iter_lightning_target_eval_frames(self, evaluation_df: pd.DataFrame, target: str, model_name: str):
-        target_names = self._resolve_lightning_target_names(evaluation_df, target)
+    def _iter_target_eval_frames(self, evaluation_df: pd.DataFrame, target: str, model_name: str):
+        target_names = self._resolve_target_names(evaluation_df, target)
         has_multi_prediction_columns = any(column.startswith("prediction_") for column in evaluation_df.columns)
 
         if "prediction" in evaluation_df.columns and not has_multi_prediction_columns:
@@ -229,6 +231,88 @@ class ChildRunLogger:
             frame["target_name"] = target_name
             frame["model_name"] = model_name
             yield frame, target_name, prediction_column
+
+    # --- the shared run tree -------------------------------------------------
+    # One rule for both families: the shape of the tree follows the TARGET GROUP, not the framework.
+    # A group of one is a single flat run. A group of several is a model run - holding the fitted
+    # model, its params and its training curves - with one child per target holding that target's
+    # evaluation. Before this, sklearn was always flat and Lightning grew a third level as soon as a
+    # second target appeared, so the same experiment looked structurally different depending on
+    # which family produced it.
+
+    def _log_per_target_runs(self, evaluation_df, target: str, model_name: str, log_one):
+        """Call ``log_one(frame, target_name)`` once per target, in the right run.
+
+        A group of one logs into the CURRENT run rather than opening a child: there is nothing to
+        fan out, and an extra level would make a single-target run's tree differ from every other
+        single-target run's. Returns ``[(target_name, log_one(...)), ...]``.
+        """
+        frames = []
+        if evaluation_df is not None:
+            frames = list(self._iter_target_eval_frames(evaluation_df, target=target, model_name=model_name))
+
+        if len(frames) <= 1:
+            frame = frames[0][0] if frames else evaluation_df
+            name = frames[0][1] if frames else target
+            return [(name, log_one(frame, name))]
+
+        results = []
+        for frame, target_name, _prediction_column in frames:
+            with start_child_run(
+                f"{target_name}_{model_name}",
+                tags={"target": target_name, "model_name": model_name},
+            ):
+                results.append((target_name, log_one(frame, target_name)))
+        return results
+
+    def _per_target_metrics(self, evaluation_df, target: str, model_name: str) -> dict:
+        """Suffixed metrics for every target in the frame, plus their means.
+
+        The means carry the UNSUFFIXED names, which is what makes a joint run comparable with a
+        per-target one and what the champion promotion reads - it looks for a scalar `rmse_test`
+        and silently promotes nothing when the run has only suffixed keys.
+        """
+        if evaluation_df is None:
+            return {}
+
+        frames = [
+            (frame, target_name)
+            for frame, target_name, _column in self._iter_target_eval_frames(
+                evaluation_df, target=target, model_name=model_name
+            )
+            if target_name in frame.columns and "prediction" in frame.columns
+        ]
+
+        metrics: dict[str, float] = {}
+        collected: dict[str, list[float]] = {}
+        for frame, target_name in frames:
+            # One target keeps the COMPLETE unsuffixed set - mae_test, bias_test, rpd_test and the
+            # rest - because there is nothing to disambiguate and every existing reader expects
+            # those names. Several targets get suffixed keys plus the means below.
+            if len(frames) == 1:
+                metrics.update(regression_metrics(frame[target_name], frame["prediction"]))
+            per_target = regression_metrics(
+                frame[target_name], frame["prediction"], suffix=f"_{target_name}"
+            )
+            metrics.update(per_target)
+            for stem in ("r2_test", "rmse_test"):
+                value = per_target.get(f"{stem}_{target_name}")
+                if value is not None:
+                    collected.setdefault(stem, []).append(value)
+
+        # Only r2 and rmse are averaged, and only as a FALLBACK for a run with several targets.
+        # `n` would be a count and `bias` a signed quantity, so those stay per-target.
+        #
+        # A caveat that matters for rmse_test: a mean over targets measured in different units
+        # (pH beside g/kg) is not a physical error, and it is dominated by whichever target has the
+        # largest scale. It exists to RANK candidates fitted over the SAME group - which is what
+        # champion promotion needs, since CHAMPION_METRIC is a scalar and a run carrying only
+        # suffixed keys promotes nothing at all. Read the suffixed keys for anything else; r2_test,
+        # being unitless, is the one that survives comparison across groups.
+        for stem, values in collected.items():
+            if values and stem not in metrics:
+                metrics[stem] = float(np.mean(values))
+        return metrics
 
     @staticmethod
     def _block_feature_dims(block):
@@ -698,131 +782,226 @@ class ChildRunLogger:
         model_name,
         plot_functions,
         extra_params=None,
+        targets=None,
     ):
-        """Log one child run with params, metrics, plots, and model."""
+        """Log one fitted sklearn model inside an ALREADY-STARTED run.
+
+        The caller opens the run - see ModelTrainer - so that the grid search runs inside it and its
+        progress and system metrics attach to the right place. This used to open its own run, which
+        put the search outside any child run and gave sklearn a different ownership rule from
+        Lightning for no reason.
+
+        `targets` is the group this model was fitted over. One target logs everything here; several
+        log the model, its params and the CV results here and fan the evaluation out into one child
+        run per target.
+        """
+        target_names = [str(name) for name in (targets or split_target_names(target))] or [str(target)]
         run_name = f"{target}_{model_name}"
-        with mlflow.start_run(run_name=run_name, nested=True):
-            # --- Tags ---
-            mlflow.set_tags({
-                "target": target,
-                "model_name": model_name
-            })
-            # --- Params ---
-            mlflow.log_params({
-                "cell_size_m": config.CLUSTERING_STRATEGY.get('params', {}).get('cell_size_m', None) if config.ENABLE_CLUSTERING else None,
-                "n_clusters": config.CLUSTERING_STRATEGY.get('params', {}).get('n_clusters', None) if config.ENABLE_CLUSTERING else None,
-            })
-            if extra_params:
-                mlflow.log_params(extra_params)
-            mlflow.log_params(search.best_params_)
+        # --- Tags ---
+        mlflow.set_tags({
+            "mlflow.runName": run_name,
+            "target": target,
+            "model_name": model_name,
+            "framework": "sklearn",
+            **run_owner_tags(),
+        })
+        # --- Params ---
+        mlflow.log_params({
+            "cell_size_m": config.CLUSTERING_STRATEGY.get('params', {}).get('cell_size_m', None) if config.ENABLE_CLUSTERING else None,
+            "n_clusters": config.CLUSTERING_STRATEGY.get('params', {}).get('n_clusters', None) if config.ENABLE_CLUSTERING else None,
+        })
+        if extra_params:
+            mlflow.log_params(extra_params)
+        mlflow.log_params(search.best_params_)
 
-            # --- Model ---
-            signature = infer_signature(X_test, best_model.predict(X_test))
-            model_info = mlflow.sklearn.log_model(sk_model=best_model,  # type: ignore
-                                         signature=signature,
-                                         name=ArtifactLayout.logged_model_name(target, model_name),
-                                         # Enters the registry under the same stable name, so
-                                         # versions accumulate per target+model and deployment can
-                                         # reference models:/<name>/<version> rather than a
-                                         # run-scoped URI.
-                                         registered_model_name=(
-                                             ArtifactLayout.logged_model_name(target, model_name)
-                                             if bool(getattr(config, "MLFLOW_REGISTER_MODELS", True))
-                                             else None
-                                         ),
-                                         input_example=X_test[:5],
-                                         skops_trusted_types=[
-                                             "numpy.dtype",
-                                             "xgboost.core.Booster",
-                                             "xgboost.sklearn.XGBRegressor",
-                                             # TabICL ships its own preprocessing estimators inside
-                                             # the fitted regressor; skops refuses to persist any of
-                                             # them unless they are named here.
-                                             "random.Random",
-                                             "tabicl._sklearn.preprocessing.CustomStandardScaler",
-                                             "tabicl._sklearn.preprocessing.EnsembleGenerator",
-                                             "tabicl._sklearn.preprocessing.OutlierRemover",
-                                             "tabicl._sklearn.preprocessing.PreprocessingPipeline",
-                                             "tabicl._sklearn.preprocessing.TransformToNumerical",
-                                             "tabicl._sklearn.preprocessing.UniqueFeatureFilter",
-                                             "tabicl._sklearn.regressor.TabICLRegressor",
-                                             ])
-            # --- CV results as artifact ---
-            self._log_cv_results(cv_results, target, model_name, param_names)
+        # The ONE prediction pass over the test set. It used to happen twice - once here for the
+        # signature and once again when the evaluation frame was built - which is invisible for a
+        # tree and another full inference pass for an in-context model.
+        test_predictions = np.asarray(best_model.predict(X_test))
 
-            # --- Evaluation frame, in ORIGINAL target units ---
-            eval_df = pd.concat([X_test, y_test], axis=1)
-            eval_df["prediction"] = best_model.predict(X_test)  # ensure predictions column exists
+        # --- Model ---
+        # Logged ONCE, under the group's label. A joint model predicts every target in the group,
+        # so registering it once per target would put the same multi-output estimator in the
+        # registry under several names, each claiming to be about one target.
+        logged_model_name = ArtifactLayout.logged_model_name(target, model_name)
+        signature = infer_signature(X_test, test_predictions)
+        model_info = mlflow.sklearn.log_model(sk_model=best_model,  # type: ignore
+                                     signature=signature,
+                                     name=logged_model_name,
+                                     # Enters the registry under the same stable name, so
+                                     # versions accumulate per target+model and deployment can
+                                     # reference models:/<name>/<version> rather than a
+                                     # run-scoped URI.
+                                     registered_model_name=(
+                                         logged_model_name
+                                         if bool(getattr(config, "MLFLOW_REGISTER_MODELS", True))
+                                         else None
+                                     ),
+                                     input_example=X_test[:5],
+                                     skops_trusted_types=[
+                                         "numpy.dtype",
+                                         "xgboost.core.Booster",
+                                         "xgboost.sklearn.XGBRegressor",
+                                         # TabICL ships its own preprocessing estimators inside
+                                         # the fitted regressor; skops refuses to persist any of
+                                         # them unless they are named here.
+                                         "random.Random",
+                                         "tabicl._sklearn.preprocessing.CustomStandardScaler",
+                                         "tabicl._sklearn.preprocessing.EnsembleGenerator",
+                                         "tabicl._sklearn.preprocessing.OutlierRemover",
+                                         "tabicl._sklearn.preprocessing.PreprocessingPipeline",
+                                         "tabicl._sklearn.preprocessing.TransformToNumerical",
+                                         "tabicl._sklearn.preprocessing.UniqueFeatureFilter",
+                                         "tabicl._sklearn.regressor.TabICLRegressor",
+                                         ])
+        # --- CV results as artifact ---
+        self._log_cv_results(cv_results, target, model_name, param_names)
 
-            # --- Metrics ---
-            # The unified set, computed from the same prediction frame the Lightning path uses, so
-            # the two families are directly comparable. `mean_test_score` and `mean_train_score` are
-            # deliberately NOT logged any more: they meant a positive CV RMSE here and a negative
-            # -test_loss on the Lightning side, under one name and on one leaderboard axis.
-            metrics = regression_metrics(eval_df[target], eval_df["prediction"])
-            metrics.update(cv_rmse_from_search(cv_results, search.best_index_))
-            metrics["r2_train_fit"] = float(r2_score(y_train, best_model.predict(X_train)))
+        # --- Evaluation frame, in ORIGINAL target units ---
+        eval_df = self._build_sklearn_evaluation_frame(
+            test_predictions, X_test, y_test, target_names, model_name
+        )
+
+        # --- Metrics ---
+        # The unified set, computed from the same prediction frame the Lightning path uses, so
+        # the two families are directly comparable. `mean_test_score` and `mean_train_score` are
+        # deliberately NOT logged any more: they meant a positive CV RMSE here and a negative
+        # -test_loss on the Lightning side, under one name and on one leaderboard axis.
+        model_metrics = dict(cv_rmse_from_search(cv_results, search.best_index_))
+        # One diagnostic number that costs a full pass over the TRAINING set - here 4809 rows
+        # against 865 for the test set, so most of the post-fit inference for one target. Cheap for
+        # a tree, minutes for an in-context model like TabICL, which is why it is switchable.
+        # 2-D under a joint fit; r2_score averages the outputs, which is the same convention the
+        # per-target r2_test mean uses.
+        if bool(getattr(config, "LOG_TRAIN_FIT_METRIC", True)):
+            model_metrics["r2_train_fit"] = float(r2_score(y_train, best_model.predict(X_train)))
+        model_metrics.update(self._per_target_metrics(eval_df, target, model_name))
+        self._log_metric_dict(model_metrics)
+
+        self._log_table_artifact(
+            eval_df,
+            filename=ArtifactLayout.EVAL_RESULTS_FILE,
+            artifact_path=ArtifactLayout.EVAL_RESULTS,
+        )
+
+        champion = self._promote_champion(
+            target, model_name, model_metrics,
+            getattr(model_info, "registered_model_version", None),
+        )
+
+        def log_one(frame, target_name):
+            """Everything that is about ONE target, in whichever run holds that target."""
+            metrics = regression_metrics(frame[target_name], frame["prediction"])
+            if target_name == target:
+                # Single-target run: the CV and train-fit numbers belong here too, since there is
+                # no separate model run holding them.
+                metrics = {**model_metrics, **metrics}
+            else:
+                metrics["n_test"] = float(len(frame))
             self._log_metric_dict(metrics)
 
-            self._log_table_artifact(
-                eval_df,
-                filename=ArtifactLayout.EVAL_RESULTS_FILE,
-                artifact_path=ArtifactLayout.EVAL_RESULTS,
-            )
+            if target_name != target:
+                self._log_table_artifact(
+                    frame,
+                    filename=ArtifactLayout.EVAL_RESULTS_FILE,
+                    artifact_path=ArtifactLayout.EVAL_RESULTS,
+                )
 
-            mlflow.models.evaluate(
-                model_info.model_uri,
-                data=pd.concat([X_test, y_test], axis=1),
-                targets=target,
-                model_type="regressor",
-                evaluators=["regressor"],
-                extra_metrics=[mlflow_rpiq_score],
-                custom_artifacts=[create_pred_obs_plot]
-            )
+            self._evaluate_sklearn_target(frame, target_name)
 
             # --- Test Plots ---
-            self._log_plots(plot_functions, target, model_name)
+            self._log_plots(plot_functions, target_name, model_name)
 
             # --- SHAP ---
             explain_summary = self._log_shap_artifacts(
                 config=config,
-                target=target,
+                target=target_name,
                 model_name=model_name,
                 backend="sklearn",
                 payload={
                     "fitted_estimator": best_model,
                     "X_train": X_train,
                     "X_test": X_test,
-                    "target": target,
+                    "target": target_name,
+                    "target_names": target_names,
                 },
             )
 
             # The same split_summary.json the Lightning path writes, so the two families' holdouts
             # can be compared directly - which is the point of sharing one split plan.
-            self._write_split_summary({"train": y_train, "test": y_test}, None, target)
+            self._write_split_summary({"train": y_train, "test": y_test}, None, target_name)
 
             # --- Run summary, the same shape the Lightning path writes ---
             self._write_json_artifact(
                 {
-                    "target": target,
+                    "target": target_name,
                     "model_name": model_name,
                     "framework": "sklearn",
-                    "run_name": run_name,
+                    "run_name": f"{target_name}_{model_name}",
                     "metrics": metrics,
                     "metric_space": metric_space_for(metrics),
                     "best_params": {str(key): str(value) for key, value in search.best_params_.items()},
-                    "logged_model_name": ArtifactLayout.logged_model_name(target, model_name),
+                    "logged_model_name": logged_model_name,
                     "logged_model_uri": getattr(model_info, "model_uri", None),
                     "registered_model_version": getattr(model_info, "registered_model_version", None),
-                    "champion": self._promote_champion(
-                        target, model_name, metrics,
-                        getattr(model_info, "registered_model_version", None),
-                    ),
+                    "champion": champion,
                     "explain": explain_summary,
                 },
                 ArtifactLayout.RUN_SUMMARY_FILE,
                 artifact_path=ArtifactLayout.META,
             )
+            return explain_summary
+
+        self._log_per_target_runs(eval_df, target, model_name, log_one)
+
+    @staticmethod
+    def _build_sklearn_evaluation_frame(predictions, X_test, y_test, target_names, model_name):
+        """Test features, observed targets and predictions, in ORIGINAL units.
+
+        Takes the predictions rather than the model on purpose: the caller has already computed
+        them for the model signature, and asking an in-context estimator for them twice is a real
+        cost.
+
+        Deliberately the same column convention the Lightning trainer emits - one
+        ``prediction_<target>`` per output when there are several, a plain ``prediction`` when there
+        is one - so a single reader can fan either family's frame out per target.
+        """
+        eval_df = pd.concat([X_test, y_test], axis=1)
+        predictions = np.asarray(predictions)
+        if predictions.ndim == 1 or predictions.shape[1] == 1:
+            eval_df["prediction"] = predictions.reshape(-1)
+        else:
+            for index in range(predictions.shape[1]):
+                name = target_names[index] if index < len(target_names) else str(index)
+                eval_df[f"prediction_{name}"] = predictions[:, index]
+        encoded = join_target_names(target_names)
+        eval_df["target_name"] = encoded
+        eval_df["target_names"] = encoded
+        eval_df["model_name"] = model_name
+        return eval_df
+
+    def _evaluate_sklearn_target(self, frame, target_name: str) -> None:
+        """MLflow's own regressor evaluation, over the predictions ALREADY computed.
+
+        Static-dataset form - no `model` argument, `predictions` naming a column that is already
+        in the frame. Passing a model URI instead made MLflow reload the model and predict the test
+        set a second time, duplicating work `_build_sklearn_evaluation_frame` had just done. For a
+        tree that is invisible; for an in-context model it is another full inference pass.
+
+        The frame carries exactly one prediction column here because the caller has already fanned
+        it out per target, so the ambiguity that made this multi-output-unsafe is gone.
+        """
+        if frame is None or target_name not in frame.columns or "prediction" not in frame.columns:
+            return
+        mlflow.models.evaluate(
+            data=frame,
+            targets=target_name,
+            predictions="prediction",
+            model_type="regressor",
+            evaluators=["regressor"],
+            extra_metrics=[mlflow_rpiq_score],
+            custom_artifacts=[create_pred_obs_plot]
+        )
 
     def log_lightning_child_run(
         self,
@@ -847,7 +1026,7 @@ class ChildRunLogger:
         if evaluation_df is None:
             evaluation_df = eval_df
 
-        run_target = self._resolve_lightning_run_target_label(evaluation_df, target)
+        run_target = self._resolve_run_target_label(evaluation_df, target)
         run_name = f"{run_target}_{model_name}"
 
         mlflow.set_tags({
@@ -855,6 +1034,7 @@ class ChildRunLogger:
             "target": run_target,
             "model_name": model_name,
             "framework": "lightning",
+            **run_owner_tags(),
         })
 
         params = {
@@ -892,48 +1072,25 @@ class ChildRunLogger:
         if architecture_params:
             mlflow.log_params(architecture_params)
 
-        metrics = {}
-        metrics.update(validation_metrics or {})
-        metrics.update(test_metrics or {})
-
-        # The unified metric set, computed from the prediction frame - which predict_step has already
-        # run through inverse_transform_targets, so these are in ORIGINAL target units. The
-        # train/val/test_loss and *_r2 values already in `metrics` come from the LightningModule and
-        # live in STANDARDIZED LOG1P space; both are kept, and metric_space_for() records which is
-        # which in the run summary so nobody has to infer it from the magnitudes.
+        # The model-run metric set. The train/val/test_loss and *_r2 values come from the
+        # LightningModule and live in STANDARDIZED LOG1P space; the unified set below is computed
+        # from the prediction frame - which predict_step has already run through
+        # inverse_transform_targets - and is in ORIGINAL target units. Both are kept, and
+        # metric_space_for() records which is which in the run summary so nobody has to infer it
+        # from the magnitudes.
         #
         # What used to be here instead: mean_test_score = -test_loss, mean_train_score = -val_loss.
         # Those negations made the Lightning rows of the leaderboard negative while the sklearn rows
         # under the same names were positive. Nothing is negated any more.
-        if evaluation_df is not None and target in evaluation_df.columns and "prediction" in evaluation_df.columns:
-            metrics.update(regression_metrics(evaluation_df[target], evaluation_df["prediction"]))
+        model_metrics = {}
+        model_metrics.update(validation_metrics or {})
+        model_metrics.update(test_metrics or {})
+        model_metrics.update(self._per_target_metrics(evaluation_df, target, model_name))
+        self._log_metric_dict(model_metrics)
 
-        if evaluation_df is not None:
-            target_eval_frames = list(
-                self._iter_lightning_target_eval_frames(evaluation_df, target=target, model_name=model_name)
-            )
-            per_target_r2_scores = []
-            for target_frame, target_name, _prediction_column in target_eval_frames:
-                if target_name not in target_frame.columns or "prediction" not in target_frame.columns:
-                    continue
-                per_target = regression_metrics(
-                    target_frame[target_name],
-                    target_frame["prediction"],
-                    suffix=f"_{target_name}",
-                )
-                metrics.update(per_target)
-                r2_key = f"r2_test_{target_name}"
-                if r2_key in per_target:
-                    per_target_r2_scores.append(per_target[r2_key])
-
-            # On a multi-target run the trainer hands each child an empty metric dict and a
-            # single-target frame, so the loop above is what produces that child's numbers. When the
-            # frame really is multi-target, the run-level r2_test is the mean across targets.
-            if per_target_r2_scores and "r2_test" not in metrics:
-                metrics["r2_test"] = float(np.mean(per_target_r2_scores))
-
-        self._log_metric_dict(metrics)
-
+        # Checkpoint and serialized model live in the model run, ONCE. A joint model predicts every
+        # target in the group, so logging it inside the per-target fan-out put the same multi-output
+        # checkpoint in the registry under one name per target, each claiming a single target.
         if best_model_path:
             self._log_checkpoint(best_model_path)
 
@@ -945,40 +1102,6 @@ class ChildRunLogger:
             )
 
         self._log_split_summary(bundle, evaluation_df, run_target)
-
-        pred_obs_logged = False
-        if evaluation_df is not None:
-            try:
-                target_eval_frames = list(
-                    self._iter_lightning_target_eval_frames(evaluation_df, target=target, model_name=model_name)
-                )
-                # One target writes plots/pred_obs.png, so it lines up with every other run in the
-                # compare view. Several targets nest under plots/<target>/, because they would
-                # otherwise write the same leaf and silently overwrite one another.
-                nest_by_target = len(target_eval_frames) > 1
-
-                if not target_eval_frames:
-                    pred_obs_logged = self._log_lightning_pred_obs_artifact(
-                        evaluation_df,
-                        target=target,
-                        model_name=model_name,
-                        artifact_path=ArtifactLayout.plots_path(),
-                    )
-
-                for target_frame, target_name, _prediction_column in target_eval_frames:
-                    pred_obs_logged = (
-                        self._log_lightning_pred_obs_artifact(
-                            target_frame,
-                            target=target_name,
-                            model_name=model_name,
-                            artifact_path=ArtifactLayout.plots_path(
-                                target_name if nest_by_target else None
-                            ),
-                        )
-                        or pred_obs_logged
-                    )
-            except Exception:
-                pred_obs_logged = False
 
         model_logged = False
         model_logging_error = None
@@ -1011,49 +1134,82 @@ class ChildRunLogger:
         # the same reason: the absence of a tag is not evidence.
         self._tag_model_logging(run_target, model_name, model_logged, model_logging_error)
 
-        explain_summary = self._log_shap_artifacts(
-            config=config,
-            target=run_target,
-            model_name=model_name,
-            backend="lightning",
-            payload={"model": model, "bundle": bundle, "target": run_target},
-        )
+        registered_version = getattr(self, "_registered_version", None)
+        champion = self._promote_champion(run_target, model_name, model_metrics, registered_version)
 
-        summary = {
-            "target": target,
-            "model_name": model_name,
-            "framework": "lightning",
-            "metrics": metrics,
-            "metric_space": metric_space_for(metrics),
-            "best_model_path": best_model_path,
-            # The checkpoint is logged as checkpoints/best.ckpt so runs stay comparable; this is
-            # where its Lightning-assigned epoch/step name survives.
-            "checkpoint_filename": os.path.basename(best_model_path) if best_model_path else None,
-            "logged_model_name": ArtifactLayout.logged_model_name(run_target, model_name),
-            "registered_model_version": getattr(self, "_registered_version", None),
-            "champion": self._promote_champion(
-                run_target, model_name, metrics, getattr(self, "_registered_version", None)
-            ),
-            "pred_obs_artifact_logged": pred_obs_logged,
-            "serialized_model_logged": model_logged,
-            "serialized_model_logging_error": model_logging_error,
-            "explain": explain_summary,
-        }
-        summary["run_name"] = run_name
-        summary["resolved_target"] = run_target
-        self._write_json_artifact(
-            summary,
-            ArtifactLayout.RUN_SUMMARY_FILE,
-            artifact_path=ArtifactLayout.META,
-        )
+        def log_one(frame, target_name):
+            """Everything that is about ONE target, in whichever run holds that target."""
+            is_model_run = target_name == run_target
+            metrics = dict(model_metrics) if is_model_run else {}
+            if frame is not None and target_name in frame.columns and "prediction" in frame.columns:
+                metrics.update(regression_metrics(frame[target_name], frame["prediction"]))
+
+            if not is_model_run:
+                self._log_metric_dict(metrics)
+                self._log_table_artifact(
+                    frame,
+                    filename=ArtifactLayout.EVAL_RESULTS_FILE,
+                    artifact_path=ArtifactLayout.EVAL_RESULTS,
+                )
+                self._log_split_summary(bundle, frame, target_name)
+
+            # Flat plots/pred_obs.png in every case: the RUN is now the per-target scope, so there
+            # is no longer a second target writing the same leaf to nest away from.
+            pred_obs_logged = False
+            try:
+                pred_obs_logged = self._log_lightning_pred_obs_artifact(
+                    frame if frame is not None else evaluation_df,
+                    target=target_name,
+                    model_name=model_name,
+                    artifact_path=ArtifactLayout.plots_path(),
+                )
+            except Exception:
+                pred_obs_logged = False
+
+            explain_summary = self._log_shap_artifacts(
+                config=config,
+                target=target_name,
+                model_name=model_name,
+                backend="lightning",
+                payload={"model": model, "bundle": bundle, "target": target_name},
+            )
+
+            summary = {
+                "target": target_name,
+                "model_name": model_name,
+                "framework": "lightning",
+                "metrics": metrics,
+                "metric_space": metric_space_for(metrics),
+                "best_model_path": best_model_path,
+                # The checkpoint is logged as checkpoints/best.ckpt so runs stay comparable; this is
+                # where its Lightning-assigned epoch/step name survives.
+                "checkpoint_filename": os.path.basename(best_model_path) if best_model_path else None,
+                "logged_model_name": ArtifactLayout.logged_model_name(run_target, model_name),
+                "registered_model_version": registered_version,
+                "champion": champion,
+                "pred_obs_artifact_logged": pred_obs_logged,
+                "serialized_model_logged": model_logged,
+                "serialized_model_logging_error": model_logging_error,
+                "explain": explain_summary,
+                "run_name": f"{target_name}_{model_name}",
+                "resolved_target": target_name,
+            }
+            self._write_json_artifact(
+                summary,
+                ArtifactLayout.RUN_SUMMARY_FILE,
+                artifact_path=ArtifactLayout.META,
+            )
+            return explain_summary
+
+        self._log_per_target_runs(evaluation_df, run_target, model_name, log_one)
 
 class ParentRunLogger:
     def __init__(self):
         pass
 
     @staticmethod
-    def _resolve_lightning_target_names(evaluation_df: pd.DataFrame, fallback_target: str) -> list[str]:
-        return ChildRunLogger._resolve_lightning_target_names(evaluation_df, fallback_target)
+    def _resolve_target_names(evaluation_df: pd.DataFrame, fallback_target: str) -> list[str]:
+        return ChildRunLogger._resolve_target_names(evaluation_df, fallback_target)
 
     def _collect_leaderboard(self,parent_run_id: str):
         """
@@ -1061,13 +1217,28 @@ class ParentRunLogger:
         Returns a DataFrame with leaderboard info.
         """
         client = mlflow.tracking.MlflowClient()  # type: ignore
-        child_runs = client.search_runs(
-            experiment_ids=[client.get_run(parent_run_id).info.experiment_id],
-            filter_string=f"tags.mlflow.parentRunId = '{parent_run_id}'"
-        )
+        experiment_id = client.get_run(parent_run_id).info.experiment_id
+
+        def children_of(run_id: str):
+            return client.search_runs(
+                experiment_ids=[experiment_id],
+                filter_string=f"tags.mlflow.parentRunId = '{run_id}'",
+            )
+
+        # A joint run is a model run with one child per target, so the rows worth comparing sit a
+        # level deeper than they used to. Searching only direct children left a joint run out of
+        # the leaderboard entirely: its model run carried no target tag and its per-target runs
+        # were grandchildren.
+        leaf_runs = []
+        for child in children_of(parent_run_id):
+            grandchildren = children_of(child.info.run_id)
+            # The model run's own metrics are means over its children, so listing it beside them
+            # would put the same model on the board twice, once under a label ("a__b") that names
+            # no measurable target.
+            leaf_runs.extend(grandchildren or [child])
 
         rows = []
-        for run in child_runs:
+        for run in leaf_runs:
             run_data = run.data
             target = run_data.tags.get("target")
             model_name = run_data.tags.get("model_name")
@@ -1117,10 +1288,19 @@ class ParentRunLogger:
         parent_run = client.get_run(parent_run_id)
         exp_id = parent_run.info.experiment_id
 
-        child_runs = client.search_runs(
-            experiment_ids=[exp_id],
-            filter_string=f"tags.mlflow.parentRunId = '{parent_run_id}'"
-        )
+        def children_of(run_id: str):
+            return client.search_runs(
+                experiment_ids=[exp_id],
+                filter_string=f"tags.mlflow.parentRunId = '{run_id}'",
+            )
+
+        # Same reason as _collect_leaderboard: a joint run keeps its per-target evaluation frames
+        # one level deeper, in the child runs, and its model run holds the joint frame those were
+        # split from.
+        child_runs = []
+        for child in children_of(parent_run_id):
+            grandchildren = children_of(child.info.run_id)
+            child_runs.extend(grandchildren or [child])
 
         eval_dfs = []
         for run in child_runs:
@@ -1150,7 +1330,7 @@ class ParentRunLogger:
 
                 df = pd.read_csv(local_path)
 
-                target_names = self._resolve_lightning_target_names(df, target)
+                target_names = self._resolve_target_names(df, target)
                 if "prediction" in df.columns and not any(column.startswith("prediction_") for column in df.columns):
                     df["target_name"] = target_names[0] if target_names else target
                     df["model_name"] = model_name
@@ -1196,13 +1376,18 @@ class ParentRunLogger:
             "SPLIT_HOLDOUT_STRATEGY": getattr(trainer.config, "SPLIT_HOLDOUT_STRATEGY", None),
             "SPLIT_POPULATION_POLICY": getattr(trainer.config, "SPLIT_POPULATION_POLICY", None),
         })
-        mlflow.log_params({
+        # log_params_once, not log_params: these land at the END of a run, so an immutable-param
+        # clash here destroys the summary of work that has already fully succeeded.
+        log_params_once({
             "DATA_FOLDER": trainer.config.DATA_FOLDER,
             "DATA_FILE": trainer.config.DATA_FILE,
             "STATIC_FEATURES_FILE": getattr(trainer.config, "STATIC_FEATURES_FILE", trainer.config.DATA_FILE),
             "TARGETS_FILE": getattr(trainer.config, "TARGETS_FILE", trainer.config.DATA_FILE),
             "RANDOM_SEED": trainer.config.RANDOM_SEED,
-            "TARGET_COLUMNS": trainer.config.TARGET_COLUMNS,
+            # TARGET_COLUMNS is deliberately NOT logged here. SoilModelTraining._log_target_plan
+            # writes it at the START of training, beside the resolved target groups, so a run that
+            # is killed partway still records what it set out to fit. Writing it again here - in a
+            # different format - is what made a finished run fail on MLflow's immutable params.
             "COLUMNS_TO_TRANSFORM": [column for column in trainer.config.COLUMNS_TO_TRANSFORM
                                      if column in trainer.config.TARGET_COLUMNS],
             "CLUSTERING_STRATEGY": trainer.config.CLUSTERING_STRATEGY.get('class_path').rsplit('.', 1)[1] if trainer.config.ENABLE_CLUSTERING else None,

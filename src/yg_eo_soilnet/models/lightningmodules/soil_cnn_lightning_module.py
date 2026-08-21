@@ -58,6 +58,7 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         static_dim: int,
         target_dim: int,
         target_names: Optional[Sequence[str]] = None,
+        fitted_target_names: Optional[Sequence[str]] = None,
         categorical_cardinalities: Optional[Sequence[int]] = None,
         categorical_vocabularies: Optional[Sequence[Sequence[str]]] = None,
         categorical_feature_names: Optional[Sequence[str]] = None,
@@ -121,10 +122,14 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         auxiliary_available_names = [str(name) for name in (auxiliary_available_names or [])]
         auxiliary_hidden_dims = [int(width) for width in (auxiliary_hidden_dims or [])]
         target_names = [str(name) for name in (target_names or [])]
+        # Every target the RUN fits, which under per-target grouping is a superset of this model's
+        # outputs. Defaults to target_names so a hand-built module keeps the old behaviour.
+        fitted_target_names = [str(name) for name in (fitted_target_names or target_names)]
         self.save_hyperparameters()
 
         self._init_regression_targets(
             target_dim=target_dim,
+            target_names=target_names,
             target_mean=target_mean,
             target_scale=target_scale,
             target_transform=target_transform,
@@ -215,6 +220,7 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
                 )
 
         self.target_names = list(target_names)
+        self.fitted_target_names = list(fitted_target_names)
         self.auxiliary_validity_channels = bool(auxiliary_validity_channels)
         self.auxiliary_encoder = self._build_auxiliary_encoder(
             auxiliary_label_columns,
@@ -280,7 +286,7 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         if not selected:
             return nn.Identity()
 
-        if not self.target_names:
+        if not self.fitted_target_names:
             # Without the target roster the leakage check below cannot run, and silently skipping
             # it is how a model ends up reading its own answer. The config factory always supplies
             # these, so this only fires on hand-built modules.
@@ -289,12 +295,16 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
                 "against what is being fitted; pass target_names explicitly."
             )
 
-        leaking = [name for name in selected if name in set(self.target_names)]
+        # Checked against every target the RUN fits, not just this model's outputs. Under
+        # per-target grouping the two differ, and checking the narrower list would admit a sibling
+        # target as an input - which leaks the answer just as surely, via whatever correlation the
+        # two share.
+        leaking = [name for name in selected if name in set(self.fitted_target_names)]
         if leaking:
             raise ValueError(
                 f"auxiliary_label_columns may not name a column being fitted: {sorted(leaking)} "
-                f"also appear(s) in target_names {sorted(self.target_names)}. The model would read "
-                "its own target as an input."
+                f"also appear(s) in the run's targets {sorted(self.fitted_target_names)}. The model "
+                "would read a target as an input."
             )
 
         if not available:

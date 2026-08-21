@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 import optuna
 
+from yg_eo_soilnet.targets import join_target_names, resolve_target_groups
 from yg_eo_soilnet.hpo.overrides import apply_overrides
 from yg_eo_soilnet.hpo.search_space import SearchSpace
 from yg_eo_soilnet.hpo.trial_runner import (
@@ -49,16 +50,44 @@ class ObjectiveContext:
     datamodule_cache: dict[Any, Any] | None = field(default=None)
 
     @classmethod
-    def from_config(cls, entry: str, config: Any, data: Mapping[str, Any], **kwargs) -> "ObjectiveContext":
+    def from_config(
+        cls,
+        entry: str,
+        config: Any,
+        data: Mapping[str, Any],
+        target: str | None = None,
+        **kwargs,
+    ) -> "ObjectiveContext":
         registry = config.LIGHTNING_MODEL_REGISTRY
         if entry not in registry:
             available = ", ".join(sorted(registry)) or "(none)"
             raise KeyError(f"No entry {entry!r} in the Lightning registry. Available: {available}.")
-        targets = list(config.TARGET_COLUMNS)
-        # Mirrors main.py: the sequence and graph datamodules span every point at once, so a
-        # multi-target run is one combined run rather than one run per target.
-        target = "__".join(targets) if len(targets) > 1 else (targets[0] if targets else "target")
-        return cls(entry=entry, registry_entry=deepcopy(registry[entry]), config=config, target=target, data=data, **kwargs)
+
+        # The same grouping main.py uses, read from the same place. This used to join on
+        # `len(targets) > 1` alone while main.py also consulted the datamodule, so a study could
+        # tune a shape training would not build.
+        groups = resolve_target_groups(config, registry[entry])
+        labels = [join_target_names(group) for group in groups] or ["target"]
+
+        if target is not None:
+            if target not in labels:
+                raise ValueError(
+                    f"--target {target!r} is not one of the groups this entry fits: "
+                    f"{', '.join(labels)}."
+                )
+            label = target
+        elif len(labels) > 1:
+            # Picking one silently would tune a single target and export the result as though it
+            # described the whole run.
+            raise ValueError(
+                f"MULTI_TARGET_MODE fits {len(labels)} separate models for {entry!r} "
+                f"({', '.join(labels)}), so there is no single objective to optimize. "
+                "Pass --target to choose one, or set MULTI_TARGET_MODE: joint to tune them together."
+            )
+        else:
+            label = labels[0]
+
+        return cls(entry=entry, registry_entry=deepcopy(registry[entry]), config=config, target=label, data=data, **kwargs)
 
 
 class TrialObjective:

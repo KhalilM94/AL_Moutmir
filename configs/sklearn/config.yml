@@ -3,6 +3,12 @@ SKLEARN_FILE_LOGGING_ENABLED: true
 MIN_FEATURE_COUNT: 10
 MAX_FEATURE_DROP_RATIO_WARNING: 0.9
 
+# r2_train_fit: R2 of the fitted model on its own TRAINING set, an overfitting diagnostic. It costs
+# a full extra prediction pass over the train split - several times the test set - which is free for
+# a tree and minutes per target for an in-context model like TabICL. Turn it off when fitting slow
+# estimators; every other metric is unaffected.
+LOG_TRAIN_FIT_METRIC: true
+
 CLUSTERING_STRATEGY:
   enabled: false
   class_path: yg_eo_soilnet.clustering_utils.KMeansClusterStrategy # SpatialGridClusterStrategy / KMeansClusterStrategy

@@ -263,10 +263,13 @@ def test_train_models_dispatches_sklearn_and_lightning(monkeypatch: pytest.Monke
     trainer = main_module.SoilModelTraining.__new__(main_module.SoilModelTraining)
     trainer.config = SimpleNamespace(
         TARGET_COLUMNS=["target_a"],
+        MULTI_TARGET_MODE="joint",
         COLUMNS_TO_TRANSFORM=[],
         ENABLE_CLUSTERING=False,
         SPLIT_STRATEGY="kfold",
         RANDOM_SEED=42,
+        MODEL_REGISTRY={"sklearn_model": {"enabled": True}},
+        LIGHTNING_MODEL_REGISTRY={"lightning_model": {"enabled": True}},
     )
     trainer.logger = MagicMock()
     trainer.sklearn_logger = MagicMock()
@@ -275,7 +278,6 @@ def test_train_models_dispatches_sklearn_and_lightning(monkeypatch: pytest.Monke
     )
     trainer.lightning_model_configs = SimpleNamespace(
         build_lightning_configs=MagicMock(return_value={"lightning_model": object()}),
-        covers_all_targets_in_one_run=MagicMock(return_value=False),
     )
     trainer.lightning_trainer = fake_lightning_trainer
 
@@ -293,17 +295,26 @@ def test_train_models_dispatches_sklearn_and_lightning(monkeypatch: pytest.Monke
     fake_sklearn_trainer.train.assert_called_once()
     fake_lightning_trainer.train.assert_called_once()
 
-def _multi_target_trainer(monkeypatch: pytest.MonkeyPatch, *, covers_all_targets: bool):
+def _multi_target_trainer(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mode: str,
+    sklearn_spec: dict | None = None,
+    lightning_spec: dict | None = None,
+):
     fake_sklearn_trainer = SimpleNamespace(train=MagicMock())
     fake_lightning_trainer = SimpleNamespace(train=MagicMock())
 
     trainer = main_module.SoilModelTraining.__new__(main_module.SoilModelTraining)
     trainer.config = SimpleNamespace(
         TARGET_COLUMNS=["target_a", "target_b"],
+        MULTI_TARGET_MODE=mode,
         COLUMNS_TO_TRANSFORM=[],
         ENABLE_CLUSTERING=False,
         SPLIT_STRATEGY="kfold",
         RANDOM_SEED=42,
+        MODEL_REGISTRY={"sklearn_model": {"enabled": True, **(sklearn_spec or {})}},
+        LIGHTNING_MODEL_REGISTRY={"lightning_model": {"enabled": True, **(lightning_spec or {})}},
     )
     trainer.logger = MagicMock()
     trainer.sklearn_logger = MagicMock()
@@ -312,7 +323,6 @@ def _multi_target_trainer(monkeypatch: pytest.MonkeyPatch, *, covers_all_targets
     )
     trainer.lightning_model_configs = SimpleNamespace(
         build_lightning_configs=MagicMock(return_value={"lightning_model": object()}),
-        covers_all_targets_in_one_run=MagicMock(return_value=covers_all_targets),
     )
     trainer.lightning_trainer = fake_lightning_trainer
 
@@ -328,19 +338,196 @@ def _multi_target_trainer(monkeypatch: pytest.MonkeyPatch, *, covers_all_targets
     return trainer, fake_sklearn_trainer, fake_lightning_trainer
 
 
-def test_multi_target_graph_runs_lightning_once_on_a_combined_target(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A graph spans every point at once, so it cannot be trained per target."""
-    trainer, sklearn_trainer, lightning_trainer = _multi_target_trainer(monkeypatch, covers_all_targets=True)
+def test_joint_mode_fits_one_lightning_model_over_every_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MULTI_TARGET_MODE: joint gives Lightning one run with a target_dim-wide head."""
+    _, _, lightning_trainer = _multi_target_trainer(monkeypatch, mode="joint")
 
-    trainer.lightning_model_configs.covers_all_targets_in_one_run.assert_called_once()
-    assert sklearn_trainer.train.call_count == 2  # sklearn stays per-target
     lightning_trainer.train.assert_called_once()
     assert lightning_trainer.train.call_args.kwargs["target"] == "target_a__target_b"
 
 
-def test_multi_target_without_graph_runs_lightning_per_target(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, sklearn_trainer, lightning_trainer = _multi_target_trainer(monkeypatch, covers_all_targets=False)
+def test_per_target_mode_fits_one_lightning_model_each(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The switch the family never had: Lightning was joint whatever the config said."""
+    _, _, lightning_trainer = _multi_target_trainer(monkeypatch, mode="per_target")
 
-    assert sklearn_trainer.train.call_count == 2
     assert lightning_trainer.train.call_count == 2
     assert [call.kwargs["target"] for call in lightning_trainer.train.call_args_list] == ["target_a", "target_b"]
+
+
+def test_sklearn_joins_targets_only_when_the_estimator_declares_it_can(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Most scikit estimators cannot fit a 2-D y, so an undeclared entry stays per-target."""
+    _, undeclared, _ = _multi_target_trainer(monkeypatch, mode="joint")
+    assert undeclared.train.call_count == 2
+    assert [call.kwargs["target"] for call in undeclared.train.call_args_list] == ["target_a", "target_b"]
+
+    _, native, _ = _multi_target_trainer(
+        monkeypatch, mode="joint", sklearn_spec={"multi_target": "native"}
+    )
+    native.train.assert_called_once()
+    assert native.train.call_args.kwargs["target"] == "target_a__target_b"
+    assert native.train.call_args.kwargs["targets"] == ["target_a", "target_b"]
+
+
+def test_a_registry_entry_overrides_the_global_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, lightning_trainer = _multi_target_trainer(
+        monkeypatch, mode="joint", lightning_spec={"multi_target": "per_target"}
+    )
+
+    assert lightning_trainer.train.call_count == 2
+    assert [call.kwargs["target"] for call in lightning_trainer.train.call_args_list] == ["target_a", "target_b"]
+
+
+def test_sklearn_entries_that_agree_on_a_grouping_are_trained_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FAIL_IF_ALL_MODELS_FAIL_FOR_TARGET is a check ACROSS the models tried for a target.
+
+    Splitting the entries into one call each would turn "every model failed" into "any model
+    failed", so entries resolving to the same groups share a call.
+    """
+    fake_sklearn_trainer = SimpleNamespace(train=MagicMock())
+
+    trainer = main_module.SoilModelTraining.__new__(main_module.SoilModelTraining)
+    trainer.config = SimpleNamespace(
+        TARGET_COLUMNS=["target_a", "target_b"],
+        MULTI_TARGET_MODE="joint",
+        COLUMNS_TO_TRANSFORM=[],
+        ENABLE_CLUSTERING=False,
+        SPLIT_STRATEGY="kfold",
+        RANDOM_SEED=42,
+        MODEL_REGISTRY={
+            "Ridge": {"enabled": True, "multi_target": "native"},
+            "PLSRegression": {"enabled": True, "multi_target": "native"},
+            # Cannot take a 2-D y, so it falls back to one model per target on its own.
+            "GradientBoosting": {"enabled": True},
+        },
+        LIGHTNING_MODEL_REGISTRY={},
+    )
+    trainer.logger = MagicMock()
+    trainer.sklearn_logger = MagicMock()
+    trainer.model_configs = SimpleNamespace(
+        build_model_configs=MagicMock(
+            return_value={name: {"model": object(), "params": {}, "modeltype": "ml"} for name in
+                          ("Ridge", "PLSRegression", "GradientBoosting")}
+        )
+    )
+    trainer.lightning_model_configs = SimpleNamespace(build_lightning_configs=MagicMock(return_value={}))
+    trainer.lightning_trainer = SimpleNamespace(train=MagicMock())
+    monkeypatch.setattr(main_module, "ModelTrainer", MagicMock(return_value=fake_sklearn_trainer))
+
+    trainer.train_models(
+        {
+            "X_train": pd.DataFrame({"feature": [1.0, 2.0]}),
+            "y_train": pd.DataFrame({"target_a": [3.0, 4.0], "target_b": [5.0, 6.0]}),
+            "X_test": pd.DataFrame({"feature": [5.0]}),
+            "y_test": pd.DataFrame({"target_a": [6.0], "target_b": [7.0]}),
+        }
+    )
+
+    calls = {call.kwargs["target"]: sorted(call.kwargs["model_pipelines"]) for call in
+             fake_sklearn_trainer.train.call_args_list}
+    assert calls == {
+        # The two native estimators share the joint group, in ONE call.
+        "target_a__target_b": ["PLSRegression", "Ridge"],
+        # The one that cannot fit a 2-D y gets its own per-target calls.
+        "target_a": ["GradientBoosting"],
+        "target_b": ["GradientBoosting"],
+    }
+
+
+@pytest.mark.parametrize(
+    "mode,expected_sklearn",
+    [
+        ("joint", "target_a__target_b"),
+        ("per_target", "target_a | target_b"),
+    ],
+)
+def test_train_models_records_what_it_decided_to_fit(
+    monkeypatch: pytest.MonkeyPatch, mode, expected_sklearn
+) -> None:
+    """The run logs how it split the data but used to say nothing about what it planned to fit.
+
+    That gap is why an OOM-killed multi-target run was mistaken for a bug in the grouping: the
+    mode and the resolved groups were only recoverable by reading child run names afterwards.
+    """
+    logged: dict = {}
+    monkeypatch.setattr(main_module.mlflow, "log_params", lambda params: logged.update(params))
+
+    trainer = main_module.SoilModelTraining.__new__(main_module.SoilModelTraining)
+    trainer.config = SimpleNamespace(
+        TARGET_COLUMNS=["target_a", "target_b"],
+        MULTI_TARGET_MODE=mode,
+        COLUMNS_TO_TRANSFORM=[],
+        ENABLE_CLUSTERING=False,
+        SPLIT_STRATEGY="kfold",
+        RANDOM_SEED=42,
+        MODEL_REGISTRY={"Ridge": {"enabled": True, "multi_target": "native"}},
+        LIGHTNING_MODEL_REGISTRY={"soil_cnn": {"enabled": True}},
+    )
+    trainer.logger = MagicMock()
+    trainer.sklearn_logger = MagicMock()
+    trainer.model_configs = SimpleNamespace(
+        build_model_configs=MagicMock(
+            return_value={"Ridge": {"model": object(), "params": {}, "modeltype": "ml"}}
+        )
+    )
+    trainer.lightning_model_configs = SimpleNamespace(build_lightning_configs=MagicMock(return_value={}))
+    trainer.lightning_trainer = SimpleNamespace(train=MagicMock())
+    monkeypatch.setattr(main_module, "ModelTrainer", MagicMock(return_value=SimpleNamespace(train=MagicMock())))
+
+    trainer.train_models(
+        {
+            "X_train": pd.DataFrame({"feature": [1.0, 2.0]}),
+            "y_train": pd.DataFrame({"target_a": [3.0, 4.0], "target_b": [5.0, 6.0]}),
+            "X_test": pd.DataFrame({"feature": [5.0]}),
+            "y_test": pd.DataFrame({"target_a": [6.0], "target_b": [7.0]}),
+        }
+    )
+
+    assert logged["MULTI_TARGET_MODE"] == mode
+    assert logged["TARGET_COLUMNS"] == "target_a,target_b"
+    assert logged["sklearn_target_groups"] == expected_sklearn
+    assert logged["lightning_target_groups"] == expected_sklearn
+
+
+def test_the_target_plan_shows_a_fallback_as_a_mode_group_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """joint mode beside per-target groups IS the fallback, and is otherwise invisible afterwards."""
+    logged: dict = {}
+    monkeypatch.setattr(main_module.mlflow, "log_params", lambda params: logged.update(params))
+
+    trainer = main_module.SoilModelTraining.__new__(main_module.SoilModelTraining)
+    trainer.config = SimpleNamespace(
+        TARGET_COLUMNS=["target_a", "target_b"],
+        MULTI_TARGET_MODE="joint",
+        COLUMNS_TO_TRANSFORM=[],
+        ENABLE_CLUSTERING=False,
+        SPLIT_STRATEGY="kfold",
+        RANDOM_SEED=42,
+        # No multi_target declaration, so it cannot take a 2-D y.
+        MODEL_REGISTRY={"TabICL": {"enabled": True}},
+        LIGHTNING_MODEL_REGISTRY={},
+    )
+    trainer.logger = MagicMock()
+    trainer.sklearn_logger = MagicMock()
+    trainer.model_configs = SimpleNamespace(
+        build_model_configs=MagicMock(
+            return_value={"TabICL": {"model": object(), "params": {}, "modeltype": "ml"}}
+        )
+    )
+    trainer.lightning_model_configs = SimpleNamespace(build_lightning_configs=MagicMock(return_value={}))
+    trainer.lightning_trainer = SimpleNamespace(train=MagicMock())
+    monkeypatch.setattr(main_module, "ModelTrainer", MagicMock(return_value=SimpleNamespace(train=MagicMock())))
+
+    trainer.train_models(
+        {
+            "X_train": pd.DataFrame({"feature": [1.0, 2.0]}),
+            "y_train": pd.DataFrame({"target_a": [3.0, 4.0], "target_b": [5.0, 6.0]}),
+            "X_test": pd.DataFrame({"feature": [5.0]}),
+            "y_test": pd.DataFrame({"target_a": [6.0], "target_b": [7.0]}),
+        }
+    )
+
+    assert logged["MULTI_TARGET_MODE"] == "joint"
+    assert logged["sklearn_target_groups"] == "target_a | target_b"

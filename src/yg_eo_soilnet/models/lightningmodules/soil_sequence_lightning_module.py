@@ -44,6 +44,7 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         self,
         static_dim: int,
         target_dim: int,
+        target_names: Optional[Sequence[str]] = None,
         categorical_cardinalities: Optional[Sequence[int]] = None,
         categorical_vocabularies: Optional[Sequence[Sequence[str]]] = None,
         categorical_feature_names: Optional[Sequence[str]] = None,
@@ -105,6 +106,7 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
 
         self._init_regression_targets(
             target_dim=target_dim,
+            target_names=target_names,
             target_mean=target_mean,
             target_scale=target_scale,
             target_transform=target_transform,

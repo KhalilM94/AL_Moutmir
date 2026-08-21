@@ -97,14 +97,26 @@ def _unwrap(fitted_estimator: Any) -> tuple[Any, Any, str]:
 
 
 def _as_values(raw: Any) -> np.ndarray:
-    """SHAP output as ``(n_samples, n_features)``.
+    """SHAP output as ``(n_samples, n_features)`` or ``(n_samples, n_features, n_outputs)``.
 
-    A multi-output explainer appends an output axis; these are single-target regressors, so it is
-    length 1 when present and dropping it keeps the contract. ``shap.Explainer`` returns an
+    A multi-output explainer appends an output axis. It is kept: under a joint fit the estimator
+    has one output per target, and taking ``[..., 0]`` - which this used to do unconditionally -
+    reported the first target's attributions for every target. ``shap.Explainer`` returns an
     Explanation object rather than an array, hence the ``.values`` probe.
     """
-    values = np.asarray(getattr(raw, "values", raw), dtype=np.float64)
-    return values[..., 0] if values.ndim == 3 else values
+    return np.asarray(getattr(raw, "values", raw), dtype=np.float64)
+
+
+def _output_slice(values: np.ndarray, index: int) -> np.ndarray:
+    """One output's ``(n_samples, n_features)`` block."""
+    return values[..., index] if values.ndim == 3 else values
+
+
+def _base_value_at(base_value: Any, index: int) -> float:
+    array = np.asarray(base_value, dtype=np.float64).reshape(-1)
+    if array.size == 0:
+        return 0.0
+    return float(array[index]) if index < array.size else float(array[0])
 
 
 def _agnostic(shap, estimator, background_matrix, explain_matrix, max_evals):
@@ -192,12 +204,15 @@ def _blocks_from_feature_names(feature_names: list[str]) -> list[str]:
     return blocks
 
 
-def _base_value(explainer) -> float:
+def _base_value(explainer):
+    """The explainer's expected value, kept per output when it has several."""
     expected = getattr(explainer, "expected_value", None)
     if expected is None:
         return 0.0
     array = np.asarray(expected, dtype=np.float64).reshape(-1)
-    return float(array[0]) if array.size else 0.0
+    if array.size == 0:
+        return 0.0
+    return array if array.size > 1 else float(array[0])
 
 
 def sklearn_shap_results(
@@ -207,6 +222,7 @@ def sklearn_shap_results(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
     target: str,
+    target_names: Any = None,
 ) -> list[ShapResult]:
     import shap
 
@@ -238,15 +254,27 @@ def sklearn_shap_results(
         max_evals=int(getattr(config, "EXPLAIN_MAX_EVALS", DEFAULT_MAX_EVALS)),
     )
 
+    # A joint fit has one output per target. `_as_values` keeps that axis - it used to be dropped
+    # with `[..., 0]`, so every target's plots showed the FIRST target's attributions under its own
+    # name. `target` names the output wanted: the caller runs this once per target, inside that
+    # target's run.
+    n_outputs = values.shape[2] if values.ndim == 3 else 1
+    names = [str(name) for name in (target_names or [])]
+    if len(names) != n_outputs:
+        names = [str(target)] if n_outputs == 1 else [f"{target}_{index}" for index in range(n_outputs)]
+
+    wanted = [names.index(str(target))] if str(target) in names else list(range(n_outputs))
+
     return [
         ShapResult(
-            values=values,
+            values=_output_slice(values, index),
             data=explain_matrix,
             feature_names=feature_names,
             blocks=_blocks_from_feature_names(feature_names),
-            target_name=str(target),
+            target_name=names[index],
             output_space=output_space,
-            base_value=base_value,
+            base_value=_base_value_at(base_value, index),
             explainer=explainer_name,
         )
+        for index in wanted
     ]

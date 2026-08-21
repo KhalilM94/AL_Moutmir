@@ -51,6 +51,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tune a Lightning registry entry with Optuna")
     parser.add_argument("--entry", required=True, help="Registry entry to tune, e.g. soil_tabular")
     parser.add_argument("--config-path", default="configs/main_config.yml", help="Path to the main YAML config file")
+    parser.add_argument(
+        "--target",
+        default=None,
+        help=(
+            "Which target group to tune, when MULTI_TARGET_MODE fits several models. Required in "
+            "that case: a study optimizes one objective, and picking a group silently would tune "
+            "one target and export the result as though it described the run."
+        ),
+    )
     parser.add_argument("--search-spaces", default="configs/lightning/search_spaces.yml")
     parser.add_argument(
         "--n-trials", type=int, default=50, help="Trials to run NOW; on a resumed study they are added to it"
@@ -173,6 +182,7 @@ def main() -> None:
         args.entry,
         config,
         data=data,
+        target=args.target,
         logger=logger,
         data_manager=scikit_datamodule.data_manager,
         datamodule_cache={} if args.cache_datamodules else None,

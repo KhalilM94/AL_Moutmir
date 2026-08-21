@@ -46,7 +46,16 @@ class TargetNanFilter(BaseEstimator, TransformerMixin):
     def transform(self, X, y=None, groups=None):
         if y is None:
             return X
-        mask = pd.notna(y)
+        # A DataFrame y is a joint fit over several targets. `pd.notna` on it is a 2-D boolean
+        # frame, which is not a row selector - `X.loc[mask]` on one either raises or silently
+        # misaligns. Reduced with `.all(axis=1)`: one design matrix is shared by every target in the
+        # group, so a row is usable only where ALL of them were measured. That is stricter than the
+        # per-target loop, which keeps each row for whichever targets it has, and it is the
+        # unavoidable cost of a single fit rather than an oversight.
+        if isinstance(y, pd.DataFrame):
+            mask = y.notna().all(axis=1)
+        else:
+            mask = pd.notna(y)
         X_clean = X.loc[mask]
         y_clean = y.loc[mask]
         groups_clean = groups.loc[mask] if groups is not None else None

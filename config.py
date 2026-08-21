@@ -258,6 +258,12 @@ class Config:
         self.IGNORE_BANDS = self._get_ignore_bands([])
         self.COLUMNS_TO_TRANSFORM = self._get_config('COLUMNS_TO_TRANSFORM', [])
         self.TARGET_COLUMNS = self._get_config('TARGET_COLUMNS', self._get_config('target_columns', []))
+        # How several targets are grouped into models. 'joint' fits ONE model with a target_dim-wide
+        # head over all of them; 'per_target' fits an independent model each. Both families obey
+        # this: before it existed Lightning was always joint and sklearn always per-target, and
+        # neither was switchable. A registry entry may override it with its own `multi_target:` key.
+        # Irrelevant when a single target is configured. See yg_eo_soilnet.targets.
+        self.MULTI_TARGET_MODE = self._get_config('MULTI_TARGET_MODE', 'joint')
         # Every measured label, whether or not a model is fitted for it. Defaults to empty so a
         # config that has not adopted the key behaves exactly as before.
         self.LABEL_COLUMNS = self._get_config('LABEL_COLUMNS', self._get_config('label_columns', []))
@@ -272,6 +278,9 @@ class Config:
         self.TREE_CATEGORICAL_ENCODING = self._get_sklearn_categorical_config('TREE_CATEGORICAL_ENCODING', 'onehot')
         self.TREE_ONEHOT_MAX_CATEGORIES = self._get_sklearn_categorical_config('TREE_ONEHOT_MAX_CATEGORIES', 30)
         self.MIN_FEATURE_COUNT = self._get_sklearn_categorical_config('MIN_FEATURE_COUNT', 10)
+        # Whether to spend a full prediction pass over the TRAINING split on the r2_train_fit
+        # overfitting diagnostic. See configs/sklearn/config.yml.
+        self.LOG_TRAIN_FIT_METRIC = self._get_config('LOG_TRAIN_FIT_METRIC', True)
         self.MAX_FEATURE_DROP_RATIO_WARNING = self._get_sklearn_categorical_config(
             'MAX_FEATURE_DROP_RATIO_WARNING', 0.9
         )
