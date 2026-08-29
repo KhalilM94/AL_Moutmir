@@ -98,6 +98,10 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         target_mean: Optional[Any] = None,
         target_scale: Optional[Any] = None,
         target_transform: Optional[str] = None,
+        # Emit (mu, log var) instead of mu alone, and train with beta-NLL. Set by the factory from
+        # uncertainty.heteroscedastic; see SoilRegressionLightningBase._beta_nll_loss.
+        predict_variance: bool = False,
+        beta_nll: float = 0.5,
     ):
         super().__init__()
         # Coerce BEFORE save_hyperparameters(): it captures this frame's locals, and a numpy array
@@ -133,6 +137,8 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
             target_mean=target_mean,
             target_scale=target_scale,
             target_transform=target_transform,
+            predict_variance=predict_variance,
+            beta_nll=beta_nll,
             loss_name=loss_name,
             huber_delta=huber_delta,
             learning_rate=learning_rate,
@@ -236,7 +242,9 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         self.output_head = build_mlp_stack(
             self.fusion.output_dim + self.auxiliary_output_dim,
             head_hidden_dims,
-            self.target_dim,
+            # head_output_dim, not target_dim: a heteroscedastic head is twice as wide
+            # because it emits a log variance beside every mean.
+            self.head_output_dim,
             dropout=dropout,
             activation="gelu",
             norm_final=bool(head_norm_final),
@@ -676,7 +684,11 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
             fused = torch.cat([fused, self.auxiliary_encoder(parts[cursor])], dim=-1)
             cursor += 1
 
-        return self.output_head(fused)
+        # The MEAN only. On a heteroscedastic head the readout is 2*target_dim wide, and returning
+        # it whole would hand the explainer a second block of outputs that are log variances - which
+        # it would attribute and label as targets, producing a SHAP plot with twice the targets the
+        # model has, half of them explaining a quantity nobody asked about.
+        return self._split_head_output(self.output_head(fused))[0]
 
     def _static_feature_names(self, width: int) -> list[str]:
         """Names for the continuous static block, falling back to positions when none were stored."""

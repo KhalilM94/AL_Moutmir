@@ -50,6 +50,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--config-path", default="configs/main_config.yml", help="Main config, for the registry lookup"
     )
     parser.add_argument("--no-register", action="store_true", help="Log the model without registering it")
+    parser.add_argument(
+        "--allow-ensemble-member",
+        action="store_true",
+        help=(
+            "Register a single checkpoint from a run that trained an ensemble. Refused by default: "
+            "one member is not the ensemble, and the run's metrics describe the ensemble."
+        ),
+    )
     parser.add_argument("--rows", type=int, default=3, help="Rows in the input example")
     return parser.parse_args(argv)
 
@@ -104,6 +112,20 @@ def relog(args: argparse.Namespace) -> dict[str, Any]:
     tags = run.data.tags
     model_name = tags.get("model_name") or "model"
     target = tags.get("target") or "target"
+
+    # An ensemble run's prediction is the MEAN of n_members checkpoints, and its interval comes from
+    # their spread. One checkpoint carries neither. Re-registering it here would silently replace an
+    # ensemble with a single member under the same registered name - the point estimate would shift
+    # and the uncertainty would vanish, with the run's own metrics still describing the ensemble.
+    n_members = run.data.params.get("uncertainty_n_members")
+    if n_members and not args.allow_ensemble_member:
+        raise SystemExit(
+            f"Run {args.run_id} trained an ensemble of {n_members} members, and a single checkpoint "
+            "cannot reproduce it: its predictions are the members' mean and its interval is their "
+            "spread. Re-running the training is the only way to recover the ensemble. Pass "
+            "--allow-ensemble-member to register this checkpoint anyway, as a single model whose "
+            "metrics on this run will overstate it."
+        )
 
     class_path = args.model_class or infer_model_class_path(config, model_name)
     module_class = resolve_model_class(class_path)

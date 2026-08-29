@@ -91,6 +91,7 @@ soil_cnn:
     use_validity_channels: false
     auxiliary_label_columns: []
     # total_silt_pct, c_e_c_meq_100g, c_n_ratio, caco3_pct_total
+    # total_silt_pct__soil_cnn, c_e_c_meq_100g__soil_cnn, caco3_pct_total__soil_cnn, c_n_ratio__soil_cnn
     auxiliary_available_names: auto
     auxiliary_validity_channels: true
     auxiliary_hidden_dims: []

@@ -339,16 +339,31 @@ class SoilSequencePyfunc:
         return self._predictor
 
     def predict(self, context, model_input: pd.DataFrame, params=None) -> pd.DataFrame:
+        """Predictions per target, plus their uncertainty when asked for and available.
+
+        ``params={"uncertainty": True}`` widens the output to ``<target>`` / ``<target>_std`` per
+        target. It is opt-in rather than always-on because the column set is the served model's
+        contract, and silently doubling it would break every caller that reads the frame
+        positionally. Asking a point-head model for uncertainty returns the ordinary columns rather
+        than raising: a checkpoint trained before the variance head existed has none to give, and
+        that is not an error at inference time.
+        """
         predictor = self._ensure_predictor()
         frame = pd.DataFrame(model_input)
         bundle = bundle_from_frame(frame, predictor.preprocessing_state)
-        predictions = predictor.predict(bundle)
+        predictions, sigma = predictor.predict_with_uncertainty(bundle)
 
         names = list(predictor.preprocessing_state.get("target_names") or [])
         names = names[: predictions.shape[1]] or [
             f"prediction_{index}" for index in range(predictions.shape[1])
         ]
-        return pd.DataFrame(predictions, columns=names)
+        output = pd.DataFrame(predictions, columns=names)
+
+        if bool((params or {}).get("uncertainty", False)) and sigma is not None:
+            for index, name in enumerate(names):
+                output[f"{name}_std"] = sigma[:, index]
+
+        return output
 
 
 def example_from_state(

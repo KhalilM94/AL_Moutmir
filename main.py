@@ -233,17 +233,28 @@ class SoilModelTraining:
             label = join_target_names(list(target_group))
             self.logger.info(f"[lightning group {index}/{len(lightning_groups)}] {label} - starting")
             started = time.perf_counter()
-            lightning_model_bundles = self.lightning_model_configs.build_lightning_configs(
-                target=label,
-                data=lightning_input,
-                seed=int(self.config.RANDOM_SEED),
-                entries=entry_names,
-            )
+            def build_bundles(seed: int, _label=label, _entries=entry_names):
+                """Bundles for this group at one seed. Called once per ensemble member.
+
+                A Lightning model's weights are constructed by the factory, which seeds immediately
+                beforehand - so the only way to get a second, differently-initialized member is to
+                ask the factory again at a different seed. The dataset payload is cached inside the
+                factory, so this re-seeds and rebuilds the model without re-deriving the data.
+                """
+                return self.lightning_model_configs.build_lightning_configs(
+                    target=_label,
+                    data=lightning_input,
+                    seed=seed,
+                    entries=_entries,
+                )
+
+            lightning_model_bundles = build_bundles(int(self.config.RANDOM_SEED))
             if lightning_model_bundles:
                 self.lightning_trainer.train(
                     target=label,
                     data=lightning_input,
                     model_bundles=lightning_model_bundles,
+                    bundle_builder=build_bundles,
                 )
             self.logger.info(
                 f"[lightning group {index}/{len(lightning_groups)}] {label} - "

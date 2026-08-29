@@ -11,6 +11,10 @@ from yg_eo_soilnet.datamodules.sequence.sequence_bundle import SoilSequenceBundl
 from yg_eo_soilnet.datamodules.sequence.sequence_datamodule import SoilSequenceDataModule
 
 
+def _as_array(tensor) -> np.ndarray:
+    return np.asarray(tensor.detach().cpu(), dtype=np.float64)
+
+
 class SoilSequencePredictor:
     """A trained model plus its training-time preprocessing, ready to score new points.
 
@@ -48,6 +52,17 @@ class SoilSequencePredictor:
         datamodule.apply_preprocessing_state(self.preprocessing_state)
         return datamodule
 
+    @property
+    def predicts_variance(self) -> bool:
+        """Whether this checkpoint's head reports a per-point standard deviation.
+
+        Read off the buffer rather than the hyperparameters, because the buffer is what round-trips
+        through ``state_dict`` - a restore that lost its hparams still knows its head is wide.
+        """
+        return bool(getattr(self.model, "predict_variance", False)) or bool(
+            getattr(self.model, "head_predicts_variance", False)
+        )
+
     @torch.no_grad()
     def predict(
         self,
@@ -57,29 +72,56 @@ class SoilSequencePredictor:
         **datamodule_kwargs,
     ) -> np.ndarray:
         """``(n_points, target_dim)`` predictions in the target's original units."""
+        return self.predict_with_uncertainty(bundle, batch_size=batch_size, **datamodule_kwargs)[0]
+
+    @torch.no_grad()
+    def predict_with_uncertainty(
+        self,
+        bundle: "SoilSequenceBundle | Mapping[str, Any]",
+        *,
+        batch_size: int = 64,
+        **datamodule_kwargs,
+    ) -> "tuple[np.ndarray, np.ndarray | None]":
+        """``(predictions, sigma)``; sigma is None unless the head predicts a variance.
+
+        Both in ORIGINAL TARGET UNITS. ``predict_step`` returns a bare tensor on a point head and a
+        ``(mean, sigma)`` tuple on a heteroscedastic one, so both shapes are unpacked here - calling
+        ``.detach()`` straight on its result, which is what this used to do, raises on a tuple and
+        makes a variance-head checkpoint unservable.
+        """
         bundle = SoilSequenceBundle.from_mapping(bundle)
         if bundle.num_points == 0:
-            return np.empty((0, int(getattr(self.model, "target_dim", 1))), dtype=np.float64)
+            empty = np.empty((0, int(getattr(self.model, "target_dim", 1))), dtype=np.float64)
+            return empty, (empty.copy() if self.predicts_variance else None)
 
         datamodule = self._datamodule(bundle, **datamodule_kwargs)
 
         was_training = self.model.training
         self.model.eval()
         try:
-            outputs = []
+            outputs, sigmas = [], []
             for start in range(0, bundle.num_points, max(1, int(batch_size))):
                 indices = np.arange(start, min(start + batch_size, bundle.num_points))
                 batch = datamodule.collate(indices)
                 # predict_step, not forward: forward stops in standardized log1p space and only
                 # predict_step inverts it. Calling forward here would return predictions that look
                 # plausible and are in the wrong units.
-                outputs.append(np.asarray(self.model.predict_step(batch, 0).detach().cpu(), dtype=np.float64))
+                step_output = self.model.predict_step(batch, 0)
+                if isinstance(step_output, tuple):
+                    outputs.append(_as_array(step_output[0]))
+                    sigmas.append(_as_array(step_output[1]))
+                else:
+                    outputs.append(_as_array(step_output))
             predictions = np.concatenate(outputs, axis=0)
+            sigma = np.concatenate(sigmas, axis=0) if len(sigmas) == len(outputs) and sigmas else None
         finally:
             if was_training:
                 self.model.train()
 
-        return predictions.reshape(bundle.num_points, -1)
+        predictions = predictions.reshape(bundle.num_points, -1)
+        if sigma is not None:
+            sigma = sigma.reshape(bundle.num_points, -1)
+        return predictions, sigma
 
     def predict_frame(self, bundle, **kwargs):
         """:meth:`predict` as a DataFrame, one column per target name, indexed by point id."""

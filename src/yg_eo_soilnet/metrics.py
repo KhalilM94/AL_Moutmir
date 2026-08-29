@@ -49,10 +49,37 @@ METRIC_DIRECTION: dict[str, str | None] = {
     "rpiq": "higher",
     "bias": "zero",
     "n": None,
+    # The uncertainty stems are merged in below, after their table is declared, so that
+    # METRIC_DIRECTION stays the one lookup every reader needs.
 }
 
 # The unified set, in the order they are logged and reported.
 METRIC_STEMS: tuple[str, ...] = ("rmse", "mae", "r2", "rpd", "rpiq", "bias", "n")
+
+# Uncertainty metric stems, computed by yg_eo_soilnet.uncertainty.metrics. Declared HERE rather than
+# there so that this module stays the single registry of what a metric name means - the dependency
+# runs one way (uncertainty.metrics imports from this module) and cannot become a cycle.
+#
+# `picp` has direction None on purpose. It should sit CLOSE TO 1-alpha, not be maximized: an
+# interval spanning the whole target range covers 100% of observations and says nothing. A "higher"
+# direction would rank that as the best possible result, so the rankable form is `coverage_error`,
+# which is zero-centred and signed the way `bias` is.
+UNCERTAINTY_METRIC_DIRECTION: dict[str, str | None] = {
+    "picp": None,
+    "coverage_error": "zero",
+    "mpiw": "lower",
+    "nmpiw": "lower",
+    "interval_score": "lower",
+    "crps": "lower",
+    "nll": "lower",
+    "ence": "lower",
+    "sigma_error_corr": "higher",
+    "mean_sigma": None,
+}
+
+UNCERTAINTY_METRIC_STEMS: tuple[str, ...] = tuple(UNCERTAINTY_METRIC_DIRECTION)
+
+METRIC_DIRECTION.update(UNCERTAINTY_METRIC_DIRECTION)
 
 # Which numeric space a metric name lives in. Recorded in every run summary so that a reader
 # comparing test_loss against rmse_test knows they are not the same quantity in different units -
@@ -63,6 +90,11 @@ STANDARDIZED_LOG1P = "standardized_log1p"
 METRIC_SPACE: dict[str, str] = {
     # computed by this module, from the prediction frame, after inverse_transform_targets
     **{f"{stem}_test": ORIGINAL_UNITS for stem in METRIC_STEMS},
+    # computed by yg_eo_soilnet.uncertainty.metrics, from the same frame and therefore in the same
+    # space. This is what makes a mean_sigma readable against an rmse_test on the same target - the
+    # comparison that says whether the model's stated uncertainty is the size of its actual error.
+    **{f"{stem}_test": ORIGINAL_UNITS for stem in UNCERTAINTY_METRIC_STEMS},
+    "conformal_q": ORIGINAL_UNITS,
     "rmse_cv_mean": ORIGINAL_UNITS,
     "rmse_cv_std": ORIGINAL_UNITS,
     "rmse_cv_train_mean": ORIGINAL_UNITS,

@@ -355,7 +355,22 @@ class LightningConfigFactory:
         if init_args.get("target_transform") in (None, "auto"):
             offer("target_transform", getattr(datamodule, "target_transform", None))
 
+        # Heteroscedastic head, from the run's uncertainty block. Offered rather than set, so an
+        # architecture that does not implement it - SoilGraphLightningModule keeps its own copy of
+        # the regression base and has no predict_variance argument - is left alone instead of
+        # failing, and gets ensemble-only uncertainty. A registry entry that names the key wins, so
+        # one model can opt out of the variance head without changing the mode for the rest.
+        if "predict_variance" not in init_args and self._heteroscedastic_enabled():
+            offer("predict_variance", True)
+            offer("beta_nll", float(getattr(self.config, "UNCERTAINTY_BETA_NLL", 0.5)))
+
         return model_cls(**init_args)
+
+    def _heteroscedastic_enabled(self) -> bool:
+        """Whether this run wants variance heads: uncertainty on AND heteroscedastic requested."""
+        return bool(getattr(self.config, "UNCERTAINTY_ENABLED", False)) and bool(
+            getattr(self.config, "UNCERTAINTY_HETEROSCEDASTIC", False)
+        )
 
     def _build_trainer_kwargs(self, spec: Mapping[str, Any]) -> dict[str, Any]:
         trainer_kwargs = deepcopy(spec.get("trainer_args", {}))

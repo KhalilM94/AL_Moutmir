@@ -11,7 +11,7 @@
 #               it, with a warning
 
 PLSRegression:
-  enabled: False
+  enabled: false
   modeltype: "ml"
   import_path: sklearn.cross_decomposition.PLSRegression
   # PLS2 regresses several responses onto shared latent components; multi-output is the point of it.
@@ -20,7 +20,7 @@ PLSRegression:
     model__n_components: [2, 4, 6, 8, 10, 12, 14, 16, 18]
 
 Ridge:
-  enabled: False
+  enabled: false
   modeltype: "ml"
   import_path: sklearn.linear_model.Ridge
   # Ridge solves for a coefficient matrix, one column per target, in a single fit.
@@ -67,7 +67,7 @@ XGBoost:
 TabICL:
   # Pretrained tabular foundation model: fit() does in-context learning, it does not train weights.
   # First fit downloads tabicl-regressor-v2-*.ckpt from the HuggingFace hub.
-  enabled: false
+  enabled: true
   modeltype: "ml"
   import_path: tabicl.TabICLRegressor
   # Each worker loads the full checkpoint, so the default -1 would fan that out over every CV fold

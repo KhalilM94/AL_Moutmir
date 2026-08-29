@@ -135,6 +135,10 @@ class SklearnDataSplitter:
         split_data["point_ids"] = point_id_series
         split_data["split_labels"] = pd.Series(labels, index=X.index, name="split")
         split_data["split_plan"] = split_plan
+        # The WHOLE featurized population, split labels and all. Read only by the per-point
+        # prediction export, which scores every point rather than only the holdout. Kept as the
+        # same object the splits were carved from so its index still keys into `point_ids`.
+        split_data["X_all"] = X
 
         return split_data
 

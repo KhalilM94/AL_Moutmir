@@ -28,6 +28,10 @@ LABEL_COLUMNS:
   - cu_ppm_dtpa
   - zn_ppm_dtpa
   - b_ppm_hot_water
+  # - total_silt_pct__soil_cnn
+  # - c_e_c_meq_100g__soil_cnn
+  # - caco3_pct_total__soil_cnn
+  # - c_n_ratio__soil_cnn
 
 # Whether the measured values above travel with the data as AUXILIARY INPUTS. This changes
 # availability only: every LABEL_COLUMNS entry stays out of the feature set either way, because
@@ -43,13 +47,15 @@ CARRY_LABEL_COLUMNS: true
 # The subset of LABEL_COLUMNS to actually fit models for in this run. A name on either side is
 # treated as a label and kept out of the features; only these get models fitted.
 TARGET_COLUMNS:
-  # - organic_matter_g_kg
-  # - organic_matter_pct
-  - clay_pct
-  - sand_pct
+  - organic_matter_g_kg
+  # - clay_pct
+  # - sand_pct
   - total_silt_pct
   # - ph_water
-  # - caco3_pct_total
+  - caco3_pct_total
+  - c_e_c_meq_100g
+  - c_n_ratio
+  # - p2o5_ehangable_olsen_ppm
 
 # How several targets become models. Ignored when TARGET_COLUMNS has one entry.
 #   joint       one model with a target_dim-wide head over every target, sharing a representation
@@ -70,22 +76,31 @@ IGNORED_COLUMNS: &ignored_columns
   - uuid
   - cluster
   - date
-  - texture_20cm
-  - landform_class
-  - bd_median_0_30cm
-  - clay_median_0_30cm
-  - ph_median_0_30cm
-  - sand_median_0_30cm
-  - soc_median_0_30cm
-  - swc_median_0_30cm
+  # - texture_20cm
+  # - landform_class
+  # - bd_median_0_30cm
+  # - clay_median_0_30cm
+  # - ph_median_0_30cm
+  # - sand_median_0_30cm
+  # - soc_median_0_30cm
+  # - swc_median_0_30cm
   - ClimDef_trend_slope
   - SM_trend_slope
   - ETa_trend_slope
+  # - organic_matter_g_kg__soil_cnn
+  # - clay_pct__soil_cnn
+  # - ph_water__soil_cnn
+  # - sand_pct__soil_cnn
+  # - total_silt_pct__soil_cnn
+  # - caco3_pct_total__soil_cnn
+  # - c_n_ratio__soil_cnn
+  # - p2o5_ehangable_olsen_ppm__soil_cnn
+
 ELIMINATED_FEATURES: *ignored_columns
 
 CATEGORICAL_FEATURES:
-  # - texture_20cm
-  # - landform_class
+  - texture_20cm
+  - landform_class
 
 existing_hs_features:
   enabled: false

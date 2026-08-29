@@ -181,6 +181,128 @@ class Config:
         # that difference, so the exclusion is by name rather than by budget.
         self.EXPLAIN_SKIP_MODELS = self._get_config('EXPLAIN_SKIP_MODELS', ['TabICL'])
         self.EXPLAIN_FAIL_ON_ERROR = self._get_config('EXPLAIN_FAIL_ON_ERROR', False)
+
+        # --- predictive uncertainty ------------------------------------------------------------
+        # Same shape as the EXPLAIN block above, and for the same reason: UNCERTAINTY_ENABLED is a
+        # real off-switch, not a plot suppressor. False means one fit per model and an eval frame
+        # with the columns it has always had, so a run that does not want uncertainty does not pay
+        # the n_members multiple on training time.
+        #
+        # Read UNCERTAINTY_CALIBRATION_SOURCE together with the sklearn fit pool: `val` moves the
+        # sklearn members onto X_train_only so the calibration set is genuinely held out. See
+        # configs/main_config.yml for why, and UNCERTAINTY_FIT_POOL below for what gets logged.
+        self.UNCERTAINTY_CONFIG = {
+            **self._normalize_mapping(self.config.get('uncertainty', {})),
+            **self._normalize_mapping(self.COMMON_CONFIG.get('uncertainty', {})),
+        }
+        self.UNCERTAINTY_ENABLED = self._get_uncertainty_config('enabled', 'UNCERTAINTY_ENABLED', False)
+        self.UNCERTAINTY_N_MEMBERS = int(
+            self._get_uncertainty_config('n_members', 'UNCERTAINTY_N_MEMBERS', 5)
+        )
+        # Member k trains at RANDOM_SEED + k * stride. A stride rather than consecutive integers so
+        # a member's seed never collides with SPLIT_SEED or with another entry's `random_seed`,
+        # which would silently correlate two members that are supposed to be independent draws.
+        self.UNCERTAINTY_SEED_STRIDE = int(
+            self._get_uncertainty_config('member_seed_stride', 'UNCERTAINTY_SEED_STRIDE', 1000)
+        )
+        # auto | always | never. `auto` bootstraps only estimators that expose no random_state:
+        # refitting Ridge five times on the same rows gives five identical members and a zero
+        # standard deviation, which looks like a confident model and is actually no ensemble at all.
+        self.UNCERTAINTY_BOOTSTRAP = str(
+            self._get_uncertainty_config('bootstrap', 'UNCERTAINTY_BOOTSTRAP', 'auto')
+        ).lower()
+        # Lightning only. The head emits (mu, log var) and the loss becomes beta-NLL, which is what
+        # gives an input-dependent bar width rather than one driven by ensemble spread alone.
+        # SoilGraphLightningModule does not inherit the shared regression base, so it ignores this
+        # and gets ensemble-only uncertainty.
+        self.UNCERTAINTY_HETEROSCEDASTIC = self._get_uncertainty_config(
+            'heteroscedastic', 'UNCERTAINTY_HETEROSCEDASTIC', True
+        )
+        # beta-NLL interpolation weight (Seitzer et al. 2022). 0.0 is plain Gaussian NLL, which is
+        # known to under-fit the mean where it has already decided the variance is large; 1.0 is
+        # fully variance-weighted. 0.5 is the paper's recommended middle.
+        self.UNCERTAINTY_BETA_NLL = float(
+            self._get_uncertainty_config('beta_nll', 'UNCERTAINTY_BETA_NLL', 0.5)
+        )
+        self.UNCERTAINTY_CALIBRATION = {
+            **self._normalize_mapping(self.UNCERTAINTY_CONFIG.get('calibration', {})),
+        }
+        self.UNCERTAINTY_INTERVAL = {
+            **self._normalize_mapping(self.UNCERTAINTY_CONFIG.get('interval', {})),
+        }
+        # conformal | gaussian | sigma | none. See yg_eo_soilnet.uncertainty.intervals - only
+        # conformal is calibrated, and only conformal needs held-out rows to fit against.
+        #
+        # `calibration.method` is the key this used to live under and is still read when `interval`
+        # is absent, so a config written before this block keeps working. `split_conformal` there
+        # means `conformal` here.
+        self.UNCERTAINTY_INTERVAL_METHOD = str(
+            self._get_interval_config(
+                'method',
+                'UNCERTAINTY_INTERVAL_METHOD',
+                self._get_calibration_config(
+                    'method', 'UNCERTAINTY_CALIBRATION_METHOD', 'split_conformal'
+                ),
+            )
+        ).lower()
+        # Retained under its old name because the sklearn trainer and the export CLI still read it,
+        # and because a run summary that records which calibration was asked for should keep saying
+        # so. It is the same choice, spelled the way the config used to spell it.
+        self.UNCERTAINTY_CALIBRATION_METHOD = self.UNCERTAINTY_INTERVAL_METHOD
+        # The miscoverage rate. 0.05 is a 95% interval; the plotted bar and picp_test both read it,
+        # so there is one number behind the picture and the metric that checks the picture. Ignored
+        # by the `sigma` method, which is graded against what k implies instead.
+        self.UNCERTAINTY_ALPHA = float(
+            self._get_interval_config(
+                'alpha',
+                'UNCERTAINTY_ALPHA',
+                self._get_calibration_config('alpha', 'UNCERTAINTY_ALPHA', 0.05),
+            )
+        )
+        # Half-width in standard deviations, read only by `method: sigma`.
+        self.UNCERTAINTY_INTERVAL_K = float(
+            self._get_interval_config('k', 'UNCERTAINTY_INTERVAL_K', 1.0)
+        )
+        # val | cv_oof. See configs/main_config.yml: `val` costs sklearn the val rows and buys a
+        # calibration set that is the same point ids as Lightning's, `cv_oof` costs no rows and
+        # calibrates on out-of-fold residuals instead.
+        self.UNCERTAINTY_CALIBRATION_SOURCE = str(
+            self._get_calibration_config('source', 'UNCERTAINTY_CALIBRATION_SOURCE', 'val')
+        ).lower()
+        self.UNCERTAINTY_MODELS = self._get_uncertainty_config('models', 'UNCERTAINTY_MODELS', [])
+        # TabICL is excluded by name for the same reason it is excluded from SHAP: n_members fits of
+        # an in-context model is the path that got a run OOM-killed by the kernel.
+        self.UNCERTAINTY_SKIP_MODELS = self._get_uncertainty_config(
+            'skip_models', 'UNCERTAINTY_SKIP_MODELS', ['TabICL']
+        )
+        self.UNCERTAINTY_FAIL_ON_ERROR = self._get_uncertainty_config(
+            'fail_on_error', 'UNCERTAINTY_FAIL_ON_ERROR', False
+        )
+
+        # --- per-point prediction export --------------------------------------------------------
+        # One CSV per run keyed on POINT_ID_COLUMN, carrying every child model's prediction for
+        # every point. Off by default because it costs a full-population inference pass per model,
+        # which no other part of the run performs.
+        self.EXPORT_PREDICTIONS_CONFIG = {
+            **self._normalize_mapping(self.config.get('export_point_predictions', {})),
+            **self._normalize_mapping(self.COMMON_CONFIG.get('export_point_predictions', {})),
+        }
+        self.EXPORT_POINT_PREDICTIONS = self._get_export_config(
+            'enabled', 'EXPORT_POINT_PREDICTIONS', False
+        )
+        self.EXPORT_POINT_PREDICTIONS_MODELS = self._get_export_config(
+            'models', 'EXPORT_POINT_PREDICTIONS_MODELS', []
+        )
+        # Same exclusion as SHAP and uncertainty, for the same reason: one prediction from an
+        # in-context model re-processes the training set, so a pass over every point is measured in
+        # hours rather than seconds.
+        self.EXPORT_POINT_PREDICTIONS_SKIP_MODELS = self._get_export_config(
+            'skip_models', 'EXPORT_POINT_PREDICTIONS_SKIP_MODELS', ['TabICL']
+        )
+        self.EXPORT_POINT_PREDICTIONS_FAIL_ON_ERROR = self._get_export_config(
+            'fail_on_error', 'EXPORT_POINT_PREDICTIONS_FAIL_ON_ERROR', False
+        )
+
         self.LIGHTNING_EARLY_STOPPING_MONITOR = self._get_config('LIGHTNING_EARLY_STOPPING_MONITOR', 'val_loss')
         self.LIGHTNING_EARLY_STOPPING_MODE = self._get_config('LIGHTNING_EARLY_STOPPING_MODE', 'min')
         self.LIGHTNING_EARLY_STOPPING_PATIENCE = self._get_config('LIGHTNING_EARLY_STOPPING_PATIENCE', 5)
@@ -395,6 +517,67 @@ class Config:
         env_value = os.environ.get(flat_key)
         if env_value is None and split_key in self.SPLIT_CONFIG and self.SPLIT_CONFIG[split_key] is not None:
             return self.SPLIT_CONFIG[split_key]
+        return self._get_config(flat_key, default)
+
+    def _get_uncertainty_config(self, uncertainty_key: str, flat_key: str, default: Any) -> Any:
+        """Read `uncertainty.<uncertainty_key>`, falling back to a flat key and then the default.
+
+        Same shape as _get_split_config, so an env var of the flat name still overrides the YAML -
+        which is what makes UNCERTAINTY_N_MEMBERS=2 a one-liner when iterating on the pipeline
+        rather than on the numbers.
+        """
+        env_value = os.environ.get(flat_key)
+        if (
+            env_value is None
+            and uncertainty_key in self.UNCERTAINTY_CONFIG
+            and self.UNCERTAINTY_CONFIG[uncertainty_key] is not None
+        ):
+            return self.UNCERTAINTY_CONFIG[uncertainty_key]
+        return self._get_config(flat_key, default)
+
+    def _get_export_config(self, export_key: str, flat_key: str, default: Any) -> Any:
+        """Read `export_point_predictions.<export_key>`, then a flat key, then the default.
+
+        Same shape as _get_uncertainty_config, so an env var of the flat name still overrides the
+        YAML - which is what makes EXPORT_POINT_PREDICTIONS=true a one-liner on an existing config.
+        """
+        env_value = os.environ.get(flat_key)
+        if (
+            env_value is None
+            and export_key in self.EXPORT_PREDICTIONS_CONFIG
+            and self.EXPORT_PREDICTIONS_CONFIG[export_key] is not None
+        ):
+            return self.EXPORT_PREDICTIONS_CONFIG[export_key]
+        return self._get_config(flat_key, default)
+
+    def _get_interval_config(self, interval_key: str, flat_key: str, default: Any) -> Any:
+        """Read `uncertainty.interval.<interval_key>`, then a flat key, then the default.
+
+        Its own reader for the same reason _get_calibration_config has one: `interval` is a nested
+        mapping under `uncertainty`, so looking `method` up one level would miss it.
+        """
+        env_value = os.environ.get(flat_key)
+        if (
+            env_value is None
+            and interval_key in self.UNCERTAINTY_INTERVAL
+            and self.UNCERTAINTY_INTERVAL[interval_key] is not None
+        ):
+            return self.UNCERTAINTY_INTERVAL[interval_key]
+        return self._get_config(flat_key, default)
+
+    def _get_calibration_config(self, calibration_key: str, flat_key: str, default: Any) -> Any:
+        """Read `uncertainty.calibration.<calibration_key>`, then a flat key, then the default.
+
+        Its own reader rather than a second call to _get_uncertainty_config: `calibration` is a
+        nested mapping under `uncertainty`, so looking `alpha` up one level would miss it.
+        """
+        env_value = os.environ.get(flat_key)
+        if (
+            env_value is None
+            and calibration_key in self.UNCERTAINTY_CALIBRATION
+            and self.UNCERTAINTY_CALIBRATION[calibration_key] is not None
+        ):
+            return self.UNCERTAINTY_CALIBRATION[calibration_key]
         return self._get_config(flat_key, default)
 
     def _get_data_quality_config(self, quality_key: str, flat_key: str, default: Any) -> Any:

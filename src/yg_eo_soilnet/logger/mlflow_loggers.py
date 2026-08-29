@@ -12,8 +12,25 @@ from yg_eo_soilnet.metrics import (
     metric_space_for,
     regression_metrics,
 )
+from yg_eo_soilnet.predictions_export import (
+    combine as combine_point_predictions,
+    duplicate_report,
+    export_enabled_for,
+    point_id_column,
+    point_prediction_frame,
+    summarize as summarize_point_predictions,
+)
 from yg_eo_soilnet.targets import join_target_names, split_target_names
 from yg_eo_soilnet.tracking import log_params_once, run_owner_tags, start_child_run
+from yg_eo_soilnet.uncertainty.intervals import describe as describe_interval
+from yg_eo_soilnet.uncertainty import (
+    attach_uncertainty_columns,
+    interval_columns,
+    is_prediction_column,
+    log_uncertainty_artifacts,
+    sigma_column,
+    uncertainty_metrics,
+)
 
 import pandas as pd
 import numpy as np
@@ -35,6 +52,41 @@ from typing import Any, Mapping
 # Kept as a module constant because callers outside this file import it. It is now sourced from
 # ArtifactLayout so there is one definition of the tree.
 EVAL_RESULTS_ARTIFACT_PATH = ArtifactLayout.EVAL_RESULTS
+
+# Tag marking an ensemble member's run. Members are children of the model run, and the leaderboard
+# prefers a run's grandchildren to the run itself, so without this the model's row would be replaced
+# by one row per member. Defined here as well as in the trainer because this module is the reader.
+MEMBER_RUN_KIND = "ensemble_member"
+
+
+def _uncertainty_alpha(config) -> float:
+    """The miscoverage the configured interval actually implies.
+
+    Not simply UNCERTAINTY_ALPHA. A `sigma` band claims what k implies under a Normal - 0.683 at
+    k=1 - so grading it against 0.95 would report a perfectly good ±1σ band as under-covering by
+    0.27. This is the single funnel for the value, so every metric that compares against a nominal
+    level gets the right one.
+    """
+    from yg_eo_soilnet.uncertainty.intervals import effective_alpha
+
+    return effective_alpha(
+        getattr(config, "UNCERTAINTY_INTERVAL_METHOD", "conformal"),
+        alpha=float(getattr(config, "UNCERTAINTY_ALPHA", 0.05)),
+        k=float(getattr(config, "UNCERTAINTY_INTERVAL_K", 1.0)),
+    )
+
+
+def _scoring_runs(runs):
+    """The child runs that carry a score, with the ensemble members filtered out.
+
+    Both readers below walk a model run's children and prefer them to the model run itself - which
+    is right for the per-target evaluation runs a joint fit produces, and wrong for ensemble
+    members. Without this filter a single-target model that gained five members would DISAPPEAR
+    from the leaderboard and be replaced by five rows carrying the same target and model name and
+    no test metrics at all. The `or [child]` fallback makes that silent: an empty list falls back
+    to the model run, a list of five members does not.
+    """
+    return [run for run in runs if run.data.tags.get("run_kind") != MEMBER_RUN_KIND]
 
 
 def _eval_results_filename(target: str, model_name: str) -> str:
@@ -204,7 +256,15 @@ class ChildRunLogger:
 
     def _iter_target_eval_frames(self, evaluation_df: pd.DataFrame, target: str, model_name: str):
         target_names = self._resolve_target_names(evaluation_df, target)
-        has_multi_prediction_columns = any(column.startswith("prediction_") for column in evaluation_df.columns)
+        # is_prediction_column, not `startswith("prediction_")`. An uncertainty run's frame also
+        # carries prediction_std / prediction_lower / prediction_upper, and counting those as
+        # per-target prediction columns makes a SINGLE-target frame look multi-target: the branch
+        # below then looks for a prediction_<target> that does not exist, finds several candidates,
+        # gives up, and yields nothing - so the run logs no rmse_test and no picp_test at all.
+        prediction_columns = [
+            column for column in evaluation_df.columns if is_prediction_column(column)
+        ]
+        has_multi_prediction_columns = any(column != "prediction" for column in prediction_columns)
 
         if "prediction" in evaluation_df.columns and not has_multi_prediction_columns:
             frame = evaluation_df.copy()
@@ -216,9 +276,7 @@ class ChildRunLogger:
         for target_name in target_names:
             prediction_column = f"prediction_{target_name}"
             if prediction_column not in evaluation_df.columns:
-                prediction_candidates = [
-                    column for column in evaluation_df.columns if column.startswith("prediction_")
-                ]
+                prediction_candidates = list(prediction_columns)
                 if len(prediction_candidates) == 1:
                     prediction_column = prediction_candidates[0]
                 else:
@@ -265,7 +323,9 @@ class ChildRunLogger:
                 results.append((target_name, log_one(frame, target_name)))
         return results
 
-    def _per_target_metrics(self, evaluation_df, target: str, model_name: str) -> dict:
+    def _per_target_metrics(
+        self, evaluation_df, target: str, model_name: str, alpha: float | None = None
+    ) -> dict:
         """Suffixed metrics for every target in the frame, plus their means.
 
         The means carry the UNSUFFIXED names, which is what makes a joint run comparable with a
@@ -295,6 +355,19 @@ class ChildRunLogger:
                 frame[target_name], frame["prediction"], suffix=f"_{target_name}"
             )
             metrics.update(per_target)
+            # The interval metrics follow the same suffixing, so a joint run's model run carries
+            # picp_test_<target> for every target it fitted rather than only the point metrics.
+            if alpha is not None:
+                metrics.update(
+                    self._uncertainty_metrics(frame, target_name, alpha=alpha)
+                    if len(frames) == 1
+                    else {
+                        f"{key}_{target_name}": value
+                        for key, value in self._uncertainty_metrics(
+                            frame, target_name, alpha=alpha
+                        ).items()
+                    }
+                )
             for stem in ("r2_test", "rmse_test"):
                 value = per_target.get(f"{stem}_{target_name}")
                 if value is not None:
@@ -429,13 +502,172 @@ class ChildRunLogger:
             except (TypeError, ValueError):
                 continue
 
-    def _log_lightning_pred_obs_artifact(
+    def _uncertainty_metrics(self, frame, target_name: str, *, alpha: float) -> dict:
+        """The interval metrics for one target, empty when the frame carries no sigma.
+
+        Empty rather than absent-with-a-check at every call site: most frames reaching here come
+        from runs with uncertainty disabled, and the caller should not have to know that.
+        """
+        sigma = sigma_column(frame, target_name)
+        if sigma is None or target_name not in frame.columns or "prediction" not in frame.columns:
+            return {}
+
+        interval = interval_columns(frame, target_name)
+        lower, upper = interval if interval is not None else (None, None)
+        return uncertainty_metrics(
+            frame[target_name],
+            frame["prediction"],
+            sigma,
+            lower=lower,
+            upper=upper,
+            alpha=alpha,
+        )
+
+    def _log_uncertainty_artifacts(
+        self,
+        *,
+        frame,
+        target: str,
+        multi_target: bool,
+        calibrator=None,
+    ) -> dict:
+        """Write the ``uncertainty/`` diagnostics, nesting per target only when there are several.
+
+        Same failure policy as the SHAP seam: a diagnostic that cannot be drawn records why and
+        leaves the training run standing, because the model and its metrics are the deliverable and
+        a plot is not.
+        """
+        if frame is None or sigma_column(frame, target) is None:
+            return {}
+
+        try:
+            return log_uncertainty_artifacts(
+                frame,
+                target,
+                calibrator=calibrator,
+                artifact_path=ArtifactLayout.uncertainty_path(target if multi_target else None),
+            )
+        except Exception as exc:  # pragma: no cover - defensive, mirrors _log_shap_artifacts
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def _log_point_predictions(
+        self,
+        *,
+        config,
+        model_name: str,
+        target_names: list,
+        predict,
+        point_ids,
+        n_expected: int | None = None,
+    ) -> dict:
+        """Write this child's ``predictions/point_predictions.csv``, keyed on the point id.
+
+        ``predict`` is a zero-argument callable rather than a model plus data, so the two families
+        can hand over completely different inference paths - a fitted sklearn estimator against a
+        feature frame, or SoilSequencePredictor against a bundle - without this seam knowing which.
+        It is only called once the switch has been checked, so a disabled run pays nothing: the
+        full-population pass is the expensive part and it must not happen speculatively.
+
+        Failure policy matches the SHAP seam - record it and keep the training run, unless the
+        config asks otherwise. A prediction export is a convenience artifact; the model and its
+        metrics are the deliverable.
+        """
+        if not export_enabled_for(config, model_name):
+            return {}
+
+        id_column = point_id_column(config)
+        try:
+            predictions = predict()
+            if predictions is None:
+                return {}
+            frame = point_prediction_frame(point_ids, predictions, target_names, id_column)
+            if n_expected is not None and len(frame) != n_expected:
+                raise ValueError(
+                    f"Exported {len(frame)} rows for {model_name} but the population has "
+                    f"{n_expected}; the ids and the predictions describe different point sets."
+                )
+            self._log_table_artifact(
+                frame,
+                filename=ArtifactLayout.POINT_PREDICTIONS_FILE,
+                artifact_path=ArtifactLayout.PREDICTIONS,
+            )
+            return {"n_points": int(len(frame)), "targets": [str(name) for name in target_names]}
+        except Exception as exc:
+            if bool(getattr(config, "EXPORT_POINT_PREDICTIONS_FAIL_ON_ERROR", False)):
+                raise
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def _log_lightning_point_predictions(
+        self,
+        *,
+        config,
+        model_name: str,
+        model,
+        bundle,
+        full_population_predictions=None,
+    ) -> dict:
+        """Full-population predictions for a Lightning entry.
+
+        Reuses SoilSequencePredictor rather than adding a second inference path: it installs the
+        checkpoint's stored preprocessing state instead of re-fitting scalers on whatever rows it
+        was handed, which is the property that makes a prediction over the whole population mean
+        the same thing as a prediction over the test split.
+
+        SoilGraphLightningModule's datamodule exposes no equivalent - it carries a graph, not a
+        sequence bundle - so a graph entry is skipped with a reason rather than half-supported. It
+        is `enabled: false` throughout the shipped registry.
+        """
+        if not export_enabled_for(config, model_name):
+            return {}
+
+        datamodule = getattr(bundle, "datamodule", None) if bundle is not None else None
+        sequence_bundle = getattr(datamodule, "sequence_bundle", None)
+        if sequence_bundle is None:
+            return {
+                "skipped": (
+                    f"{model_name} has no sequence bundle to predict over - the graph datamodule "
+                    "does not support a full-population pass."
+                )
+            }
+
+        target_names = list(getattr(datamodule, "target_names", []) or [])
+        point_ids = list(getattr(sequence_bundle, "point_ids", []) or [])
+
+        def predict():
+            if full_population_predictions is not None:
+                # An ensemble: the trainer already ran every member and averaged them, because no
+                # single model object represents the mean.
+                return full_population_predictions
+            from yg_eo_soilnet.serving.sequence_predictor import SoilSequencePredictor
+
+            return SoilSequencePredictor(model).predict(sequence_bundle)
+
+        return self._log_point_predictions(
+            config=config,
+            model_name=model_name,
+            target_names=target_names,
+            predict=predict,
+            point_ids=point_ids,
+            n_expected=len(point_ids),
+        )
+
+    def _log_pred_obs_artifact(
         self,
         evaluation_df: pd.DataFrame,
         target: str,
         model_name: str,
         artifact_path: str | None = None,
+        interval_label: str | None = None,
     ) -> bool:
+        """Write plots/pred_obs.png for ONE target, carrying its uncertainty columns.
+
+        Used by both families now. The sklearn path also runs ``mlflow.models.evaluate``, which
+        calls ``create_pred_obs_plot`` itself through its custom-artifacts hook - but the evaluator
+        hands that hook a frame it builds from the `targets` and `predictions` columns alone, so the
+        sigma and interval columns never reach it and the bars silently do not appear. Writing the
+        plot here as well is what puts them on the picture, and it incidentally files the sklearn
+        plot under the same plots/pred_obs.png path the Lightning one has always used.
+        """
         if evaluation_df.empty or target not in evaluation_df.columns or "prediction" not in evaluation_df.columns:
             return False
 
@@ -445,6 +677,20 @@ class ChildRunLogger:
                 "prediction": evaluation_df["prediction"],
             }
         )
+        # The uncertainty columns have to travel with the two above, or the plotter finds no
+        # interval and silently draws the bar-less version of the picture on an ensemble run.
+        # Renamed to the unsuffixed spelling because this frame holds exactly one target.
+        sigma = sigma_column(evaluation_df, target)
+        if sigma is not None:
+            plot_eval_df["prediction_std"] = sigma.to_numpy()
+        interval = interval_columns(evaluation_df, target)
+        if interval is not None:
+            plot_eval_df["prediction_lower"] = interval[0].to_numpy()
+            plot_eval_df["prediction_upper"] = interval[1].to_numpy()
+        if interval_label:
+            # `attrs` rather than a column: it is one string about the whole frame, and a column
+            # would end up in the CSV the evaluator writes.
+            plot_eval_df.attrs["interval_label"] = interval_label
 
         # create_pred_obs_plot follows MLflow's custom-artifact contract: it SAVES into the
         # directory it is handed and returns {name: path}, rather than returning a Figure the way
@@ -783,6 +1029,7 @@ class ChildRunLogger:
         plot_functions,
         extra_params=None,
         targets=None,
+        export_data=None,
     ):
         """Log one fitted sklearn model inside an ALREADY-STARTED run.
 
@@ -817,7 +1064,19 @@ class ChildRunLogger:
         # The ONE prediction pass over the test set. It used to happen twice - once here for the
         # signature and once again when the evaluation frame was built - which is invisible for a
         # tree and another full inference pass for an in-context model.
-        test_predictions = np.asarray(best_model.predict(X_test))
+        #
+        # An ensemble is asked for its decomposition rather than its mean, and the mean is read off
+        # the result. Calling predict() and then predict_uncertainty() would run every member twice,
+        # which is the same cost this comment exists to prevent, multiplied by n_members.
+        ensemble = best_model if hasattr(best_model, "predict_uncertainty") else None
+        if ensemble is None:
+            ensemble_prediction = None
+            test_predictions = np.asarray(best_model.predict(X_test))
+        else:
+            ensemble_prediction = ensemble.predict_uncertainty(X_test)
+            test_predictions = ensemble_prediction.mean
+            if len(target_names) <= 1:
+                test_predictions = test_predictions.reshape(-1)
 
         # --- Model ---
         # Logged ONCE, under the group's label. A joint model predicts every target in the group,
@@ -842,6 +1101,19 @@ class ChildRunLogger:
                                          "numpy.dtype",
                                          "xgboost.core.Booster",
                                          "xgboost.sklearn.XGBRegressor",
+                                         # An uncertainty run logs the ENSEMBLE, not a bare
+                                         # pipeline, and skops refuses any type it was not told
+                                         # about - including ours. Without these two the model
+                                         # logging step raises and the whole run is lost, having
+                                         # already paid for n_members fits.
+                                         "yg_eo_soilnet.uncertainty.predictors.EnsembleRegressor",
+                                         # One entry per interval estimator the ensemble may carry.
+                                         # skops refuses any type it was not told about, so a method
+                                         # missing from this list fails the model logging step -
+                                         # after the run has already paid for every fit.
+                                         "yg_eo_soilnet.uncertainty.conformal.ConformalCalibrator",
+                                         "yg_eo_soilnet.uncertainty.intervals.GaussianInterval",
+                                         "yg_eo_soilnet.uncertainty.intervals.SigmaInterval",
                                          # TabICL ships its own preprocessing estimators inside
                                          # the fitted regressor; skops refuses to persist any of
                                          # them unless they are named here.
@@ -861,6 +1133,13 @@ class ChildRunLogger:
         eval_df = self._build_sklearn_evaluation_frame(
             test_predictions, X_test, y_test, target_names, model_name
         )
+        if ensemble_prediction is not None:
+            # The sigma and interval columns land beside the predictions the builder just wrote, so
+            # eval_results.csv carries the estimate and its uncertainty in one row per point.
+            attach_uncertainty_columns(
+                eval_df, ensemble_prediction, target_names, ensemble.calibrators
+            )
+            mlflow.log_params(ensemble.describe())
 
         # --- Metrics ---
         # The unified set, computed from the same prediction frame the Lightning path uses, so
@@ -875,7 +1154,9 @@ class ChildRunLogger:
         # per-target r2_test mean uses.
         if bool(getattr(config, "LOG_TRAIN_FIT_METRIC", True)):
             model_metrics["r2_train_fit"] = float(r2_score(y_train, best_model.predict(X_train)))
-        model_metrics.update(self._per_target_metrics(eval_df, target, model_name))
+        model_metrics.update(
+            self._per_target_metrics(eval_df, target, model_name, alpha=_uncertainty_alpha(config))
+        )
         self._log_metric_dict(model_metrics)
 
         self._log_table_artifact(
@@ -889,9 +1170,31 @@ class ChildRunLogger:
             getattr(model_info, "registered_model_version", None),
         )
 
+        # Predictions for EVERY point, not just the holdout. Written on the model run because that
+        # is where the fitted model lives; a joint model contributes one column per target from a
+        # single pass. For an ensemble `best_model` is the EnsembleRegressor, whose predict()
+        # returns the mean - so the exported number is the ensemble's estimate and carries no
+        # uncertainty, which is what this file is meant to hold.
+        export_summary = {}
+        if export_data is not None:
+            X_all = export_data["X"]
+            export_summary = self._log_point_predictions(
+                config=config,
+                model_name=model_name,
+                target_names=target_names,
+                predict=lambda: best_model.predict(X_all),
+                # reindex, not a positional slice: X_all and point_ids share the frame's index, and
+                # that is the only thing tying a prediction to the point it belongs to.
+                point_ids=export_data["point_ids"].reindex(X_all.index).to_numpy(),
+                n_expected=len(X_all),
+            )
+
         def log_one(frame, target_name):
             """Everything that is about ONE target, in whichever run holds that target."""
             metrics = regression_metrics(frame[target_name], frame["prediction"])
+            metrics.update(
+                self._uncertainty_metrics(frame, target_name, alpha=_uncertainty_alpha(config))
+            )
             if target_name == target:
                 # Single-target run: the CV and train-fit numbers belong here too, since there is
                 # no separate model run holding them.
@@ -909,8 +1212,30 @@ class ChildRunLogger:
 
             self._evaluate_sklearn_target(frame, target_name)
 
+            # Our own copy of the pred-vs-obs plot, with the uncertainty bars on it. The evaluator
+            # above draws one too, but from a frame it rebuilds out of the target and prediction
+            # columns alone - so its copy has no bars however many uncertainty columns the run
+            # produced. See _log_pred_obs_artifact.
+            self._log_pred_obs_artifact(
+                frame,
+                target=target_name,
+                model_name=model_name,
+                artifact_path=ArtifactLayout.plots_path(),
+                interval_label=describe_interval(
+                    ensemble.calibrators.get(target_name) if ensemble else None
+                ),
+            )
+
             # --- Test Plots ---
             self._log_plots(plot_functions, target_name, model_name)
+
+            # --- Uncertainty diagnostics ---
+            uncertainty_summary = self._log_uncertainty_artifacts(
+                frame=frame,
+                target=target_name,
+                multi_target=len(target_names) > 1,
+                calibrator=(ensemble.calibrators.get(target_name) if ensemble else None),
+            )
 
             # --- SHAP ---
             explain_summary = self._log_shap_artifacts(
@@ -946,6 +1271,8 @@ class ChildRunLogger:
                     "registered_model_version": getattr(model_info, "registered_model_version", None),
                     "champion": champion,
                     "explain": explain_summary,
+                    "uncertainty": uncertainty_summary,
+                    "point_predictions": export_summary,
                 },
                 ArtifactLayout.RUN_SUMMARY_FILE,
                 artifact_path=ArtifactLayout.META,
@@ -1017,12 +1344,23 @@ class ChildRunLogger:
         bundle=None,
         eval_df: pd.DataFrame | None = None,
         model=None,
+        calibrators: dict | None = None,
+        full_population_predictions=None,
     ):
         """Log Lightning outputs inside an already-started child run.
 
         Supports both the lightweight direct form used by the trainer and the
         richer bundle-based form for future compatibility.
+
+        `calibrators` is passed only on an ensemble run; the evaluation frame already carries the
+        interval columns by then, and these are here so the reliability plot can be drawn against
+        the same q the interval was built with.
+
+        `full_population_predictions` is likewise ensemble-only: the mean over every point, which
+        only the trainer can compute because no single model object represents a Lightning
+        ensemble. A single-model run leaves it None and this method runs the pass itself.
         """
+        calibrators = calibrators or {}
         if evaluation_df is None:
             evaluation_df = eval_df
 
@@ -1085,8 +1423,20 @@ class ChildRunLogger:
         model_metrics = {}
         model_metrics.update(validation_metrics or {})
         model_metrics.update(test_metrics or {})
-        model_metrics.update(self._per_target_metrics(evaluation_df, target, model_name))
+        model_metrics.update(
+            self._per_target_metrics(
+                evaluation_df, target, model_name, alpha=_uncertainty_alpha(config)
+            )
+        )
         self._log_metric_dict(model_metrics)
+
+        for target_name, calibrator in calibrators.items():
+            mlflow.log_params(
+                {
+                    f"{key}{'' if len(calibrators) <= 1 else f'_{target_name}'}": value
+                    for key, value in calibrator.to_dict().items()
+                }
+            )
 
         # Checkpoint and serialized model live in the model run, ONCE. A joint model predicts every
         # target in the group, so logging it inside the per-target fan-out put the same multi-output
@@ -1137,12 +1487,25 @@ class ChildRunLogger:
         registered_version = getattr(self, "_registered_version", None)
         champion = self._promote_champion(run_target, model_name, model_metrics, registered_version)
 
+        export_summary = self._log_lightning_point_predictions(
+            config=config,
+            model_name=model_name,
+            model=model,
+            bundle=bundle,
+            full_population_predictions=full_population_predictions,
+        )
+
         def log_one(frame, target_name):
             """Everything that is about ONE target, in whichever run holds that target."""
             is_model_run = target_name == run_target
             metrics = dict(model_metrics) if is_model_run else {}
             if frame is not None and target_name in frame.columns and "prediction" in frame.columns:
                 metrics.update(regression_metrics(frame[target_name], frame["prediction"]))
+                metrics.update(
+                    self._uncertainty_metrics(
+                        frame, target_name, alpha=_uncertainty_alpha(config)
+                    )
+                )
 
             if not is_model_run:
                 self._log_metric_dict(metrics)
@@ -1157,14 +1520,22 @@ class ChildRunLogger:
             # is no longer a second target writing the same leaf to nest away from.
             pred_obs_logged = False
             try:
-                pred_obs_logged = self._log_lightning_pred_obs_artifact(
+                pred_obs_logged = self._log_pred_obs_artifact(
                     frame if frame is not None else evaluation_df,
                     target=target_name,
                     model_name=model_name,
                     artifact_path=ArtifactLayout.plots_path(),
+                    interval_label=describe_interval(calibrators.get(target_name)),
                 )
             except Exception:
                 pred_obs_logged = False
+
+            uncertainty_summary = self._log_uncertainty_artifacts(
+                frame=frame if frame is not None else evaluation_df,
+                target=target_name,
+                multi_target=False,
+                calibrator=calibrators.get(target_name),
+            )
 
             explain_summary = self._log_shap_artifacts(
                 config=config,
@@ -1191,6 +1562,8 @@ class ChildRunLogger:
                 "serialized_model_logged": model_logged,
                 "serialized_model_logging_error": model_logging_error,
                 "explain": explain_summary,
+                "uncertainty": uncertainty_summary,
+                "point_predictions": export_summary,
                 "run_name": f"{target_name}_{model_name}",
                 "resolved_target": target_name,
             }
@@ -1231,7 +1604,7 @@ class ParentRunLogger:
         # were grandchildren.
         leaf_runs = []
         for child in children_of(parent_run_id):
-            grandchildren = children_of(child.info.run_id)
+            grandchildren = _scoring_runs(children_of(child.info.run_id))
             # The model run's own metrics are means over its children, so listing it beside them
             # would put the same model on the board twice, once under a label ("a__b") that names
             # no measurable target.
@@ -1299,7 +1672,7 @@ class ParentRunLogger:
         # split from.
         child_runs = []
         for child in children_of(parent_run_id):
-            grandchildren = children_of(child.info.run_id)
+            grandchildren = _scoring_runs(children_of(child.info.run_id))
             child_runs.extend(grandchildren or [child])
 
         eval_dfs = []
@@ -1331,7 +1704,18 @@ class ParentRunLogger:
                 df = pd.read_csv(local_path)
 
                 target_names = self._resolve_target_names(df, target)
-                if "prediction" in df.columns and not any(column.startswith("prediction_") for column in df.columns):
+                # is_prediction_column, not `startswith("prediction_")`. An uncertainty run's frame
+                # also carries prediction_std / prediction_lower / prediction_upper; counting those
+                # sent a SINGLE-target frame down the multi-target branch, where the fallback below
+                # picked `prediction_std` and assigned it to `prediction` - so the parent's
+                # pred_error_plot.png plotted standard deviations on the predicted axis. Same bug,
+                # and same fix, as in _iter_target_eval_frames.
+                prediction_columns = [
+                    column for column in df.columns if is_prediction_column(column)
+                ]
+                if "prediction" in df.columns and not any(
+                    column != "prediction" for column in prediction_columns
+                ):
                     df["target_name"] = target_names[0] if target_names else target
                     df["model_name"] = model_name
                     eval_dfs.append(df)
@@ -1339,10 +1723,7 @@ class ParentRunLogger:
                     for target_name in target_names:
                         prediction_column = f"prediction_{target_name}"
                         if prediction_column not in df.columns:
-                            prediction_column = next(
-                                (column for column in df.columns if column.startswith("prediction_")),
-                                None,
-                            )
+                            prediction_column = next(iter(prediction_columns), None)
                         if prediction_column is None or target_name not in df.columns:
                             continue
                         target_df = df.copy()
@@ -1355,6 +1736,68 @@ class ParentRunLogger:
 
         return eval_dfs
 
+
+    def _collect_point_predictions(self, parent_run_id: str, id_column: str):
+        """``(model_name, frame)`` for every child that exported per-point predictions.
+
+        DIRECT children only, unlike the leaderboard and eval-frame collectors. Those two want the
+        per-target evaluation runs, which sit a level deeper on a joint fit; this wants the run that
+        holds the MODEL, because that is the one that ran the full-population pass and a joint
+        model writes all of its targets into one file. Ensemble members are children of the model
+        run rather than of the parent, so they never appear at this level - but the filter is
+        applied anyway, so this does not silently depend on that.
+        """
+        client = mlflow.tracking.MlflowClient()  # type: ignore
+        experiment_id = client.get_run(parent_run_id).info.experiment_id
+        children = client.search_runs(
+            experiment_ids=[experiment_id],
+            filter_string=f"tags.mlflow.parentRunId = '{parent_run_id}'",
+        )
+
+        collected = []
+        for run in _scoring_runs(children):
+            model_name = run.data.tags.get("model_name")
+            if not model_name:
+                continue
+            try:
+                local_path = mlflow.artifacts.download_artifacts(  # type: ignore
+                    run_id=run.info.run_id,
+                    artifact_path=(
+                        f"{ArtifactLayout.PREDICTIONS}/{ArtifactLayout.POINT_PREDICTIONS_FILE}"
+                    ),
+                )
+            except Exception:
+                # A child that did not export - skipped by name, a graph entry, or a failure it
+                # already recorded in its own run summary. Not this collector's business.
+                continue
+            frame = pd.read_csv(local_path)
+            if id_column in frame.columns:
+                collected.append((model_name, frame))
+
+        return collected
+
+    def _log_point_prediction_export(self, parent_run_id: str, config) -> None:
+        """Combine the children's per-point predictions into the two parent-level files."""
+        if not bool(getattr(config, "EXPORT_POINT_PREDICTIONS", False)):
+            return
+
+        id_column = point_id_column(config)
+        frames = self._collect_point_predictions(parent_run_id, id_column)
+        if not frames:
+            return
+
+        wide, long_frame = combine_point_predictions(frames, id_column=id_column)
+        warning = duplicate_report(long_frame, id_column=id_column)
+        if warning:
+            mlflow.set_tags({"point_predictions_warning": warning})
+
+        log_table(wide, ArtifactLayout.POINT_PREDICTIONS_WIDE_FILE, ArtifactLayout.PREDICTIONS)
+        log_table(long_frame, ArtifactLayout.POINT_PREDICTIONS_LONG_FILE, ArtifactLayout.PREDICTIONS)
+        log_json(
+            dict(summarize_point_predictions(wide, long_frame, id_column)),
+            "point_predictions_summary.json",
+            ArtifactLayout.PREDICTIONS,
+        )
 
     def log_parent_summary(self, parent_run_id: str, trainer):
         """
@@ -1428,3 +1871,5 @@ class ParentRunLogger:
             "pred_error_plot.png",
             ArtifactLayout.LEADERBOARD_PLOTS,
         )
+
+        self._log_point_prediction_export(parent_run_id, trainer.config)

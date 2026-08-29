@@ -22,6 +22,23 @@ from yg_eo_soilnet.logger.mlflow_loggers import ChildRunLogger
 from yg_eo_soilnet.models.config_fatories.lightning_config_factory import LightningModelBundle
 from yg_eo_soilnet.targets import join_target_names
 from yg_eo_soilnet.tracking import start_child_run
+from yg_eo_soilnet.predictions_export import export_enabled_for
+from yg_eo_soilnet.uncertainty.intervals import (
+    build_interval_estimators,
+    needs_calibration_set,
+    normalize_method,
+)
+from yg_eo_soilnet.uncertainty import (
+    aggregate,
+    attach_uncertainty_columns,
+    fit_calibrators,
+    member_seeds,
+    uncertainty_enabled_for,
+)
+
+# Mirrors the sklearn trainer's constant. See ParentRunLogger._collect_leaderboard for why a member
+# run has to be distinguishable from a per-target evaluation run.
+MEMBER_RUN_KIND = "ensemble_member"
 
 
 class _LightningMlflowEpochMetricCallback(LightningCallback):
@@ -83,10 +100,31 @@ class LightningTrainer:
         self.logger = logger
         self.mlflow_logger = mlflow_logger or ChildRunLogger()
 
-    def train(self, target: str, data: Mapping[str, Any], model_bundles: Mapping[str, LightningModelBundle]):
+    def train(
+        self,
+        target: str,
+        data: Mapping[str, Any],
+        model_bundles: Mapping[str, LightningModelBundle],
+        bundle_builder: Any = None,
+    ):
+        """Fit every bundle for one target group.
+
+        ``bundle_builder(seed) -> {model_name: bundle}`` is what makes an ensemble possible here.
+        A Lightning model's weights are constructed by the factory, seeded immediately beforehand,
+        so a second member cannot be made from an existing bundle - it needs the factory to build a
+        new one at a new seed. Absent (or with uncertainty off) every entry takes the single-fit
+        path below, unchanged.
+        """
         results: dict[str, LightningRunResult] = {}
 
         for model_name, bundle in model_bundles.items():
+            if bundle_builder is not None and uncertainty_enabled_for(self.config, model_name):
+                results[model_name] = self._train_ensemble(
+                    target=target,
+                    model_name=model_name,
+                    bundle_builder=bundle_builder,
+                )
+                continue
             # Deliberately no seeding here. Seeding at this point is too late to reach the weights -
             # the factory built them already - and resetting the stream now would start fit() from a
             # different place than the HPO trial that chose these hyperparameters, so a tuned config
@@ -156,6 +194,338 @@ class LightningTrainer:
                 )
 
         return results
+
+    # --- uncertainty --------------------------------------------------------
+
+    def _train_ensemble(
+        self,
+        *,
+        target: str,
+        model_name: str,
+        bundle_builder: Any,
+    ) -> LightningRunResult:
+        """Fit n_members independently seeded models and log them as one ensemble.
+
+        Each member is a fresh bundle from the factory at its own seed, which is the only way to get
+        a different weight initialization - the factory seeds immediately before it constructs the
+        model, precisely so that a run is reproducible from its seed.
+
+        The members do NOT resample their training rows. Bootstrapping is what gives a deterministic
+        estimator its diversity; a neural network trained from a different initialization on a
+        non-convex loss surface already lands somewhere else, and taking 36.8% of its rows away as
+        well would cost accuracy to buy spread it already has.
+        """
+        n_members = int(getattr(self.config, "UNCERTAINTY_N_MEMBERS", 5))
+        stride = int(getattr(self.config, "UNCERTAINTY_SEED_STRIDE", 1000))
+        seeds = member_seeds(int(getattr(self.config, "RANDOM_SEED", 42)), n_members, stride)
+
+        run_name = f"{target}_{model_name}"
+        with start_child_run(run_name):
+            mlflow.log_params(
+                {
+                    "uncertainty_n_members": n_members,
+                    "uncertainty_member_seeds": ",".join(str(seed) for seed in seeds),
+                    "uncertainty_bootstrapped": False,
+                    "uncertainty_calibration_source": getattr(
+                        self.config, "UNCERTAINTY_CALIBRATION_SOURCE", "val"
+                    ),
+                }
+            )
+
+            members = []
+            for index, seed in enumerate(seeds):
+                with start_child_run(
+                    f"{run_name}_member{index}",
+                    tags={
+                        "run_kind": MEMBER_RUN_KIND,
+                        "target": target,
+                        "model_name": model_name,
+                        "ensemble_member": str(index),
+                        "ensemble_seed": str(seed),
+                    },
+                ):
+                    members.append(
+                        self._fit_member(
+                            bundle=bundle_builder(seed)[model_name],
+                            index=index,
+                            seed=seed,
+                        )
+                    )
+
+            return self._log_ensemble(
+                target=target, model_name=model_name, members=members, seeds=seeds
+            )
+
+    def _fit_member(self, *, bundle: LightningModelBundle, index: int, seed: int) -> dict:
+        """Fit one member and collect everything the ensemble needs from it.
+
+        Predictions are taken on BOTH the test split and the val split. The val predictions are the
+        calibration set: unlike the sklearn side, where val had to be carved out of the fit pool,
+        Lightning has always early-stopped on val and never fitted on it, so it is available here
+        at no cost in training rows. It is not perfectly held out either - early stopping read it -
+        so the calibration is mildly optimistic, which is worth knowing and not worth a third split.
+        """
+        trainer = self._build_trainer(bundle)
+        bundle.datamodule.setup("fit")
+        self._attach_preprocessing_state(bundle)
+        trainer.fit(bundle.model, datamodule=bundle.datamodule)
+
+        best_model_path = self._resolve_best_checkpoint(trainer)
+        validation_metrics = self._normalize_metrics(
+            self._call_trainer_method(
+                trainer, "validate", bundle.model, bundle.datamodule, ckpt_path=best_model_path
+            )
+        )
+        test_metrics = self._normalize_metrics(
+            self._call_trainer_method(
+                trainer, "test", bundle.model, bundle.datamodule, ckpt_path=best_model_path
+            )
+        )
+
+        mlflow.log_params(
+            {
+                "ensemble_member": index,
+                "ensemble_seed": seed,
+                # The local path Lightning wrote to. Only the model run used to record one, and only
+                # for the reference member, so a member's weights could be found afterwards solely
+                # by scavenging lightning_logs and matching on val_loss.
+                "best_model_path": best_model_path,
+            }
+        )
+        # Each member keeps its OWN checkpoint. Without this the run logs one checkpoint for the
+        # whole ensemble - the reference member's - and the other n-1 exist only as local files
+        # under lightning_logs, which nothing records and any cleanup removes. That is what made
+        # export_predictions.py unable to reconstruct a Lightning ensemble's mean from MLflow alone.
+        # Costs n_members checkpoints per entry instead of one; see uncertainty.n_members.
+        if best_model_path:
+            self.mlflow_logger._log_checkpoint(best_model_path)
+
+        test_predictions, test_sigmas = self._predict_split(
+            bundle, trainer, best_model_path, "predict"
+        )
+        calibration_predictions, calibration_sigmas = self._predict_split(
+            bundle, trainer, best_model_path, "val"
+        )
+
+        return {
+            "full_predictions": self._predict_full_population(bundle),
+            "bundle": bundle,
+            "trainer": trainer,
+            "best_model_path": best_model_path,
+            "validation_metrics": validation_metrics,
+            "test_metrics": test_metrics,
+            "test_predictions": test_predictions,
+            "test_sigmas": test_sigmas,
+            "calibration_predictions": calibration_predictions,
+            "calibration_sigmas": calibration_sigmas,
+        }
+
+    def _predict_full_population(self, bundle) -> np.ndarray | None:
+        """This member's prediction for EVERY point, or None when the export is off.
+
+        Only an ensemble needs this at member level: the exported number is the mean across
+        members, and there is no single model object that computes it. Gated on the switch because
+        it is a whole extra inference pass over the full dataset, per member.
+        """
+        if not export_enabled_for(self.config, bundle.name):
+            return None
+
+        datamodule = getattr(bundle, "datamodule", None)
+        sequence_bundle = getattr(datamodule, "sequence_bundle", None)
+        if sequence_bundle is None:
+            return None
+
+        try:
+            from yg_eo_soilnet.serving.sequence_predictor import SoilSequencePredictor
+
+            return SoilSequencePredictor(bundle.model).predict(sequence_bundle)
+        except Exception as exc:  # pragma: no cover - the logger reports and keeps the run
+            if self.logger is not None:
+                self.logger.warning(
+                    f"Full-population prediction failed for one member of {bundle.name}: "
+                    f"{type(exc).__name__}: {exc}. The ensemble export will be skipped."
+                )
+            return None
+
+    def _predict_split(self, bundle, trainer, ckpt_path, split: str):
+        """``(means, sigmas)`` over one split, in original target units; sigmas None without a head.
+
+        ``predict`` uses the datamodule's own predict_dataloader, which is the test split and is
+        never shuffled - the frame is aligned positionally with y_test_frame_. The val loader is
+        passed explicitly because there is no predict-style hook for it.
+        """
+        predict_method = getattr(trainer, "predict", None)
+        if predict_method is None:
+            return None, None
+
+        try:
+            if split == "val":
+                dataloader = bundle.datamodule.val_dataloader()
+                if dataloader is None:
+                    return None, None
+                predictions = predict_method(
+                    bundle.model, dataloaders=dataloader, ckpt_path=ckpt_path
+                )
+            else:
+                predictions = predict_method(
+                    bundle.model, datamodule=bundle.datamodule, ckpt_path=ckpt_path
+                )
+        except (TypeError, RuntimeError, ValueError):
+            return None, None
+
+        return self._flatten_predictions_with_sigma(predictions)
+
+    def _log_ensemble(self, *, target, model_name, members, seeds) -> LightningRunResult:
+        """Aggregate the members, calibrate, and hand one frame to the logger."""
+        reference = members[0]
+        bundle = reference["bundle"]
+        datamodule = bundle.datamodule
+        target_names = list(getattr(datamodule, "target_names", []) or [])
+
+        test_stack, test_sigmas = self._stack_member_outputs(members, "test")
+        prediction = aggregate(test_stack, test_sigmas) if test_stack else None
+
+        calibrators = self._calibrate_ensemble(members, datamodule, target_names)
+
+        evaluation_df = self._build_evaluation_frame(
+            bundle, reference["trainer"], target, ckpt_path=reference["best_model_path"]
+        )
+        if evaluation_df is not None and prediction is not None and target_names:
+            # The ensemble MEAN replaces the reference member's predictions: the frame builder wrote
+            # one member's numbers, and what the run reports must be what the ensemble predicts.
+            self._overwrite_predictions(evaluation_df, prediction, target_names)
+            attach_uncertainty_columns(evaluation_df, prediction, target_names, calibrators)
+
+        # Metrics are averaged across members so val_loss and test_loss describe the ensemble rather
+        # than whichever member happened to be built first.
+        validation_metrics = self._average_metrics([m["validation_metrics"] for m in members])
+        test_metrics = self._average_metrics([m["test_metrics"] for m in members])
+
+        self.mlflow_logger.log_lightning_child_run(
+            config=self.config,
+            target=target,
+            model_name=model_name,
+            evaluation_df=evaluation_df,
+            validation_metrics=validation_metrics,
+            test_metrics=test_metrics,
+            best_model_path=reference["best_model_path"],
+            extra_params=self._serialize_params(bundle),
+            plot_functions={},
+            bundle=bundle,
+            model=bundle.model,
+            calibrators=calibrators,
+            full_population_predictions=self._ensemble_full_population(members),
+        )
+
+        return LightningRunResult(
+            model_name=model_name,
+            target=target,
+            validation_metrics=validation_metrics,
+            test_metrics=test_metrics,
+            best_model_path=reference["best_model_path"],
+        )
+
+    def _calibrate_ensemble(self, members, datamodule, target_names) -> dict:
+        """One interval estimator per target, of whichever kind the config asked for.
+
+        Only conformal reaches the val split below; gaussian and sigma are arithmetic on the sigma
+        the ensemble already produced, so they need no held-out predictions at all.
+        """
+        method = normalize_method(getattr(self.config, "UNCERTAINTY_INTERVAL_METHOD", "conformal"))
+        if not needs_calibration_set(method):
+            return build_interval_estimators(
+                method,
+                target_names,
+                alpha=float(getattr(self.config, "UNCERTAINTY_ALPHA", 0.05)),
+                k=float(getattr(self.config, "UNCERTAINTY_INTERVAL_K", 1.0)),
+            )
+
+        y_val = getattr(datamodule, "y_val_frame_", None)
+        stack, sigmas = self._stack_member_outputs(members, "calibration")
+        if y_val is None or not len(y_val) or not stack or not target_names:
+            if self.logger is not None:
+                self.logger.warning(
+                    "No usable validation split for conformal calibration; the ensemble reports a "
+                    "standard deviation but no calibrated interval."
+                )
+            return {}
+
+        calibration = aggregate(stack, sigmas)
+        if calibration.mean.shape[0] != len(y_val):
+            if self.logger is not None:
+                self.logger.warning(
+                    f"Validation predictions ({calibration.mean.shape[0]} rows) do not line up with "
+                    f"y_val_frame_ ({len(y_val)} rows); skipping calibration rather than pairing "
+                    "residuals with the wrong observations."
+                )
+            return {}
+
+        return fit_calibrators(
+            calibration,
+            y_val,
+            target_names,
+            alpha=float(getattr(self.config, "UNCERTAINTY_ALPHA", 0.05)),
+            logger=self.logger,
+        )
+
+    @staticmethod
+    def _ensemble_full_population(members) -> np.ndarray | None:
+        """The ensemble MEAN over every point, or None when any member could not produce one.
+
+        All-or-nothing: averaging over the subset of members that happened to succeed would export
+        a number that is neither one member's prediction nor the ensemble's, under a column name
+        claiming to be the ensemble's. The sigma is discarded here - the export carries estimates
+        only.
+        """
+        full = [
+            member["full_predictions"]
+            for member in members
+            if member.get("full_predictions") is not None
+        ]
+        if not full or len(full) != len(members):
+            return None
+        return aggregate(full).mean
+
+    @staticmethod
+    def _stack_member_outputs(members, split: str):
+        """``(means, sigmas)`` across members for one split, sigmas None unless EVERY member has one.
+
+        All-or-nothing on the sigmas because ``aggregate`` averages variances across members: a
+        partial list would average the aleatoric term over the members that reported one and
+        silently treat the rest as noiseless, understating it by exactly the fraction missing.
+        """
+        means = [
+            member[f"{split}_predictions"]
+            for member in members
+            if member.get(f"{split}_predictions") is not None
+        ]
+        sigmas = [
+            member[f"{split}_sigmas"]
+            for member in members
+            if member.get(f"{split}_sigmas") is not None
+        ]
+        return means, (sigmas if means and len(sigmas) == len(means) else None)
+
+    @staticmethod
+    def _overwrite_predictions(evaluation_df, prediction, target_names) -> None:
+        """Replace the frame's prediction columns with the ensemble mean, in place."""
+        multi_target = len(target_names) > 1
+        for index, target_name in enumerate(target_names):
+            column = f"prediction_{target_name}" if multi_target else "prediction"
+            if column in evaluation_df.columns:
+                evaluation_df[column] = prediction.mean[:, index]
+
+    @staticmethod
+    def _average_metrics(metric_dicts: list[dict]) -> dict[str, float]:
+        """Mean of each metric across the members, over the keys they all report."""
+        if not metric_dicts:
+            return {}
+        shared = set(metric_dicts[0])
+        for metrics in metric_dicts[1:]:
+            shared &= set(metrics)
+        return {
+            key: float(np.mean([metrics[key] for metrics in metric_dicts])) for key in sorted(shared)
+        }
 
     @staticmethod
     def _attach_preprocessing_state(bundle: LightningModelBundle) -> None:
@@ -295,26 +665,54 @@ class LightningTrainer:
         return eval_df
 
     def _flatten_predictions(self, predictions) -> np.ndarray | None:
-        flattened = []
+        """Just the means, for every caller that only wants predictions."""
+        return self._flatten_predictions_with_sigma(predictions)[0]
+
+    def _flatten_predictions_with_sigma(
+        self, predictions
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """``(means, sigmas)`` from a list of predict_step outputs, sigmas None on a point head.
+
+        A heteroscedastic ``predict_step`` returns a ``(mean, sigma)`` tuple per batch and a point
+        head returns a bare tensor, so both shapes have to be unpacked here rather than at each
+        call site.
+        """
+        means, sigmas = [], []
         for batch in predictions:
             if batch is None:
                 continue
-            if hasattr(batch, "detach"):
-                batch = batch.detach().cpu().numpy()
+            if isinstance(batch, tuple):
+                mean_batch, sigma_batch = batch[0], batch[1] if len(batch) > 1 else None
             else:
-                batch = np.asarray(batch)
+                mean_batch, sigma_batch = batch, None
 
-            if batch.ndim == 0:
-                batch = batch.reshape(1, 1)
-            elif batch.ndim == 1:
-                batch = batch.reshape(-1, 1)
+            means.append(self._as_2d_array(mean_batch))
+            if sigma_batch is not None:
+                sigmas.append(self._as_2d_array(sigma_batch))
 
-            flattened.append(batch)
+        if not means:
+            return None, None
 
-        if not flattened:
-            return None
+        stacked_means = np.concatenate(means, axis=0)
+        # All-or-nothing: a partial sigma would silently pair some rows' uncertainty with other
+        # rows' predictions once the arrays were concatenated to different lengths.
+        stacked_sigmas = (
+            np.concatenate(sigmas, axis=0) if len(sigmas) == len(means) else None
+        )
+        return stacked_means, stacked_sigmas
 
-        return np.concatenate(flattened, axis=0)
+    @staticmethod
+    def _as_2d_array(batch) -> np.ndarray:
+        if hasattr(batch, "detach"):
+            batch = batch.detach().cpu().numpy()
+        else:
+            batch = np.asarray(batch)
+
+        if batch.ndim == 0:
+            return batch.reshape(1, 1)
+        if batch.ndim == 1:
+            return batch.reshape(-1, 1)
+        return batch
 
     def _normalize_metrics(self, metrics) -> dict[str, float]:
         if not metrics:

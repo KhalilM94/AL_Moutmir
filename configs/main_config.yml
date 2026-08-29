@@ -8,6 +8,7 @@ common:
     # Omit / leave null when `static` is a joint file that already carries the target columns.
     # Lab targets live in their own file; lat/lon are carried across from it on the join.
     targets: 'Morocco_soil_targets_uuid_roadsafe_6ksample_V_110826.csv'
+    # targets: 'Morocco_soil_targets_uuid_roadsafe_6ksample_Prior_Predictions_V_110826.csv'
     
     # Time-series always arrives separately: a single file, or a folder of per-modality shards.
     timeseries: 'Morocco_Soil_Predictors_2017_2025_TS_with_indices_V_110826.csv'
@@ -147,3 +148,132 @@ common:
   EXPLAIN_SKIP_MODELS: ["TabICL"]
   # false records an explainer failure in meta/run_summary_*.json and keeps the training run.
   EXPLAIN_FAIL_ON_ERROR: false
+
+  # --- Predictive uncertainty ------------------------------------------------
+  # Every model here used to emit exactly one number per (sample, target). This block makes it emit
+  # a mean AND a standard deviation, and turns that standard deviation into a calibrated interval.
+  #
+  # Two sources, kept separate all the way to the eval frame because they answer different questions:
+  #   epistemic  - spread ACROSS ensemble members. "the models disagree here." Shrinks with data.
+  #   aleatoric  - the per-point variance a heteroscedastic head predicts. "the data is noisy here."
+  #                Does not shrink with data. Lightning only; see `heteroscedastic` below.
+  # total_sigma = sqrt(var(mu_k) + mean(sigma_k^2)), the deep-ensemble decomposition.
+  #
+  # Neither is trustworthy on its own - an ensemble is systematically overconfident - so the sigma
+  # is then CALIBRATED by split conformal against a held-out set. That is what makes the bar on the
+  # pred-vs-obs plot mean "95% of observations land in here" rather than "the model felt this sure",
+  # and it is what makes a sklearn interval and a Lightning interval the same kind of object.
+  # picp_test is logged beside every run so the claim is checkable rather than decorative.
+  uncertainty:
+    # The master switch. false is not a plot suppressor: no member loop runs, no extra columns are
+    # written, and the run costs exactly what it costs today.
+    enabled: false
+    # Members per model per target group. Training time scales with this LINEARLY - 5 members of a
+    # 500-epoch soil_cnn is 5 runs of it. 3 is enough to iterate, 5 to report, 10 to publish.
+    # On the Lightning side it also multiplies CHECKPOINT STORAGE by this number: every member logs
+    # its own weights, so its predictions can be reconstructed later without the ensemble having to
+    # be retrained. A soil_cnn checkpoint is ~75 MB, so 5 members per target is ~375 MB per target.
+    n_members: 5
+    # Member k trains at RANDOM_SEED + k * this. A stride rather than +1 so a member seed never
+    # collides with split.seed or with an entry's own `random_seed`, which would quietly correlate
+    # two members that are supposed to be independent draws.
+    member_seed_stride: 1000
+    # auto | always | never. Members of a DETERMINISTIC estimator (Ridge, PLS - anything with no
+    # random_state to set) are otherwise five identical fits: sigma collapses to exactly 0 and the
+    # run reports total confidence. `auto` bootstrap-resamples the fit pool for exactly those
+    # entries and leaves stochastic ones (XGBoost, GradientBoosting) alone.
+    bootstrap: auto
+    # Lightning only: the head emits (mu, log var) and the loss becomes beta-NLL instead of MSE.
+    # This is the only way to get a bar that is WIDER where the data is noisier rather than merely
+    # where the members disagree. Note two consequences: val_loss is then an NLL and is no longer
+    # comparable to an MSE run's, and soil_graph does not inherit the shared regression base so it
+    # ignores this key and gets ensemble-only uncertainty.
+    heteroscedastic: false
+    # beta-NLL weight (Seitzer et al. 2022). Plain Gaussian NLL (0.0) is known to stop fitting the
+    # mean wherever it has already decided the variance is large, which shows up as a model that
+    # gave up on its hard points. 1.0 is fully variance-weighted; 0.5 is the paper's middle.
+    beta_nll: 0.5
+    # --- what the lower/upper columns and the plotted bars actually are ---------------
+    # The sigma columns are written whatever this says. This decides how that sigma becomes an
+    # interval, and the three answers are NOT interchangeable:
+    #
+    #   conformal  mean +- q*sigma, q fitted on held-out residuals. The only one whose coverage is
+    #              guaranteed rather than assumed, and the only one that means the same thing on
+    #              both training families. The default, and what you want unless you know otherwise.
+    #   gaussian   mean +- z(1-alpha/2)*sigma. A normal-theory band. It is a real confidence
+    #              interval only if the predictive distribution is Normal AND sigma is on the right
+    #              scale - on the Ridge ensemble the fitted conformal q was 50.3 against a Gaussian
+    #              1.96, so this would have covered a fraction of what it claims.
+    #   sigma      mean +- k*sigma. Claims nothing beyond "k standard deviations", which is the
+    #              honest thing to draw when you want the model's own spread rather than a
+    #              calibrated band. Graded against what k implies (0.683 at k=1), not against alpha.
+    #   none       sigma columns only, no interval, no bars.
+    #
+    # Only `conformal` needs rows the model never saw - so under gaussian and sigma the sklearn
+    # family keeps its full fit pool instead of reserving the val split. See `calibration.source`.
+    interval:
+      method: sigma
+      # Miscoverage rate for conformal and gaussian: 0.05 is a 95% interval. The plotted bar and
+      # picp_test both read this, so there is one number behind the picture and the metric that
+      # checks it. Ignored by `sigma`.
+      alpha: 0.05
+      # Half-width in standard deviations, read only by `method: sigma`.
+      k: 1.0
+    calibration:
+      # `method` moved to the `interval` block above, because gaussian and sigma calibrate nothing
+      # and naming them a calibration method would be a lie. Setting it here still works - it is
+      # read when `interval.method` is absent, with `split_conformal` meaning `conformal`.
+      alpha: 0.05
+      # WHERE the calibration residuals come from. This is the key with a real cost attached.
+      #
+      # val     - the val split this file already carves. Honest by construction on the Lightning
+      #           side. On the sklearn side X_train is currently train u val (sklearn validates by
+      #           k-fold INSIDE that pool), so calibrating on val would calibrate on rows the model
+      #           was fitted on and the coverage guarantee would be void. Choosing `val` therefore
+      #           moves the sklearn members onto train-only and logs uncertainty_fit_pool=train_only.
+      #           Cost: sklearn trains on ~15% fewer rows. Buys: under population_policy=intersect
+      #           the two families calibrate on the SAME point ids, so their intervals are directly
+      #           comparable - the same property the unified metrics module exists to protect.
+      # cv_oof  - out-of-fold residuals from the k-fold GridSearchCV already runs. Costs no rows and
+      #           keeps the full fit pool. sklearn only: there is no equivalent for a Lightning run.
+      source: val
+    # [] applies uncertainty to every enabled entry. Name entries to restrict it.
+    models: []
+    # Never given an ensemble unless `models` names them explicitly. TabICL is excluded for the same
+    # reason it is excluded from SHAP: fit() is a full in-context pass over the training set, and
+    # n_members of those is the path that got a run OOM-killed by the kernel twice.
+    skip_models: ["TabICL"] #"TabICL"
+    # false records the failure in meta/run_summary.json and keeps the point predictions.
+    fail_on_error: false
+
+  # --- Per-point prediction export -------------------------------------------
+  # One file per run answering "what did every model predict for this point?", keyed on
+  # POINT_ID_COLUMN. Two are written to the PARENT run:
+  #   predictions/point_predictions_wide.csv   one row per point, one column per <target>__<model>
+  #   predictions/point_predictions_long.csv   one row per point x target x model
+  # The long file is the authoritative one - target and model names both contain underscores, so a
+  # wide column name is readable but not reliably parseable back into its two parts.
+  #
+  # Where an entry was ensembled the exported number is the ensemble MEAN. No sigma, no interval:
+  # this file is about the estimates. The uncertainty lives in eval_results.csv and the
+  # uncertainty/ artifacts.
+  #
+  # Two things to know before reading the output:
+  #
+  #   * It covers EVERY point the pipeline could featurize, not just the test split - so most rows
+  #     are training rows the model has already seen. Their predictions are in-sample and will look
+  #     far better than the model's real skill. Nothing in the file marks them; cross-reference
+  #     data_splits/split_assignments.parquet, which is keyed on the same point ids, to separate
+  #     them.
+  #   * It costs a full-population inference pass per model, which nothing else in the run does.
+  #     That is why this is off by default and why `skip_models` exists.
+  export_point_predictions:
+    enabled: false
+    # [] exports every model that supports it. Naming entries restricts it, and an entry named here
+    # wins over skip_models below.
+    models: []
+    # A pass over every point with an in-context model is measured in hours - the same reason TabICL
+    # is excluded from SHAP and from ensembling.
+    skip_models: ["TabICL"] #"TabICL"
+    # false records the failure in meta/run_summary.json and keeps the rest of the run.
+    fail_on_error: false

@@ -377,7 +377,7 @@ def test_collect_eval_dfs_ignores_unlabeled_runs(monkeypatch) -> None:
     assert eval_dfs == []
 
 
-def test_log_lightning_pred_obs_artifact_separates_targets_by_directory(monkeypatch, tmp_path) -> None:
+def test_log_pred_obs_artifact_separates_targets_by_directory(monkeypatch, tmp_path) -> None:
     """Two targets in one run must not overwrite each other - but they separate by DIRECTORY now.
 
     They used to separate by filename (`..._target_a_soil_graph.png`), which kept them apart within
@@ -402,10 +402,10 @@ def test_log_lightning_pred_obs_artifact_separates_targets_by_directory(monkeypa
     eval_a = pd.DataFrame({"target_a": [1.0, 2.0], "prediction": [1.1, 1.9]})
     eval_b = pd.DataFrame({"target_b": [3.0, 4.0], "prediction": [3.1, 3.9]})
 
-    assert logger._log_lightning_pred_obs_artifact(
+    assert logger._log_pred_obs_artifact(
         eval_a, target="target_a", model_name="soil_graph", artifact_path="plots/target_a"
     )
-    assert logger._log_lightning_pred_obs_artifact(
+    assert logger._log_pred_obs_artifact(
         eval_b, target="target_b", model_name="soil_graph", artifact_path="plots/target_b"
     )
 
@@ -432,7 +432,7 @@ def test_single_target_pred_obs_lands_on_the_flat_comparable_path(monkeypatch) -
     )
 
     frame = pd.DataFrame({"target_a": [1.0, 2.0], "prediction": [1.1, 1.9]})
-    assert logger._log_lightning_pred_obs_artifact(frame, target="target_a", model_name="soil_cnn")
+    assert logger._log_pred_obs_artifact(frame, target="target_a", model_name="soil_cnn")
 
     assert logged == [(logged[0][0], "plots")]
     assert Path(logged[0][0]).name == "pred_obs.png"

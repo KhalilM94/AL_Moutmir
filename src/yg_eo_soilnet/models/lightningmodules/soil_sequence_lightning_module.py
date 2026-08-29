@@ -85,6 +85,10 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         target_mean: Optional[Any] = None,
         target_scale: Optional[Any] = None,
         target_transform: Optional[str] = None,
+        # Emit (mu, log var) instead of mu alone, and train with beta-NLL. Set by the factory from
+        # uncertainty.heteroscedastic; see SoilRegressionLightningBase._beta_nll_loss.
+        predict_variance: bool = False,
+        beta_nll: float = 0.5,
     ):
         super().__init__()
         # Coerce BEFORE save_hyperparameters(): it captures this frame's locals, and a numpy array
@@ -110,6 +114,8 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
             target_mean=target_mean,
             target_scale=target_scale,
             target_transform=target_transform,
+            predict_variance=predict_variance,
+            beta_nll=beta_nll,
             loss_name=loss_name,
             huber_delta=huber_delta,
             learning_rate=learning_rate,
@@ -201,7 +207,9 @@ class SoilSequenceLightningModule(SoilRegressionLightningBase):
         self.output_head = build_mlp_stack(
             self.fusion_dim,
             head_hidden_dims,
-            self.target_dim,
+            # head_output_dim, not target_dim: a heteroscedastic head is twice as wide
+            # because it emits a log variance beside every mean.
+            self.head_output_dim,
             dropout=dropout,
             use_layer_norm=self.use_layer_norm,
         )

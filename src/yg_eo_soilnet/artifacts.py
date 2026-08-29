@@ -51,6 +51,8 @@ class ArtifactLayout:
     EVAL_RESULTS = "eval_results"
     PLOTS = "plots"
     EXPLAIN = "explain"
+    UNCERTAINTY = "uncertainty"
+    PREDICTIONS = "predictions"
     CV = "cv"
     CHECKPOINTS = "checkpoints"
 
@@ -79,10 +81,28 @@ class ArtifactLayout:
     SHAP_VALUES_FILE = "shap_values.parquet"
     SHAP_SUMMARY_FILE = "shap_summary.json"
 
+    # Uncertainty diagnostics. The calibrated bars themselves live on pred_obs.png under plots/;
+    # these are the two panels that say whether those bars are honest, kept separate because a
+    # reader checking calibration wants them side by side and not buried in a four-panel strip.
+    RELIABILITY_FILE = "reliability.png"
+    SIGMA_ERROR_FILE = "sigma_vs_error.png"
+    UNCERTAINTY_SUMMARY_FILE = "uncertainty_summary.json"
+
+    # Per-point predictions. The child file is one model's contribution keyed on point id; the two
+    # parent files are every child's, combined. See yg_eo_soilnet.predictions_export.
+    POINT_PREDICTIONS_FILE = "point_predictions.csv"
+    POINT_PREDICTIONS_WIDE_FILE = "point_predictions_wide.csv"
+    POINT_PREDICTIONS_LONG_FILE = "point_predictions_long.csv"
+
     @classmethod
     def explain_path(cls, target: Any = None) -> str:
         """``explain``, or ``explain/<target>`` when one run emits several targets."""
         return cls._per_target(cls.EXPLAIN, target)
+
+    @classmethod
+    def uncertainty_path(cls, target: Any = None) -> str:
+        """``uncertainty``, or ``uncertainty/<target>`` when one run emits several targets."""
+        return cls._per_target(cls.UNCERTAINTY, target)
 
     @classmethod
     def plots_path(cls, target: Any = None) -> str:

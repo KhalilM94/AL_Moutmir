@@ -60,8 +60,22 @@ class SoilRegressionLightningBase(LightningModule):
         scheduler_min_lr: float,
         scheduler_monitor: str,
         target_names: Optional[Any] = None,
+        predict_variance: bool = False,
+        beta_nll: float = 0.5,
     ) -> None:
         self.target_dim = int(target_dim)
+        # --- heteroscedastic head ---------------------------------------------------------
+        # With predict_variance the readout emits TWO numbers per target - a mean and a log
+        # variance - and the loss becomes beta-NLL instead of the point loss. That is what makes a
+        # prediction interval narrow where the data is clean and wide where it is noisy; an
+        # ensemble on its own can only measure where its members disagree, which is a different
+        # quantity and is often near-constant across the test set.
+        #
+        # Subclasses build their readout at `self.head_output_dim` rather than `self.target_dim`,
+        # so the extra width is decided in exactly one place.
+        self.predict_variance = bool(predict_variance)
+        self.head_output_dim = self.target_dim * (2 if self.predict_variance else 1)
+        self.beta_nll = float(beta_nll)
         # Only set when the subclass has not already: SoilCNNLightningModule assigns its own after
         # this call. Used to NAME the per-target metrics below, so a joint run's r2 can be read per
         # target instead of only in aggregate.
@@ -104,6 +118,14 @@ class SoilRegressionLightningBase(LightningModule):
             torch.tensor(self.target_transform == "log1p"),
             persistent=True,
         )
+        # A buffer for the same reason the two above are: a checkpoint restored without its
+        # hyperparameters would otherwise read a 2*target_dim head as 2*target_dim TARGETS, and
+        # report log variances as if they were predictions of targets that do not exist.
+        self.register_buffer(
+            "head_predicts_variance",
+            torch.tensor(self.predict_variance),
+            persistent=True,
+        )
 
         # NOTE: val_loss is only comparable across runs that share loss_name - it is the monitor for
         # early stopping, checkpoint selection and the LR scheduler.
@@ -125,8 +147,42 @@ class SoilRegressionLightningBase(LightningModule):
 
     # --- steps -------------------------------------------------------------
 
+    # Bounds on the predicted log variance. Not cosmetic: an unclamped head can drive the variance
+    # toward zero on a point it happens to fit early, at which point the NLL's 1/var term explodes
+    # and the run dies with a non-finite loss. exp(-10) ~ 4.5e-5 and exp(10) ~ 2.2e4, which spans
+    # every plausible noise level in STANDARDIZED space, where the target has unit variance.
+    LOG_VARIANCE_MIN = -10.0
+    LOG_VARIANCE_MAX = 10.0
+
+    def _split_head_output(self, raw: torch.Tensor):
+        """``(mean, log_variance)`` from the readout, with log_variance None on a point head."""
+        if not self.predict_variance:
+            return raw, None
+        mean, log_variance = raw[..., : self.target_dim], raw[..., self.target_dim :]
+        return mean, log_variance.clamp(self.LOG_VARIANCE_MIN, self.LOG_VARIANCE_MAX)
+
+    def _beta_nll_loss(self, mean, log_variance, targets):
+        """beta-NLL (Seitzer et al. 2022), reducing to Gaussian NLL at beta = 0.
+
+        Plain Gaussian NLL has a well-known failure that matters here. The 1/var factor weights each
+        point's mean-error by how certain the model already is, so a point it starts out uncertain
+        about contributes almost nothing to the mean's gradient - and it therefore never learns to
+        fit it, which retroactively justifies the large variance. The result is a model that has
+        given up on its hard points while scoring well on NLL.
+
+        beta-NLL multiplies each term by ``var^beta`` with the gradient stopped, which cancels that
+        weighting back out. beta = 0 is plain NLL and beta = 1 recovers MSE-like weighting on the
+        mean; 0.5 is the paper's recommendation and the default here.
+        """
+        variance = torch.exp(log_variance)
+        negative_log_likelihood = 0.5 * (log_variance + (targets - mean) ** 2 / variance)
+        if self.beta_nll > 0.0:
+            negative_log_likelihood = negative_log_likelihood * variance.detach() ** self.beta_nll
+        return negative_log_likelihood.mean()
+
     def _shared_step(self, batch: Any, stage: str):
-        predictions = self.forward(batch)
+        raw_output = self.forward(batch)
+        predictions, log_variance = self._split_head_output(raw_output)
         targets = batch_get(batch, "y")
         if targets is None:
             raise KeyError("Batch is missing 'y'")
@@ -136,7 +192,12 @@ class SoilRegressionLightningBase(LightningModule):
             raise ValueError(f"Non-finite target values encountered during {stage} step.")
         if not torch.isfinite(predictions).all():
             raise ValueError(f"Non-finite prediction values encountered during {stage} step.")
-        loss = self.loss_fn(predictions, targets)
+        if log_variance is None:
+            loss = self.loss_fn(predictions, targets)
+        else:
+            if not torch.isfinite(log_variance).all():
+                raise ValueError(f"Non-finite predicted variance encountered during {stage} step.")
+            loss = self._beta_nll_loss(predictions, log_variance, targets)
         if not torch.isfinite(loss):
             raise ValueError(f"Non-finite loss encountered during {stage} step.")
 
@@ -164,7 +225,22 @@ class SoilRegressionLightningBase(LightningModule):
         return self._shared_step(batch, "test")
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
-        return self.inverse_transform_targets(self.forward(batch))
+        """Predictions in the target's original units, with sigma alongside on a variance head.
+
+        The return type deliberately changes shape with the head: a bare tensor for a point head,
+        so every existing caller is untouched, and a ``(mean, sigma)`` tuple when there is a sigma
+        to report. LightningTrainer._flatten_predictions handles both.
+        """
+        mean, log_variance = self._split_head_output(self.forward(batch))
+        if log_variance is None:
+            return self.inverse_transform_targets(mean)
+        sigma = torch.exp(0.5 * log_variance)
+        # Order matters: the sigma inversion reads the STANDARDIZED mean, so it has to be computed
+        # before `mean` is overwritten with the inverted one.
+        return (
+            self.inverse_transform_targets(mean),
+            self.inverse_transform_sigma(sigma, mean),
+        )
 
     # --- epoch metrics -----------------------------------------------------
     # R2 and the prediction/target standard-deviation ratio are the two numbers that say whether a
@@ -337,6 +413,39 @@ class SoilRegressionLightningBase(LightningModule):
             # Mirrors LogTransformer in yg_eo_soilnet.utils: forward is 10 * log1p(y).
             predictions = torch.expm1(predictions / 10.0)
         return predictions
+
+    def inverse_transform_sigma(self, sigma, predictions):
+        """Map a standardized predictive sigma back to the target's original units.
+
+        ``predictions`` must be the STANDARDIZED mean - the same tensor that goes into
+        ``inverse_transform_targets``, not its output.
+
+        Two steps, and only the first is the one people expect:
+
+        1. Un-standardize. Scaling is linear, so the sigma scales with it: ``sigma * target_scale``.
+
+        2. Undo log1p. This one is NOT linear, so there is no single factor that maps a standard
+           deviation across it - the transform stretches the axis by a different amount at every
+           point. The delta method takes the local slope: the forward transform is
+           ``z = 10 * log1p(y)``, so ``y = expm1(z / 10)`` and ``dy/dz = exp(z / 10) / 10``,
+           evaluated at this row's own predicted ``z``.
+
+        The consequence worth stating: on a log1p target the returned sigma is asymmetric in
+        substance even though it is reported as one number, and it grows with the prediction. A
+        version of this that reused ``inverse_transform_targets`` on the sigma - the obvious
+        shortcut - would produce a number in no units at all, and nothing downstream would catch it
+        because it would still be positive and roughly the right magnitude.
+        """
+        if bool(self.targets_are_standardized):
+            scale = self.target_scale.to(sigma.device)
+            sigma = sigma * scale
+            transformed = predictions * scale + self.target_mean.to(predictions.device)
+        else:
+            transformed = predictions
+
+        if bool(self.targets_are_log1p):
+            sigma = sigma * torch.exp(transformed / 10.0) / 10.0
+        return sigma
 
     def configure_optimizers(self):
         if self.optimizer_name in {"adamw", "adam_w"}:

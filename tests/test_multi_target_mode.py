@@ -392,7 +392,7 @@ def _quiet_logger(monkeypatch, logger):
     monkeypatch.setattr("yg_eo_soilnet.artifacts.mlflow.log_artifact", MagicMock())
     for name in ("_log_plots", "_log_shap_artifacts", "_write_json_artifact", "_log_table_artifact",
                  "_write_split_summary", "_log_split_summary", "_promote_champion", "_log_cv_results",
-                 "_log_checkpoint", "_tag_model_logging", "_log_lightning_pred_obs_artifact"):
+                 "_log_checkpoint", "_tag_model_logging", "_log_pred_obs_artifact"):
         monkeypatch.setattr(logger, name, MagicMock(), raising=False)
     return logger
 
