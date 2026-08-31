@@ -211,6 +211,7 @@ class FakeSequenceDataModule:
         self.temporal_enabled = True
         self.target_mean_ = np.array([2.0])
         self.target_scale_ = np.array([0.5])
+        self.target_covariance_ = np.array([[1.0, 0.4], [0.4, 1.0]])
         self.target_transform = "log1p"
 
     def setup(self, stage=None):
@@ -355,6 +356,28 @@ def test_grid_years_is_injected_only_into_models_that_accept_it() -> None:
     assert grid_free_model.kwargs["static_dim"] == 3
     assert grid_free_model.kwargs["target_mean"] == [2.0]
     assert grid_free_model.kwargs["target_transform"] == "log1p"
+
+
+def test_target_covariance_is_injected_only_into_models_that_accept_it() -> None:
+    """The structure-aware losses need the training targets' correlation, and only the datamodule
+    has seen the whole training split. It travels the same route as target_mean/target_scale, and
+    like them must reach hyper_parameters as plain floats rather than a numpy array."""
+    factory = _factory({})
+    datamodule = FakeGridDataModule(sequence_bundle={})
+
+    model = factory._build_model(
+        {"import_path": f"{__name__}.FakeModel", "init_args": {}}, datamodule
+    )
+    covariance = model.kwargs["target_covariance"]
+    assert covariance == [[1.0, 0.4], [0.4, 1.0]]
+    assert all(isinstance(value, float) for row in covariance for value in row)
+
+    # A model whose signature does not declare it - SoilGraphLightningModule, in production - is
+    # left alone rather than failing on an unexpected keyword.
+    grid_free_model = factory._build_model(
+        {"import_path": f"{__name__}.FakeGridFreeModel", "init_args": {}}, datamodule
+    )
+    assert "target_covariance" not in grid_free_model.kwargs
 
 
 def test_a_model_taking_kwargs_still_receives_everything() -> None:

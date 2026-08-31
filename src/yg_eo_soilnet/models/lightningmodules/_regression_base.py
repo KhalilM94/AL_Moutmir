@@ -13,9 +13,14 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 import torch
-from torch import nn
 
 from lightning.pytorch import LightningModule
+
+from yg_eo_soilnet.models.lightningmodules.losses import (
+    STRUCTURAL_LOSSES,
+    build_loss_fn,
+    inverse_transform_targets,
+)
 
 
 def batch_get(batch: Any, key: str, default=None):
@@ -39,6 +44,16 @@ def as_float_list(value: Any) -> Optional[list[float]]:
     return [float(item) for item in torch.as_tensor(value, dtype=torch.float32).flatten().tolist()]
 
 
+def as_float_matrix(value: Any) -> Optional[list[list[float]]]:
+    """``as_float_list`` for a 2-D statistic, keeping its rows. Same pickle-safety reason."""
+    if value is None:
+        return None
+    rows = torch.as_tensor(value, dtype=torch.float32)
+    if rows.ndim != 2:
+        raise ValueError(f"Expected a 2-D matrix; got shape {tuple(rows.shape)}.")
+    return [[float(item) for item in row] for row in rows.tolist()]
+
+
 class SoilRegressionLightningBase(LightningModule):
     """Loss, target inversion, steps, metrics and optimizer for a soil regression head."""
 
@@ -51,6 +66,14 @@ class SoilRegressionLightningBase(LightningModule):
         target_transform: Optional[str],
         loss_name: str,
         huber_delta: float,
+        # --- structure-aware losses (see lightningmodules/losses.py) -----------------------
+        # Inert unless loss_name is one of mahalanobis / correlation_penalty / cosine.
+        loss_base: str = "mse",
+        loss_lambda: float = 0.1,
+        loss_shrinkage: float = 0.05,
+        loss_min_batch: int = 16,
+        cosine_space: str = "original",
+        target_covariance: Optional[Any] = None,
         learning_rate: float,
         optimizer_name: str,
         weight_decay: float,
@@ -131,19 +154,42 @@ class SoilRegressionLightningBase(LightningModule):
         # early stopping, checkpoint selection and the LR scheduler.
         self.loss_name = str(loss_name).lower()
         self.huber_delta = float(huber_delta)
-        self.loss_fn = self._build_loss_fn(self.loss_name, self.huber_delta)
+        # A structural loss would be SILENTLY IGNORED on a variance head: _shared_step routes to
+        # beta-NLL whenever the readout emits a log variance and never consults self.loss_fn. Refuse
+        # here rather than let a run report a mahalanobis loss_name it never optimized.
+        if self.predict_variance and self.loss_name in STRUCTURAL_LOSSES:
+            raise ValueError(
+                f"loss_name '{self.loss_name}' cannot be combined with a heteroscedastic head: "
+                f"predict_variance replaces the point loss with beta-NLL. Set "
+                f"uncertainty.heteroscedastic to false, or use a point loss."
+            )
+        # An nn.Module assigned here becomes a submodule, so the loss's own buffers - the whitening
+        # matrix, the reference correlation - follow the model onto the accelerator.
+        self.loss_fn = self._build_loss_fn(
+            self.loss_name,
+            self.huber_delta,
+            loss_base=loss_base,
+            loss_lambda=loss_lambda,
+            loss_shrinkage=loss_shrinkage,
+            loss_min_batch=loss_min_batch,
+            cosine_space=cosine_space,
+            target_dim=self.target_dim,
+            target_covariance=target_covariance,
+            target_mean=target_mean,
+            target_scale=target_scale,
+            target_transform=self.target_transform,
+        )
         # stage -> {"n": float, and one length-target_dim float64 tensor per running sum}
         self._metric_state: dict[str, dict[str, Any]] = {}
 
     @staticmethod
-    def _build_loss_fn(loss_name: str, huber_delta: float):
-        if loss_name in {"mse", "l2"}:
-            return nn.MSELoss()
-        if loss_name == "huber":
-            return nn.HuberLoss(delta=huber_delta)
-        if loss_name in {"smooth_l1", "smoothl1"}:
-            return nn.SmoothL1Loss(beta=huber_delta)
-        raise ValueError(f"Unknown loss_name '{loss_name}'; expected one of mse, huber, smooth_l1")
+    def _build_loss_fn(loss_name: str, huber_delta: float, **kwargs):
+        """The objective named by ``loss_name``; see ``lightningmodules.losses.build_loss_fn``.
+
+        Kept as a method so the two-argument call every existing caller and test makes still selects
+        the point losses exactly as it did.
+        """
+        return build_loss_fn(loss_name, huber_delta=huber_delta, **kwargs)
 
     # --- steps -------------------------------------------------------------
 
@@ -204,14 +250,26 @@ class SoilRegressionLightningBase(LightningModule):
         # The real sample count, not 1: Lightning weights the epoch mean by batch_size, so a constant
         # 1 makes the trailing partial batch count as much as a full one. This metric drives early
         # stopping, checkpoint selection and the LR scheduler.
+        batch_size = int(targets.shape[0]) if targets.ndim else 1
         self.log(
             f"{stage}_loss",
             loss,
-            batch_size=int(targets.shape[0]) if targets.ndim else 1,
+            batch_size=batch_size,
             prog_bar=stage != "train",
             on_step=False,
             on_epoch=True,
         )
+        # A composite loss reports its two halves separately. Without them there is no way to tell a
+        # lambda that is doing nothing from one that has swamped the accuracy term - both look like
+        # a single number that went down.
+        for name, value in getattr(self.loss_fn, "last_components", {}).items():
+            self.log(
+                f"{stage}_loss_{name}",
+                value,
+                batch_size=batch_size,
+                on_step=False,
+                on_epoch=True,
+            )
         self._accumulate_metrics(stage, predictions.detach(), targets.detach())
         return loss
 
@@ -403,16 +461,17 @@ class SoilRegressionLightningBase(LightningModule):
 
         Un-standardize first, then undo log1p: the datamodule fits the standardization stats on
         already-transformed targets, so the two must be inverted in the opposite order.
+
+        The arithmetic lives in ``losses.inverse_transform_targets`` because CosineStructureLoss
+        needs the same inversion and must not reach back into the module that owns it.
         """
-        if bool(self.targets_are_standardized):
-            predictions = (
-                predictions * self.target_scale.to(predictions.device)
-                + self.target_mean.to(predictions.device)
-            )
-        if bool(self.targets_are_log1p):
-            # Mirrors LogTransformer in yg_eo_soilnet.utils: forward is 10 * log1p(y).
-            predictions = torch.expm1(predictions / 10.0)
-        return predictions
+        return inverse_transform_targets(
+            predictions,
+            mean=self.target_mean,
+            scale=self.target_scale,
+            standardized=bool(self.targets_are_standardized),
+            log1p=bool(self.targets_are_log1p),
+        )
 
     def inverse_transform_sigma(self, sigma, predictions):
         """Map a standardized predictive sigma back to the target's original units.

@@ -21,6 +21,7 @@ from yg_eo_soilnet.tracking import (
 from yg_eo_soilnet.targets import join_target_names, resolve_target_groups
 import mlflow
 import datetime
+import logging
 import time
 import shutil
 import re
@@ -313,8 +314,15 @@ def main():
     # Before this run's own runs start, so the sweep cannot see them. Runs abandoned by a dead
     # process sit at RUNNING forever - an OOM kill is a SIGKILL, so nothing in the killed process
     # gets the chance to mark them. Ctrl-C and `kill` ARE catchable, hence the handlers too.
-    install_run_signal_handlers()
-    close_stale_runs(experiment_name)
+    #
+    # Both take a logger, and both used to be called without one - so the sweep did its work in
+    # complete silence. That is the whole diagnostic: an abandoned run is the one visible trace an
+    # OOM kill leaves behind, and without this message the previous run just looks stuck. The
+    # trainer's own logger does not exist yet (it is built inside the run below, and this has to
+    # happen first), so a module logger stands in.
+    startup_logger = logging.getLogger(__name__)
+    install_run_signal_handlers(startup_logger)
+    close_stale_runs(experiment_name, startup_logger)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"Run_{timestamp}"

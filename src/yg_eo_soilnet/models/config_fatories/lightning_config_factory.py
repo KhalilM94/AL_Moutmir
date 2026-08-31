@@ -354,6 +354,16 @@ class LightningConfigFactory:
         # invert it. Propagating it here keeps the two from ever disagreeing.
         if init_args.get("target_transform") in (None, "auto"):
             offer("target_transform", getattr(datamodule, "target_transform", None))
+        # Correlation structure of the training targets, for the structure-aware losses. Offered on
+        # the same terms as the statistics above and for the same reason - only the datamodule has
+        # seen the whole training split - and as a nested list of plain floats for the same
+        # weights_only=True reason.
+        covariance = getattr(datamodule, "target_covariance_", None)
+        if covariance is not None and init_args.get("target_covariance") in (None, "auto"):
+            offer(
+                "target_covariance",
+                [[float(value) for value in row] for row in np.asarray(covariance)],
+            )
 
         # Heteroscedastic head, from the run's uncertainty block. Offered rather than set, so an
         # architecture that does not implement it - SoilGraphLightningModule keeps its own copy of

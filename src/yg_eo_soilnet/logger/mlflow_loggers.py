@@ -1087,15 +1087,11 @@ class ChildRunLogger:
         model_info = mlflow.sklearn.log_model(sk_model=best_model,  # type: ignore
                                      signature=signature,
                                      name=logged_model_name,
-                                     # Enters the registry under the same stable name, so
-                                     # versions accumulate per target+model and deployment can
-                                     # reference models:/<name>/<version> rather than a
-                                     # run-scoped URI.
-                                     registered_model_name=(
-                                         logged_model_name
-                                         if bool(getattr(config, "MLFLOW_REGISTER_MODELS", True))
-                                         else None
-                                     ),
+                                     # Deliberately NOT registered here. The artifact is written
+                                     # now because the signature needs test_predictions, but the
+                                     # registry entry is created after the metrics exist - see
+                                     # _register_sklearn_model below.
+                                     registered_model_name=None,
                                      input_example=X_test[:5],
                                      skops_trusted_types=[
                                          "numpy.dtype",
@@ -1147,13 +1143,11 @@ class ChildRunLogger:
         # deliberately NOT logged any more: they meant a positive CV RMSE here and a negative
         # -test_loss on the Lightning side, under one name and on one leaderboard axis.
         model_metrics = dict(cv_rmse_from_search(cv_results, search.best_index_))
-        # One diagnostic number that costs a full pass over the TRAINING set - here 4809 rows
-        # against 865 for the test set, so most of the post-fit inference for one target. Cheap for
-        # a tree, minutes for an in-context model like TabICL, which is why it is switchable.
-        # 2-D under a joint fit; r2_score averages the outputs, which is the same convention the
-        # per-target r2_test mean uses.
-        if bool(getattr(config, "LOG_TRAIN_FIT_METRIC", True)):
-            model_metrics["r2_train_fit"] = float(r2_score(y_train, best_model.predict(X_train)))
+        # r2_train_fit is NOT computed here any more. It costs a full pass over the TRAINING set,
+        # which is the single largest allocation in this function, and it used to sit ahead of every
+        # artifact - so an OOM kill during it lost the metrics, the plots and the run summary that
+        # were all already computable. It now runs last, after everything durable is written. See
+        # the block below _log_per_target_runs.
         model_metrics.update(
             self._per_target_metrics(eval_df, target, model_name, alpha=_uncertainty_alpha(config))
         )
@@ -1165,9 +1159,15 @@ class ChildRunLogger:
             artifact_path=ArtifactLayout.EVAL_RESULTS,
         )
 
+        # Registration happens HERE, not at log_model above, and the ordering is the point: the
+        # model is in the registry only once this run has produced the metrics that justify it.
+        # Registering at log_model time meant every run killed partway through minted a READY
+        # version backed by a RUNNING run with no rmse_test - four of them accumulated that way
+        # before this was noticed, and promote_if_better would have refused all of them anyway.
+        registered_version = self._register_sklearn_model(config, model_info, logged_model_name)
+
         champion = self._promote_champion(
-            target, model_name, model_metrics,
-            getattr(model_info, "registered_model_version", None),
+            target, model_name, model_metrics, registered_version,
         )
 
         # Predictions for EVERY point, not just the holdout. Written on the model run because that
@@ -1216,18 +1216,26 @@ class ChildRunLogger:
             # above draws one too, but from a frame it rebuilds out of the target and prediction
             # columns alone - so its copy has no bars however many uncertainty columns the run
             # produced. See _log_pred_obs_artifact.
-            self._log_pred_obs_artifact(
-                frame,
-                target=target_name,
-                model_name=model_name,
-                artifact_path=ArtifactLayout.plots_path(),
-                interval_label=describe_interval(
-                    ensemble.calibrators.get(target_name) if ensemble else None
-                ),
-            )
+            # Guarded for the same reason the Lightning path guards its copy: a plotting backend
+            # failure is not a reason to lose the split summary and run_summary.json written below
+            # it. Unguarded, one bad figure discarded everything after this line.
+            try:
+                self._log_pred_obs_artifact(
+                    frame,
+                    target=target_name,
+                    model_name=model_name,
+                    artifact_path=ArtifactLayout.plots_path(),
+                    interval_label=describe_interval(
+                        ensemble.calibrators.get(target_name) if ensemble else None
+                    ),
+                )
 
-            # --- Test Plots ---
-            self._log_plots(plot_functions, target_name, model_name)
+                # --- Test Plots ---
+                self._log_plots(plot_functions, target_name, model_name)
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    f"Plots failed for {target_name}/{model_name}: {type(exc).__name__}: {exc}"
+                )
 
             # --- Uncertainty diagnostics ---
             uncertainty_summary = self._log_uncertainty_artifacts(
@@ -1268,7 +1276,7 @@ class ChildRunLogger:
                     "best_params": {str(key): str(value) for key, value in search.best_params_.items()},
                     "logged_model_name": logged_model_name,
                     "logged_model_uri": getattr(model_info, "model_uri", None),
-                    "registered_model_version": getattr(model_info, "registered_model_version", None),
+                    "registered_model_version": registered_version,
                     "champion": champion,
                     "explain": explain_summary,
                     "uncertainty": uncertainty_summary,
@@ -1280,6 +1288,86 @@ class ChildRunLogger:
             return explain_summary
 
         self._log_per_target_runs(eval_df, target, model_name, log_one)
+
+        # --- The train-fit diagnostic, LAST ---
+        # One number - R2 of the fitted model against its own training split - that costs a full
+        # prediction pass over the LARGER of the two splits. Free for a tree; for an in-context
+        # model like TabICL at 213 features it is the biggest allocation the run makes, and on
+        # 2026-08-29 the kernel's OOM killer took the process here, discarding the metrics, plots
+        # and summaries that were all already computable. Two rules follow from that:
+        #   * it runs after everything durable is written, so a kill here costs only this number;
+        #   * it is guarded, so a MemoryError does not fail a run that is otherwise complete.
+        # It is logged as an MLflow metric but is deliberately absent from meta/run_summary.json,
+        # which is written above - nothing reads it from there, and computing it earlier just to
+        # populate that field would undo the ordering this block exists for.
+        self._log_train_fit_metric(config, model_name, best_model, X_train, y_train)
+
+    def _log_train_fit_metric(self, config, model_name, best_model, X_train, y_train) -> None:
+        """Log r2_train_fit, unless this model is too expensive to ask. Never raises."""
+        if not bool(getattr(config, "LOG_TRAIN_FIT_METRIC", True)):
+            return
+        # Same shape as EXPLAIN_SKIP_MODELS, and for the same reason: the cost of this pass is a
+        # property of the estimator, not of a row or evaluation budget, so it can only be declined
+        # by name. An in-context model pays for it in full checkpoint inference.
+        if model_name in list(getattr(config, "LOG_TRAIN_FIT_METRIC_SKIP_MODELS", None) or []):
+            return
+        try:
+            # 2-D under a joint fit; r2_score averages the outputs, which is the same convention
+            # the per-target r2_test mean uses.
+            value = float(r2_score(y_train, best_model.predict(X_train)))
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                f"r2_train_fit failed for {model_name}: {type(exc).__name__}: {exc}. "
+                "The run is otherwise complete; this is a diagnostic, not a result."
+            )
+            return
+        self._log_metric_dict({"r2_train_fit": value})
+
+    def _register_sklearn_model(self, config, model_info, logged_model_name):
+        """Enter an already-logged model into the registry. Returns the version, or None.
+
+        Split out of ``log_model`` so registration happens only after this run has produced its
+        metrics - see the caller. The stable name is what lets deployment reference
+        ``models:/<name>/<version>`` rather than a run-scoped URI, and is also why versions
+        accumulate one per run for a given target+model.
+
+        Follows the same rule the Lightning path has had since b9368a1 - record the outcome on the
+        run, escalate only under ``FAIL_ON_MODEL_ERROR`` - but tags it separately from
+        :meth:`_tag_model_logging`. That helper means "this run has no servable model", which is a
+        different and worse thing than what can go wrong here: by this point log_model has already
+        succeeded, so the model IS servable and only its registry entry is missing.
+        """
+        if not bool(getattr(config, "MLFLOW_REGISTER_MODELS", True)):
+            return None
+        model_uri = getattr(model_info, "model_uri", None)
+        if model_uri is None:
+            return None
+        try:
+            version = mlflow.register_model(model_uri, logged_model_name).version
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            try:
+                # Truncated for the same reason _tag_model_logging truncates: MLflow rejects very
+                # long tag values. Tagging is a diagnostic and must not take the run down with it.
+                mlflow.set_tags({
+                    "model_registered": "false",
+                    "model_registration_error": error[:450],
+                })
+            except Exception:
+                pass
+            if bool(getattr(config, "FAIL_ON_MODEL_ERROR", False)):
+                raise
+            logging.getLogger(__name__).warning(
+                "Registration FAILED for %s: the model is logged and servable at %s, but is NOT "
+                "in the registry, so models:/%s/<version> will not resolve to it. %s",
+                logged_model_name, model_uri, logged_model_name, error,
+            )
+            return None
+        try:
+            mlflow.set_tags({"model_registered": "true"})
+        except Exception:
+            pass
+        return version
 
     @staticmethod
     def _build_sklearn_evaluation_frame(predictions, X_test, y_test, target_names, model_name):

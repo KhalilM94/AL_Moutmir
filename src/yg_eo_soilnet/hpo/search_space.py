@@ -31,7 +31,10 @@ DEFAULT_OBJECTIVE_DIRECTION = "maximize"
 KNOWN_METRICS = frozenset(
     f"{stage}_{name}"
     for stage in ("train", "val", "test")
-    for name in ("loss", "r2", "pred_std_ratio")
+    # loss_base/loss_penalty are the two halves a composite loss reports separately - they are
+    # logged only when loss_name is correlation_penalty or cosine, so an objective naming one is
+    # valid but will find nothing under any other loss.
+    for name in ("loss", "loss_base", "loss_penalty", "r2", "pred_std_ratio")
 )
 
 _SPACE_KEYS = {"objective", "sampler", "pruner", "fixed", "params", "derive"}

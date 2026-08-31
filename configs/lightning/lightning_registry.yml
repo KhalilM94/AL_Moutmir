@@ -113,8 +113,50 @@ soil_cnn:
     head_norm_final: false              # true restores LayerNorm on the block feeding the readout
     dropout: 0.2                        # one knob: static encoder, every conv block, AND the head
 
-    loss_name: mse                      # mse | huber | smooth_l1
-    huber_delta: 1.0
+    # --- loss ---------------------------------------------------------------------------------
+    # mse | huber | smooth_l1 | mahalanobis | correlation_penalty | cosine
+    #
+    # NOT every key below applies to every loss. build_loss_fn dispatches on loss_name and each
+    # branch reads only its own subset; the rest are inert, and nothing reads or warns about them.
+    # Sweeping an inert key produces identical runs that still record the swept value in MLflow -
+    # tuning loss_lambda under mahalanobis is the easy version of that mistake.
+    #
+    #   loss_name            keys it actually reads
+    #   -------------------  ------------------------------------------------------------------
+    #   mse                  (none)
+    #   huber | smooth_l1    huber_delta
+    #   mahalanobis          loss_shrinkage
+    #   correlation_penalty  loss_base (+ huber_delta if that base is huber/smooth_l1),
+    #                        loss_lambda, loss_min_batch
+    #   cosine               loss_base (+ huber_delta likewise), loss_lambda, cosine_space
+    #
+    # mahalanobis and correlation_penalty additionally read target_covariance, which is fitted on
+    # the train split and injected by the factory - it is deliberately not settable here.
+    #
+    # The last three read ACROSS targets and need at least two of them, so they require
+    # MULTI_TARGET_MODE: joint in configs/data_spec.yml and refuse to build otherwise. They score
+    # whether a predicted COMBINATION is plausible, which a per-element loss cannot see: predicting
+    # high CEC with low organic matter costs the same as a plausible pair under mse.
+    #   mahalanobis          whitened MSE - errors weighted by the inverse target covariance,
+    #                        fitted on the train split and injected by the factory. Reduces exactly
+    #                        to mse when the targets are uncorrelated, so val_loss stays comparable.
+    #   correlation_penalty  loss_base + loss_lambda * (predicted correlation - training
+    #                        correlation)^2, averaged over target pairs. A BATCH statistic: needs
+    #                        batch_size well above loss_min_batch to mean anything.
+    #   cosine               loss_base + loss_lambda * (1 - cos(prediction, target)). Per-row, so
+    #                        it works at any batch size. Penalizes the RATIOS between targets.
+    loss_name: mahalanobis
+    huber_delta: 1.0                    # huber/smooth_l1: the Huber delta / SmoothL1 beta
+    loss_base: mse                      # correlation_penalty, cosine: the accuracy term
+    loss_lambda: 0.1                    # correlation_penalty, cosine: weight on the structural term
+    loss_shrinkage: 0.05                # mahalanobis: ridge toward I before inverting Sigma
+    loss_min_batch: 16                  # correlation_penalty: below this it falls back to loss_base
+    # cosine only. original | standardized. `original` inverts log1p and standardization first, so
+    # the angle is between vectors of positive physical quantities and 1 - cos is the ratio
+    # distortion the soil chemistry constrains - but cos then sits near 1, so loss_lambda has to be
+    # larger. `standardized` measures between z-scores instead: the SHAPE of the joint anomaly,
+    # not a ratio.
+    cosine_space: original
     learning_rate: 0.00017098640419999995
     temporal_enabled: true
     optimizer_name: adamw
@@ -186,8 +228,16 @@ soil_sequence:
     # can move from the target mean.
     fusion_norm_type: batch
 
-    loss_name: mse                       # mse | huber | smooth_l1
+    # mse | huber | smooth_l1 | mahalanobis | correlation_penalty | cosine
+    # The last three need MULTI_TARGET_MODE: joint. See the soil_cnn entry for what each loss does
+    # and - importantly - which of the keys below it actually reads; the others are inert.
+    loss_name: mse
     huber_delta: 1.0
+    loss_base: mse
+    loss_lambda: 0.1
+    loss_shrinkage: 0.05
+    loss_min_batch: 16
+    cosine_space: original
     learning_rate: 0.01
     temporal_enabled: true
     optimizer_name: adamw
@@ -228,8 +278,16 @@ soil_tabular:
     activation: relu                     # relu | gelu
     use_layer_norm: true
 
+    # mse | huber | smooth_l1 | mahalanobis | correlation_penalty | cosine
+    # The last three need MULTI_TARGET_MODE: joint. See the soil_cnn entry for what each loss does
+    # and - importantly - which of the keys below it actually reads; the others are inert.
     loss_name: mse
     huber_delta: 1.0
+    loss_base: mse
+    loss_lambda: 0.1
+    loss_shrinkage: 0.05
+    loss_min_batch: 16
+    cosine_space: original
     learning_rate: 0.001
     optimizer_name: adamw
     weight_decay: 0.0001

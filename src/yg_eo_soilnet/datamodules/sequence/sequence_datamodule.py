@@ -119,6 +119,10 @@ class SoilSequenceDataModule(LightningDataModule):
         self.sequence_scale_: dict[str, np.ndarray] = {}
         self.target_mean_: Optional[np.ndarray] = None
         self.target_scale_: Optional[np.ndarray] = None
+        # Covariance of the STANDARDIZED training targets, i.e. their correlation matrix. Fitted
+        # here rather than derived by the model because this is the only place holding the whole
+        # training split at once; the config factory offers it to whichever loss wants it.
+        self.target_covariance_: Optional[np.ndarray] = None
         # Lab-value statistics, train-only for the same reason as everything above. The median is
         # kept separately from the mean because it is the FILL value, not a centring constant: a
         # skewed column's mean sits somewhere no sample actually is.
@@ -384,6 +388,17 @@ class SoilSequenceDataModule(LightningDataModule):
             train_targets = self._apply_target_transform(self._finite(targets[indices]))
             self.target_mean_ = train_targets.mean(axis=0).astype(np.float32)
             self.target_scale_ = self._safe_scale(train_targets.std(axis=0))
+            # In the SAME space the loss runs in, which is what makes this usable as-is: the loss
+            # never sees raw units, so a covariance fitted on raw units would describe a different
+            # geometry than the one the errors live in. Standardizing first also means the diagonal
+            # comes out at 1 and this IS the correlation matrix.
+            #
+            # ddof=0 to match np.std above; ddof=1 would put n/(n-1) on the diagonal instead of 1.
+            if indices.size > 1 and train_targets.shape[1] > 1:
+                standardized = (train_targets - self.target_mean_) / self.target_scale_
+                self.target_covariance_ = np.atleast_2d(
+                    np.cov(standardized, rowvar=False, ddof=0)
+                ).astype(np.float64)
 
         label_features = np.asarray(self.sequence_bundle.label_features)
         if label_features.size:

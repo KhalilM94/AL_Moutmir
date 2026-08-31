@@ -225,7 +225,16 @@ def start_child_run(run_name: str, tags: dict | None = None):
     told apart from an abandoned one by :func:`close_stale_runs`.
     """
     run = mlflow.start_run(run_name=run_name, nested=mlflow.active_run() is not None)
-    mlflow.set_tags({**run_owner_tags(), **(tags or {})})
+    try:
+        mlflow.set_tags({**run_owner_tags(), **(tags or {})})
+    except Exception:
+        # start_run has already pushed this run onto MLflow's active-run stack, but the ActiveRun
+        # never reaches the caller's `with`, so nothing would ever pop it. That matters more than it
+        # looks: mlflow.end_run() pops the TOP of the stack rather than a named run, so one leaked
+        # entry makes the PARENT's `with` close the orphan instead of itself - and the parent then
+        # sits at RUNNING forever. Pop it here, then let the caller see the failure.
+        mlflow.end_run("FAILED")
+        raise
     return run
 
 

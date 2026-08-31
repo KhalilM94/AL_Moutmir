@@ -41,6 +41,10 @@ FACTORY_RESOLVED_MODEL_KEYS = frozenset(
         "target_mean",
         "target_scale",
         "target_transform",
+        # Fitted on the train split by the datamodule, like target_mean/target_scale. `loss_lambda`,
+        # `loss_shrinkage` and `loss_name` are deliberately absent - those are genuine search
+        # dimensions; only the data-derived matrix is refused.
+        "target_covariance",
     }
 )
 

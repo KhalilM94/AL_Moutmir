@@ -7,6 +7,7 @@ import torch
 from yg_eo_soilnet.models.lightningmodules._regression_base import (
     SoilRegressionLightningBase,
     as_float_list,
+    as_float_matrix,
     batch_get,
 )
 from yg_eo_soilnet.models.lightningmodules.mlp import build_mlp_stack
@@ -47,6 +48,16 @@ class SoilTabularLightningModule(SoilRegressionLightningBase):
         use_layer_norm: bool = True,
         loss_name: str = "mse",
         huber_delta: float = 1.0,
+        # --- structure-aware losses ---------------------------------------------------------
+        # Inert unless loss_name is mahalanobis / correlation_penalty / cosine; see
+        # lightningmodules/losses.py. target_covariance is injected by LightningConfigFactory
+        # from the datamodule's training split, exactly as target_mean/target_scale are.
+        loss_base: str = "mse",
+        loss_lambda: float = 0.1,
+        loss_shrinkage: float = 0.05,
+        loss_min_batch: int = 16,
+        cosine_space: str = "original",
+        target_covariance: Optional[Any] = None,
         learning_rate: float = 1e-3,
         optimizer_name: str = "adamw",
         weight_decay: float = 1e-4,
@@ -69,6 +80,7 @@ class SoilTabularLightningModule(SoilRegressionLightningBase):
         # weights_only=True default (PyTorch >= 2.6).
         target_mean = as_float_list(target_mean)
         target_scale = as_float_list(target_scale)
+        target_covariance = as_float_matrix(target_covariance)
         head_hidden_dims = [int(width) for width in head_hidden_dims]
         static_hidden_dims = [int(width) for width in static_hidden_dims]
         categorical_cardinalities = [int(value) for value in (categorical_cardinalities or [])]
@@ -88,6 +100,12 @@ class SoilTabularLightningModule(SoilRegressionLightningBase):
             beta_nll=beta_nll,
             loss_name=loss_name,
             huber_delta=huber_delta,
+            loss_base=loss_base,
+            loss_lambda=loss_lambda,
+            loss_shrinkage=loss_shrinkage,
+            loss_min_batch=loss_min_batch,
+            cosine_space=cosine_space,
+            target_covariance=target_covariance,
             learning_rate=learning_rate,
             optimizer_name=optimizer_name,
             weight_decay=weight_decay,

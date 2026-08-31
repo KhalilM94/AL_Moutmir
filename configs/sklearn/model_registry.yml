@@ -42,7 +42,7 @@ GradientBoosting:
     # model__max_depth: [5, 13, 21]
 
 XGBoost:
-  enabled: false
+  enabled: fale
   modeltype: "ml"
   import_path: xgboost.XGBRegressor
   # XGBoost fits a 2-D y since 1.6. multi_strategy picks how: one_output_per_tree builds a separate
@@ -67,7 +67,7 @@ XGBoost:
 TabICL:
   # Pretrained tabular foundation model: fit() does in-context learning, it does not train weights.
   # First fit downloads tabicl-regressor-v2-*.ckpt from the HuggingFace hub.
-  enabled: true
+  enabled: false
   modeltype: "ml"
   import_path: tabicl.TabICLRegressor
   # Each worker loads the full checkpoint, so the default -1 would fan that out over every CV fold
@@ -79,15 +79,22 @@ TabICL:
   # ensemble member. `offload_mode: auto` picks a home for it based on free memory, and on a small
   # GPU it spills to host RAM - a run on a 4 GB card and 15 GB of RAM was OOM-killed by the kernel
   # partway through its first target, twice, with 13.4 GB of shmem resident.
-  # If that happens, in rough order of effect: lower `batch_size` (8 -> 2), set
-  # `offload_mode: "disk"` with a `disk_offload_dir`, lower `n_estimators`, or cut the feature
-  # count. Left at the defaults here because changing them changes the fitted model.
+  #
+  # It happened again on 2026-08-29 (Run_20260829_191648), and the feature count is why: the run
+  # before it fit 4538x26 and finished clean, this one fit 4896x213 and the kernel took it with
+  # 11.2 GB of shmem resident and 39 GB of virtual address space. The settings below are the
+  # response, in the order of effect this comment has always recommended.
+  #
+  # `n_estimators` is deliberately NOT lowered. It is the bigger memory win and much faster, but
+  # it changes the fitted ensemble, so the scores would stop being comparable to registry versions
+  # 5-7 of organic_matter_g_kg_TabICL. It is the next lever if disk offload plus batch_size: 2
+  # still is not enough; after that, cut the feature count.
   init_args:
     n_estimators: 8      # ensemble members; lower is faster, 4 is usually enough to compare
     device: "cuda"     # default None auto-detects
-    # batch_size: 8      # lower if the first fit runs out of memory
-    # offload_mode: "cpu"   # or "disk" with disk_offload_dir, when host RAM is the constraint
-    # disk_offload_dir: "/tmp/tabicl_offload"
+    # batch_size: 2        # 8 OOMs at 213 features; the tensor scales linearly in this
+    offload_mode: "disk"   # host RAM is the constraint here, not the 4 GB of VRAM
+    disk_offload_dir: "/tmp/tabicl_offload"
   # Deliberately empty: TabICL is designed to need no tuning, and every grid point is a full
   # checkpoint inference pass. GridSearchCV still cross-validates the single default config.
   params: {}

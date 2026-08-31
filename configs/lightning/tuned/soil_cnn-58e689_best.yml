@@ -103,8 +103,13 @@ soil_cnn:
     - 256
     - 128
     head_norm_final: true
-    dropout: 0.0
+    dropout: 0.3
     loss_name: mse
+    loss_base: mse
+    loss_lambda: 0.1
+    cosine_space: standardized
+    loss_min_batch: 16 
+    # loss_shrinkage: 0.05
     huber_delta: 1.0
     learning_rate: 0.00010038360509669296
     temporal_enabled: true

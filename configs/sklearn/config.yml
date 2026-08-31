@@ -8,6 +8,11 @@ MAX_FEATURE_DROP_RATIO_WARNING: 0.9
 # a tree and minutes per target for an in-context model like TabICL. Turn it off when fitting slow
 # estimators; every other metric is unaffected.
 LOG_TRAIN_FIT_METRIC: true
+# Per-model opt-out, so the diagnostic stays on for the cheap estimators instead of being turned off
+# globally to accommodate one expensive one. TabICL is listed because this pass is the largest
+# allocation its run makes: on 2026-08-29 the kernel's OOM killer took the process during exactly
+# this step, at 213 features. Same shape and same reasoning as EXPLAIN_SKIP_MODELS.
+LOG_TRAIN_FIT_METRIC_SKIP_MODELS: ["TabICL"]
 
 CLUSTERING_STRATEGY:
   enabled: false

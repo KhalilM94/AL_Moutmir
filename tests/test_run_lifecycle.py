@@ -138,6 +138,31 @@ def test_a_child_run_nests_under_a_parent_but_stands_alone_without_one() -> None
     assert client.get_run(child_id).data.tags["mlflow.parentRunId"] == parent.info.run_id
 
 
+def test_a_child_that_fails_to_tag_does_not_strand_its_parent(monkeypatch) -> None:
+    """start_run pushes onto the active-run stack; the caller's `with` is what pops it.
+
+    If set_tags raises in between, the ActiveRun never reaches a `with` and nothing pops it. That
+    is worse than one lost child: mlflow.end_run() pops the TOP of the stack rather than a named
+    run, so the parent's own `with` would close the orphan and leave the PARENT at RUNNING forever
+    - which is exactly the "parent run never ends" symptom, reachable with no OOM involved.
+    """
+    import mlflow
+
+    with mlflow.start_run(run_name="parent") as parent:
+        monkeypatch.setattr(
+            mlflow, "set_tags", MagicMock(side_effect=RuntimeError("tracking store down"))
+        )
+        with pytest.raises(RuntimeError):
+            start_child_run("doomed")
+        monkeypatch.undo()
+
+        # The parent, not the orphan, is what is active again.
+        assert mlflow.active_run().info.run_id == parent.info.run_id
+
+    assert mlflow.active_run() is None
+    assert mlflow.tracking.MlflowClient().get_run(parent.info.run_id).info.status == "FINISHED"
+
+
 # --- inference paid for once -----------------------------------------------
 
 
@@ -240,6 +265,151 @@ def test_the_train_fit_diagnostic_is_switchable(enabled, monkeypatch) -> None:
     assert ("r2_train_fit" in logged) is enabled
     # 10 test rows either way; the 50 training rows are what the switch buys back.
     assert estimator.rows_predicted == (60 if enabled else 10)
+
+
+def test_the_train_fit_diagnostic_can_be_declined_per_model(monkeypatch) -> None:
+    """One expensive estimator should not force the diagnostic off for the cheap ones.
+
+    The cost is a property of the model, not of a row budget, so it can only be declined by name -
+    the same reasoning EXPLAIN_SKIP_MODELS is built on.
+    """
+    monkeypatch.setattr(
+        loggers_module.mlflow.sklearn,
+        "log_model",
+        lambda **kwargs: SimpleNamespace(model_uri="models:/toy/1", registered_model_version=None),
+    )
+    monkeypatch.setattr(loggers_module, "infer_signature", lambda *args, **kwargs: None)
+
+    estimator = _CountingEstimator()
+    logger = ChildRunLogger()
+    for name in ("_log_cv_results", "_log_table_artifact", "_promote_champion", "_log_plots",
+                 "_log_shap_artifacts", "_write_split_summary", "_write_json_artifact",
+                 "_evaluate_sklearn_target"):
+        setattr(logger, name, MagicMock())
+    logged: dict = {}
+    logger._log_metric_dict = lambda metrics: logged.update(metrics)
+
+    import mlflow
+
+    with mlflow.start_run(run_name="probe"):
+        logger.log_child_run(
+            config=SimpleNamespace(
+                ENABLE_CLUSTERING=False,
+                CLUSTERING_STRATEGY={},
+                MLFLOW_REGISTER_MODELS=False,
+                EXPLAIN_ENABLED=False,
+                LOG_TRAIN_FIT_METRIC=True,
+                LOG_TRAIN_FIT_METRIC_SKIP_MODELS=["Toy"],
+            ),
+            search=SimpleNamespace(best_params_={}, best_index_=0),
+            cv_results=pd.DataFrame({"params": [{}], "mean_test_score": [-1.0]}),
+            best_model=estimator,
+            X_train=pd.DataFrame({"feature": np.arange(50, dtype=float)}),
+            y_train=pd.Series(np.arange(50, dtype=float), name="target_a"),
+            X_test=pd.DataFrame({"feature": np.arange(10, dtype=float)}),
+            y_test=pd.Series(np.arange(10, dtype=float), name="target_a"),
+            target="target_a",
+            targets=["target_a"],
+            param_names=[],
+            model_name="Toy",
+            plot_functions={},
+        )
+
+    assert "r2_train_fit" not in logged
+    # The 50 training rows were never asked for; only the one test pass happened.
+    assert estimator.rows_predicted == 10
+
+
+# --- registration follows the metrics --------------------------------------
+
+
+def test_a_model_enters_the_registry_only_after_its_metrics_exist(monkeypatch) -> None:
+    """Registering at log_model time meant a run killed partway through still minted a version.
+
+    Four such versions of organic_matter_g_kg_TabICL accumulated that way, each READY, each backed
+    by a run stuck at RUNNING with no rmse_test - and promote_if_better would have refused every
+    one of them. Registration is now a separate step that the metrics happen before.
+    """
+    monkeypatch.setattr(
+        loggers_module.mlflow.sklearn,
+        "log_model",
+        lambda **kwargs: SimpleNamespace(model_uri="models:/toy/1", registered_model_version=None),
+    )
+    monkeypatch.setattr(loggers_module, "infer_signature", lambda *args, **kwargs: None)
+
+    order: list[str] = []
+    monkeypatch.setattr(
+        loggers_module.mlflow,
+        "register_model",
+        lambda uri, name: order.append("register") or SimpleNamespace(version=3),
+    )
+
+    logger = ChildRunLogger()
+    for name in ("_log_cv_results", "_log_table_artifact", "_log_plots", "_log_shap_artifacts",
+                 "_write_split_summary", "_write_json_artifact", "_evaluate_sklearn_target"):
+        setattr(logger, name, MagicMock())
+    logger._log_metric_dict = lambda metrics: order.append("metrics")
+    promote = MagicMock(return_value={})
+    logger._promote_champion = promote
+
+    import mlflow
+
+    with mlflow.start_run(run_name="probe"):
+        logger.log_child_run(
+            config=SimpleNamespace(
+                ENABLE_CLUSTERING=False,
+                CLUSTERING_STRATEGY={},
+                MLFLOW_REGISTER_MODELS=True,
+                EXPLAIN_ENABLED=False,
+                LOG_TRAIN_FIT_METRIC=False,
+            ),
+            search=SimpleNamespace(best_params_={}, best_index_=0),
+            cv_results=pd.DataFrame({"params": [{}], "mean_test_score": [-1.0]}),
+            best_model=_CountingEstimator(),
+            X_train=pd.DataFrame({"feature": np.arange(50, dtype=float)}),
+            y_train=pd.Series(np.arange(50, dtype=float), name="target_a"),
+            X_test=pd.DataFrame({"feature": np.arange(10, dtype=float)}),
+            y_test=pd.Series(np.arange(10, dtype=float), name="target_a"),
+            target="target_a",
+            targets=["target_a"],
+            param_names=[],
+            model_name="Toy",
+            plot_functions={},
+        )
+
+    assert order.index("metrics") < order.index("register")
+    # The version reaches promotion, which is the only consumer that decides on it.
+    assert promote.call_args.args[-1] == 3
+
+
+def test_a_registry_outage_does_not_discard_a_finished_run(monkeypatch) -> None:
+    """By this point the model is logged and servable; only its registry entry is missing.
+
+    Throwing away a completed fit over that is the worse trade, so it is recorded on the run and
+    escalated only under FAIL_ON_MODEL_ERROR.
+    """
+    monkeypatch.setattr(
+        loggers_module.mlflow,
+        "register_model",
+        MagicMock(side_effect=RuntimeError("registry unreachable")),
+    )
+    logger = ChildRunLogger()
+    config = SimpleNamespace(MLFLOW_REGISTER_MODELS=True, FAIL_ON_MODEL_ERROR=False)
+    model_info = SimpleNamespace(model_uri="models:/toy/1")
+
+    import mlflow
+
+    with mlflow.start_run(run_name="probe") as run:
+        assert logger._register_sklearn_model(config, model_info, "target_a_Toy") is None
+
+    tags = mlflow.tracking.MlflowClient().get_run(run.info.run_id).data.tags
+    assert tags["model_registered"] == "false"
+    assert "registry unreachable" in tags["model_registration_error"]
+
+    config.FAIL_ON_MODEL_ERROR = True
+    with mlflow.start_run(run_name="strict"):
+        with pytest.raises(RuntimeError):
+            logger._register_sklearn_model(config, model_info, "target_a_Toy")
 
 
 # --- immutable params ------------------------------------------------------

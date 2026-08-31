@@ -50,11 +50,11 @@ TARGET_COLUMNS:
   - organic_matter_g_kg
   # - clay_pct
   # - sand_pct
-  - total_silt_pct
+  # - total_silt_pct
   # - ph_water
-  - caco3_pct_total
-  - c_e_c_meq_100g
-  - c_n_ratio
+  # - caco3_pct_total
+  # - c_e_c_meq_100g
+  # - c_n_ratio
   # - p2o5_ehangable_olsen_ppm
 
 # How several targets become models. Ignored when TARGET_COLUMNS has one entry.
@@ -78,12 +78,12 @@ IGNORED_COLUMNS: &ignored_columns
   - date
   # - texture_20cm
   # - landform_class
-  # - bd_median_0_30cm
-  # - clay_median_0_30cm
-  # - ph_median_0_30cm
-  # - sand_median_0_30cm
-  # - soc_median_0_30cm
-  # - swc_median_0_30cm
+  - bd_median_0_30cm
+  - clay_median_0_30cm
+  - ph_median_0_30cm
+  - sand_median_0_30cm
+  - soc_median_0_30cm
+  - swc_median_0_30cm
   - ClimDef_trend_slope
   - SM_trend_slope
   - ETa_trend_slope

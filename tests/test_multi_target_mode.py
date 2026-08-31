@@ -149,6 +149,69 @@ def test_narrowing_to_a_column_the_bundle_does_not_carry_is_refused() -> None:
         SoilSequenceDataModule(_bundle(), active_targets=["no_such_target"])
 
 
+# --- the target covariance the structure-aware losses read -----------------
+
+
+def _correlated_bundle(correlation: float, n_points: int = 200) -> SoilSequenceBundle:
+    generator = np.random.default_rng(0)
+    first = generator.standard_normal(n_points)
+    second = correlation * first + np.sqrt(1.0 - correlation**2) * generator.standard_normal(n_points)
+    return SoilSequenceBundle(
+        point_ids=list(range(n_points)),
+        static_features=generator.standard_normal((n_points, 2)).astype(np.float32),
+        static_feature_names=["f1", "f2"],
+        targets=np.column_stack([first, second]).astype(np.float32),
+        target_names=["target_a", "target_b"],
+    )
+
+
+def test_the_target_covariance_is_the_correlation_matrix_of_the_train_split() -> None:
+    """Fitted on STANDARDIZED targets, which is the space the loss runs in - so the diagonal is 1
+    and the off-diagonal is the correlation the losses compare predictions against."""
+    datamodule = SoilSequenceDataModule(
+        _correlated_bundle(0.8), batch_size=16, val_size=0.25, test_size=0.25, seed=0
+    )
+    datamodule.setup("fit")
+
+    covariance = datamodule.target_covariance_
+    assert covariance.shape == (2, 2)
+    np.testing.assert_allclose(covariance, covariance.T, rtol=1e-6)
+    np.testing.assert_allclose(np.diag(covariance), [1.0, 1.0], rtol=1e-5)
+    assert covariance[0, 1] == pytest.approx(0.8, abs=0.1)
+
+
+def test_the_target_covariance_never_sees_validation_or_test() -> None:
+    """Same rule as the scaler, for the same reason: a statistic fitted across the whole population
+    leaks the test split into the training objective."""
+    bundle = _correlated_bundle(0.8)
+    datamodule = SoilSequenceDataModule(
+        bundle, batch_size=16, val_size=0.25, test_size=0.25, seed=0
+    )
+    datamodule.setup("fit")
+
+    train_targets = np.asarray(bundle.targets)[datamodule.train_idx_]
+    standardized = (train_targets - train_targets.mean(axis=0)) / train_targets.std(axis=0)
+    np.testing.assert_allclose(
+        datamodule.target_covariance_, np.cov(standardized, rowvar=False, ddof=0), rtol=1e-4
+    )
+
+
+def test_a_narrowed_datamodule_has_no_target_covariance() -> None:
+    """One target has no cross-target structure to describe, and the losses that would read this
+    refuse to build without it - which is what turns per-target grouping plus a structural loss
+    into a loud failure instead of a silent fallback to MSE."""
+    narrowed = SoilSequenceDataModule(
+        _correlated_bundle(0.8),
+        batch_size=16,
+        val_size=0.25,
+        test_size=0.25,
+        seed=0,
+        active_targets=["target_b"],
+    )
+    narrowed.setup("fit")
+    assert narrowed.target_covariance_ is None
+
+
 def test_select_target_columns_reports_when_it_narrowed_nothing() -> None:
     targets = np.arange(6, dtype=np.float32).reshape(3, 2)
     _values, names, indices = select_target_columns(targets, ["a", "b"], ["a", "b"])

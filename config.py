@@ -403,6 +403,11 @@ class Config:
         # Whether to spend a full prediction pass over the TRAINING split on the r2_train_fit
         # overfitting diagnostic. See configs/sklearn/config.yml.
         self.LOG_TRAIN_FIT_METRIC = self._get_config('LOG_TRAIN_FIT_METRIC', True)
+        # Models that decline it by name, so one expensive estimator does not force the diagnostic
+        # off for the cheap ones.
+        self.LOG_TRAIN_FIT_METRIC_SKIP_MODELS = self._get_config(
+            'LOG_TRAIN_FIT_METRIC_SKIP_MODELS', []
+        )
         self.MAX_FEATURE_DROP_RATIO_WARNING = self._get_sklearn_categorical_config(
             'MAX_FEATURE_DROP_RATIO_WARNING', 0.9
         )
