@@ -1,35 +1,63 @@
+# How cross-validation (used for hyperparameter search) splits your training data:
+#   kfold       plain random folds
+#   groupkfold  keeps points from the same group (e.g. the same spatial cluster, set up via
+#               CLUSTERING_STRATEGY below) together in one fold, so a fold is never trained and
+#               validated on near-duplicate/related points
 SPLIT_STRATEGY: "kfold" # "groupkfold" or "kfold"
-SKLEARN_FILE_LOGGING_ENABLED: true
-MIN_FEATURE_COUNT: 10
+SKLEARN_FILE_LOGGING_ENABLED: true   # write a log file for sklearn runs, not just console output
+MIN_FEATURE_COUNT: 10   # stop the run with an error if fewer than this many features remain
+# If more than this fraction of your original columns end up excluded from the feature set
+# (as metadata, labels, etc.), print a warning - a high number here often points to a config
+# mistake, e.g. a genuine feature accidentally listed in IGNORED_COLUMNS.
 MAX_FEATURE_DROP_RATIO_WARNING: 0.9
 
-# r2_train_fit: R2 of the fitted model on its own TRAINING set, an overfitting diagnostic. It costs
-# a full extra prediction pass over the train split - several times the test set - which is free for
-# a tree and minutes per target for an in-context model like TabICL. Turn it off when fitting slow
-# estimators; every other metric is unaffected.
+# Also score each fitted model on the data it was TRAINED on (not just the held-out test set), and
+# log that as r2_train_fit. Comparing this to the normal test-set R2 is a simple overfitting check:
+# a much higher score on training data than on test data usually means the model has memorized the
+# training data rather than learned something that generalizes. This costs an extra prediction
+# pass over the training set (which is bigger than the test set) - unnoticeable for a tree-based
+# model, but it can take minutes per target for a slower model like TabICL. Turn off if you're
+# fitting slow models and don't need this diagnostic; no other metric is affected.
 LOG_TRAIN_FIT_METRIC: true
-# Per-model opt-out, so the diagnostic stays on for the cheap estimators instead of being turned off
-# globally to accommodate one expensive one. TabICL is listed because this pass is the largest
-# allocation its run makes: on 2026-08-29 the kernel's OOM killer took the process during exactly
-# this step, at 213 features. Same shape and same reasoning as EXPLAIN_SKIP_MODELS.
+# Skip the extra pass above for specific models, so you can leave it on for the cheap ones instead
+# of disabling it globally just to accommodate one slow one. TabICL is skipped by default because
+# this pass is the single most memory-hungry step in its run, and can run out of memory on
+# datasets with many features.
 LOG_TRAIN_FIT_METRIC_SKIP_MODELS: ["TabICL"]
 
+# Optional: group points into spatial clusters before training - e.g. to use as the grouping for
+# `groupkfold` above. Off by default.
 CLUSTERING_STRATEGY:
   enabled: false
   class_path: yg_eo_soilnet.clustering_utils.KMeansClusterStrategy # SpatialGridClusterStrategy / KMeansClusterStrategy
   params:
     n_clusters: 12
-    # cell_size_m: 5000
+    # cell_size_m: 5000   # use SpatialGridClusterStrategy (grid cells) instead of KMeans
 
 COLUMNS_TO_TRANSFORM: []
 
+# --- categorical (non-numeric) features, for classic (sklearn) models ---------------------------
 categorical:
+  # How categorical columns are encoded for TREE-based models specifically (XGBoost,
+  # GradientBoosting, etc.) - other model types (Ridge, PLS, ...) always use one-hot encoding
+  # regardless of this setting.
+  #   onehot    one yes/no column per category. Capped at TREE_ONEHOT_MAX_CATEGORIES below; past
+  #             that cap, the rarest categories get grouped together as "infrequent".
+  #   ordinal   each category becomes a single integer (0, 1, 2, ...) instead - compact, but this
+  #             implies an order between categories that may not really exist.
+  # Only setting this to exactly "ordinal" switches to that mode; any other value (including
+  # "auto") currently behaves the same as "onehot".
   TREE_CATEGORICAL_ENCODING: "onehot" # onehot | ordinal | auto
   TREE_ONEHOT_MAX_CATEGORIES: 30
 
+  # Extra categorical columns, meant to be specific to classic (sklearn) models. NOTE: this is only
+  # used as a fallback for when data_spec.yml doesn't declare its own CATEGORICAL_FEATURES - since
+  # data_spec.yml here already does, that one takes priority and this list has no effect. To add a
+  # categorical column, add it to data_spec.yml's CATEGORICAL_FEATURES instead.
   CATEGORICAL_FEATURES:
     - SU_WRB1_PH
 
+  # Categorical columns to exclude specifically from classic (sklearn) models, even if declared in
+  # data_spec.yml. Unlike CATEGORICAL_FEATURES above, this one is always applied.
   EXCLUDE_CATEGORICAL:
     # - SU_WRB1_PH
-

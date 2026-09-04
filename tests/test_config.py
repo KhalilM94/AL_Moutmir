@@ -504,6 +504,55 @@ def test_an_entry_cannot_mutate_the_defaults_for_the_next_one(base_config_paths:
     assert registry["inheritor"]["callbacks"]["checkpoint"]["save_top_k"] == 1
 
 
+# --- lightning registry split into a `models/` directory -----------------------------------------
+
+
+def test_entries_can_be_split_into_a_models_directory(base_config_paths: dict) -> None:
+    """Splitting entries into configs/lightning/models/*.yml is equivalent to writing them inline."""
+    lightning_registry_path = Path(base_config_paths["lightning_registry_path"])
+    lightning_registry_path.write_text("defaults:\n  modeltype: dl\n")
+    models_dir = lightning_registry_path.parent / "models"
+    models_dir.mkdir()
+    (models_dir / "soil_cnn.yml").write_text("soil_cnn:\n  enabled: true\n")
+
+    registry = Config(**base_config_paths).LIGHTNING_MODEL_REGISTRY
+
+    assert registry == {"soil_cnn": {"enabled": True, "modeltype": "dl"}}
+
+
+def test_split_entries_merge_alongside_inline_entries(base_config_paths: dict) -> None:
+    """A registry can mix entries still written inline with ones split out to their own file."""
+    lightning_registry_path = Path(base_config_paths["lightning_registry_path"])
+    lightning_registry_path.write_text("defaults:\n  modeltype: dl\ninline_entry:\n  enabled: true\n")
+    models_dir = lightning_registry_path.parent / "models"
+    models_dir.mkdir()
+    (models_dir / "split_entry.yml").write_text("split_entry:\n  enabled: false\n")
+
+    registry = Config(**base_config_paths).LIGHTNING_MODEL_REGISTRY
+
+    assert set(registry) == {"inline_entry", "split_entry"}
+    assert registry["split_entry"]["modeltype"] == "dl"
+
+
+def test_a_registry_with_no_models_directory_is_unaffected(base_config_paths: dict) -> None:
+    """No sibling `models/` folder (e.g. a tuned/*.yml single-entry override) is not an error."""
+    registry = _registry(base_config_paths, REGISTRY_WITH_DEFAULTS).LIGHTNING_MODEL_REGISTRY
+
+    assert set(registry) == {"inheritor", "overrider"}
+
+
+def test_duplicate_entry_across_registry_and_models_dir_raises(base_config_paths: dict) -> None:
+    """The same entry name declared both inline and in models/ is a config mistake, not a merge."""
+    lightning_registry_path = Path(base_config_paths["lightning_registry_path"])
+    lightning_registry_path.write_text("defaults:\n  modeltype: dl\nsoil_cnn:\n  enabled: true\n")
+    models_dir = lightning_registry_path.parent / "models"
+    models_dir.mkdir()
+    (models_dir / "soil_cnn.yml").write_text("soil_cnn:\n  enabled: false\n")
+
+    with pytest.raises(ValueError, match="soil_cnn"):
+        Config(**base_config_paths)
+
+
 def test_explain_switch_defaults_to_on(base_config_paths: dict) -> None:
     config = Config(**base_config_paths)
 

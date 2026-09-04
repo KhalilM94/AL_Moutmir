@@ -405,11 +405,10 @@ def test_the_shipped_registry_entry_builds_through_the_factory(tmp_path: Path, l
     Also the only place auxiliary_label_mean/scale injection is exercised: they are offered from the
     datamodule's fitted statistics, not written in the YAML.
     """
-    import yaml
-
+    from config import load_lightning_registry
     from yg_eo_soilnet.models.config_fatories.lightning_config_factory import LightningConfigFactory
 
-    registry = yaml.safe_load(Path("configs/lightning/lightning_registry.yml").read_text())
+    registry = load_lightning_registry("configs/lightning/lightning_registry.yml")
     spec = registry["soil_residual_cnn"]
     # The shipped entry names the real dataset's columns; the fixture carries its own.
     spec["init_args"]["residual_base_columns"] = {"target_a": "lab_dense"}

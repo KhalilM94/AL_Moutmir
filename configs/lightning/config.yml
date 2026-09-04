@@ -1,3 +1,4 @@
-# Controls whether Lightning's default logger is enabled.
-# Set to false to disable local lightning_logs/ creation.
+# Whether PyTorch Lightning writes its own local logs (metrics/checkpoints under lightning_logs/),
+# on top of whatever MLflow logging main_config.yml sets up. Set to false if you only want the
+# MLflow logs and don't need a separate local copy.
 LIGHTNING_ENABLE_DEFAULT_LOGGER: true

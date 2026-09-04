@@ -1,0 +1,131 @@
+# The same model as soil_cnn.yml, except instead of predicting the target value directly, it
+# predicts a CORRECTION to an existing prediction (this is called "residual learning" - the model
+# only has to learn what the first prediction got wrong, which can be an easier problem).
+#
+# For each target, you name one existing column as the "base" prediction to correct - typically a
+# `<target>__<model_name>` column produced by an earlier run's prediction export and merged back
+# into your data. The model adds its correction on top of that base value, so the final prediction
+# and the true target stay directly comparable in the same units.
+#
+# IMPORTANT - read val_loss differently here: because the model is predicting a correction rather
+# than the target itself, val_loss for this model is NOT comparable to soil_cnn's val_loss.
+# Instead, compare r2_test / rmse_test (which are always in the target's real units), and check
+# that this model actually beats the base prediction's own accuracy on the same rows - if it
+# doesn't, the correction is doing more harm than good.
+#
+# IMPORTANT - watch for data leakage: naming `c_e_c_meq_100g__soil_cnn` as the base for target
+# `c_e_c_meq_100g` is fine in principle - a prediction is something you'd genuinely have available
+# at prediction time, unlike the real measurement. But it's only a fair test if that base column's
+# predictions were made WITHOUT having seen the same points this run tests on (i.e. "out-of-fold").
+# The pipeline can't verify this for you - if the base predictions did see those points during
+# their own training, every metric on this run will look better than it should. The module logs a
+# warning naming each base column as a reminder to double-check this yourself.
+#
+# Shares its `defaults:` (trainer/callback/datamodule settings) with every other model in this
+# folder - see ../lightning_registry.yml.
+soil_residual_cnn:
+  enabled: false
+  input_kind: sequence
+  import_path: yg_eo_soilnet.models.lightningmodules.soil_residual_cnn_lightning_module.SoilResidualCNNLightningModule
+  datamodule_import_path: yg_eo_soilnet.datamodules.sequence.sequence_datamodule.SoilSequenceDataModule
+  init_args:
+    # Same settings as soil_cnn.yml unless noted below - see that file for what each one means.
+    static_dim: auto
+    target_dim: auto
+    modality_dims: auto
+    grid_years: auto
+
+    categorical_cardinalities: auto
+    categorical_vocabularies: auto
+    categorical_feature_names: auto
+    embedding_dims: auto
+    embedding_max_dim: 50
+    embedding_dropout: 0.15000000000000002
+    continuous_norm: none
+
+    temporal_encoder: dilated_tempcnn
+    cnn_hidden_dims:
+    - 128
+    - 128
+    - 128
+    - 128
+    - 128
+    modality_embed_dim: 128
+    cnn_norm: batch
+    pool: masked_avg
+    month_positional: true
+    use_validity_channels: true
+
+    # --- the residual anchor (REQUIRED for this model) ----------------------------------------------
+    # For each target you're predicting, name the column holding its "base" prediction to correct
+    # (see the notes above this entry). You must name a base for EVERY target this model fits, and
+    # each base column must also be listed in data_spec.yml's LABEL_COLUMNS with
+    # CARRY_LABEL_COLUMNS: true, so it's actually available in the data. Don't also list a base
+    # column under auxiliary_label_columns below - it already reaches the model through its own
+    # dedicated path.
+    residual_base_columns:
+      organic_matter_g_kg: organic_matter_g_kg_base
+    # [] feeds the base value (and its validity flag) into the model as-is. A non-empty list passes
+    # it through a small extra stack of layers first (same idea as auxiliary_hidden_dims below).
+    residual_base_hidden_dims: []
+    residual_base_dropout: 0.0
+    residual_base_validity_channels: false   # also tell the model whether the base value for each
+                                              # point was actually available, or had to be filled in
+    # A missing base value gets filled in with the median, so the model would be "correcting" a
+    # generic filled-in number instead of a real prediction for that point - which quietly makes
+    # results worse without an obvious error. Stop the run if more than this fraction of base
+    # values are missing.
+    residual_base_max_missing: 0.05
+    # Statistics used to convert the base prediction back into the target's real units, taken from
+    # the training data. Leave as auto.
+    auxiliary_label_mean: auto
+    auxiliary_label_scale: auto
+
+    # The ordinary "other lab values as extra inputs" branch from soil_cnn still works here too,
+    # independently of the residual base above.
+    auxiliary_label_columns: []
+    # c_e_c_meq_100g, c_n_ratio, caco3_pct_total
+    auxiliary_available_names: auto
+    auxiliary_validity_channels: true
+    auxiliary_hidden_dims: []
+    auxiliary_dropout: 0.0
+
+    coord_dim: auto
+    harmonic_num_frequencies: 6
+    harmonic_include_input: true
+    harmonic_hidden_dims: []
+    harmonic_dropout: 0.0
+
+    static_hidden_dims:
+    - 64
+    - 64
+    head_hidden_dims:
+    - 256
+    - 128
+    head_norm_final: false
+    dropout: 0.5
+
+    # Uses mse rather than soil_cnn's mahalanobis: the "across-target" losses (mahalanobis,
+    # correlation_penalty, cosine) all need MULTI_TARGET_MODE: joint, but residual_base_columns
+    # above is set up for a single target here. If you configure this model to fit several targets
+    # jointly, switch both settings together.
+    loss_name: mse
+    huber_delta: 1.0
+    loss_base: mse
+    loss_lambda: 0.1
+    loss_shrinkage: 0.05
+    loss_min_batch: 16
+    cosine_space: original
+    learning_rate: 0.00010038360509669296
+    temporal_enabled: true
+    optimizer_name: adamw
+    weight_decay: 4.3691180514692865e-06
+    scheduler_type: plateau
+    scheduler_factor: 0.5
+    scheduler_patience: 10
+    scheduler_min_lr: 1.0e-06
+    scheduler_monitor: val_loss
+  datamodule_init_args:
+    max_sequence_length: null
+  tags:
+    architecture: residual-calendar-grid-cnn

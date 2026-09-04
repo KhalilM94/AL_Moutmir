@@ -25,6 +25,44 @@ def deep_merge(base: Mapping, override: Mapping) -> dict:
     return merged
 
 
+def load_lightning_registry(registry_path: str) -> dict:
+    """Load the Lightning model registry at `registry_path`, with `defaults:` merged into every entry.
+
+    Entries can live inline in `registry_path` itself, or be split one-per-file into a `models/`
+    folder sitting next to it (see configs/lightning/models/) - each such file's top-level keys are
+    entries too, exactly as if they had been written inline. Splitting is optional: a registry file
+    with no sibling `models/` folder (e.g. a single-entry file exported by tune.py into
+    configs/lightning/tuned/) behaves exactly as before.
+    """
+    with open(registry_path, 'r') as f:
+        document = yaml.safe_load(f) or {}
+
+    # The trainer args and the callbacks were byte-identical on every entry, so they live once
+    # under `defaults:` and are merged in here. Merging at load time rather than in the factory
+    # means every consumer - LightningConfigFactory, tune.py, the HPO exporter, the tests - keeps
+    # seeing one fully materialized entry and needs to know nothing about this. A tuned file from
+    # configs/lightning/tuned/ carries no `defaults:` key, so for it this is a no-op.
+    defaults = document.pop(LIGHTNING_REGISTRY_DEFAULTS_KEY, None) or {}
+
+    models_dir = os.path.join(os.path.dirname(registry_path), 'models')
+    if os.path.isdir(models_dir):
+        for filename in sorted(os.listdir(models_dir)):
+            if not filename.endswith(('.yml', '.yaml')):
+                continue
+            model_file_path = os.path.join(models_dir, filename)
+            with open(model_file_path, 'r') as f:
+                entries = yaml.safe_load(f) or {}
+            for name, spec in entries.items():
+                if name in document:
+                    raise ValueError(
+                        f"Lightning registry entry '{name}' is declared both in {registry_path} "
+                        f"and in {model_file_path} - remove it from one of the two."
+                    )
+                document[name] = spec
+
+    return {name: deep_merge(defaults, spec or {}) for name, spec in document.items()}
+
+
 class Config:
     def __init__(
         self,
@@ -486,20 +524,11 @@ class Config:
 
     def _load_lightning_model_registry(self):
         try:
-            with open(self.lightning_registry_path, 'r') as f:
-                document = yaml.safe_load(f) or {}
+            return load_lightning_registry(self.lightning_registry_path)
         except FileNotFoundError:
             raise FileNotFoundError(
                 f"Lightning model registry YAML not found at {self.lightning_registry_path}. Stopping execution."
             )
-
-        # The trainer args and the callbacks were byte-identical on every entry, so they live once
-        # under `defaults:` and are merged in here. Merging at load time rather than in the factory
-        # means every consumer - LightningConfigFactory, tune.py, the HPO exporter, the tests - keeps
-        # seeing one fully materialized entry and needs to know nothing about this. A tuned file from
-        # configs/lightning/tuned/ carries no `defaults:` key, so for it this is a no-op.
-        defaults = document.pop(LIGHTNING_REGISTRY_DEFAULTS_KEY, None) or {}
-        return {name: deep_merge(defaults, spec or {}) for name, spec in document.items()}
 
     def _get_data_config(self, data_key: str, flat_key: str, default: Any) -> Any:
         """Read from the unified `data:` block, falling back to the legacy flat key."""

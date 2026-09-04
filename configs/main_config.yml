@@ -1,100 +1,125 @@
 common:
-  # Every source below is one path that may be a FILE or a FOLDER of files.
+  # Where to find your input data. `root` is the folder everything below lives in; each entry
+  # below it can point to either a single file or a folder of files.
   data:
     root: "/home/kmisbah/CESBIO/AL_Moutmir/Soil_Datasets/soil_dataset_20251118_140815"
-    # Static features. Targets may live in this same file (joint) or be listed separately below.
+    # The file with your static (non-time-series) features - soil covariates, etc. The measured
+    # lab values (the targets) can either live in this same file, or in their own file - see
+    # `targets` below.
     static: 'Morocco_Static_Covariates_Processed_V_310826.csv'
     # static: "Morocco_roadsafe_6k_with_ts_features_and_covariates_V_310826.csv"
-    # Omit / leave null when `static` is a joint file that already carries the target columns.
-    # Lab targets live in their own file; lat/lon are carried across from it on the join.
-    targets: 'Morocco_soil_targets_uuid_roadsafe_6ksample_V_310826.csv'
+    # The file with your measured lab values - what the models learn to predict. Leave this blank
+    # (null) if `static` above already contains those columns. When targets live in their own
+    # file like here, lat/lon coordinates are copied over from it when the two files are joined.
+    targets: 'Morocco_soil_targets_uuid_roadsafe_6ksample_V_310826_base.csv'
     # targets: 'Morocco_soil_targets_uuid_roadsafe_6ksample_Prior_Predictions_V_110826.csv'
-    
-    # Time-series always arrives separately: a single file, or a folder of per-modality shards.
+
+    # Time-series data (satellite/weather observations over time) always lives in its own file(s) -
+    # either a single file, or a folder with one file per data source.
     timeseries: 'Morocco_Soil_Predictors_2017_2025_TS_with_indices_V_310826.csv'
-    # Optional index.json listing exact paths per source (static_features / targets / timeseries).
+    # Optional: a JSON file listing the exact path to each of the three sources above, if you'd
+    # rather manage paths that way. Leave as null to just use the paths given above.
     manifest: null
-  POINT_ID_COLUMN: "uuid"
+  POINT_ID_COLUMN: "uuid"   # the column that uniquely identifies each sample point
   LAT_COLUMN: "lat"
   LON_COLUMN: "lon"
-  RANDOM_SEED: 42
-  # TEST_SIZE deliberately absent: the holdout now lives in `split:` below, and having both would
-  # give the run two sources of truth for the same number. It is still read as a fallback for
-  # configs that predate this block.
+  RANDOM_SEED: 42           # controls every source of randomness (data split, shuffling, etc.),
+                            # so re-running with the same seed reproduces the same result
+  # There is intentionally no TEST_SIZE setting here - the train/validation/test split is
+  # controlled entirely by the `split:` block below. (An old TEST_SIZE key still works as a
+  # fallback for configs written before that block existed, but don't add a new one here - it
+  # would just create a second, conflicting place to set the same number.)
 
-  # --- the train/val/test split, decided ONCE for every training family --------------------
-  # Previously each family split for itself: sklearn carved 70/30 off the tabular frame while the
-  # Lightning datamodules carved 64/16/20 off a bundle rebuilt from the same CSVs. The holdouts
-  # overlapped, so a Lightning test point was usually an sklearn TRAINING point - and both families
-  # publish the result as `rmse_test` on one leaderboard axis. This block replaces both.
+  # --- train / validation / test split ---------------------------------------------------------
+  # This one split is shared by every model the pipeline trains, whether it's a classic model
+  # (sklearn) or a deep-learning model (Lightning), so all of them are evaluated on the exact same
+  # held-out points and their scores can be compared directly.
   #
-  # The split is keyed on POINT_ID_COLUMN, not on row position: the families disagree about which
-  # rows are usable, so positions do not mean the same thing on both sides while a point id does.
+  # Points are matched up by POINT_ID_COLUMN rather than by row position, because different model
+  # types can end up using a different subset of rows (e.g. some drop rows with missing data that
+  # others keep).
   split:
-    # random        - i.i.d. holdout over point ids.
-    # spatial_group - cluster first, then hold out WHOLE clusters, so no cluster straddles two
-    #                 splits. Prefer this when spatial autocorrelation would otherwise let a test
-    #                 point be predicted from its neighbour a few metres away in train.
+    # How to choose which points go into the validation/test sets:
+    #   random        - pick points at random.
+    #   spatial_group - group nearby points into clusters first, then hold out entire clusters, so
+    #                   no cluster is split across train and test. Use this if your points are
+    #                   close enough together that a model could "cheat" by learning from a
+    #                   training point a few metres from a test point, instead of learning the
+    #                   real pattern.
     strategy: random
-    # Both are fractions of the FULL eligible population, NOT of the remainder. Asking for 0.2 gets
-    # 20%. (The old sequential carve is why the Lightning registry carried the note "without this,
-    # train was 0.7*0.7=0.49".) train is whatever is left: 0.64 here.
+    # Fraction of ALL usable points to hold out - e.g. 0.15 means 15% of the whole dataset, not
+    # 15% of whatever is left after other splits are taken out. Whatever isn't in test_size or
+    # val_size becomes the training set (here: 1 - 0.15 - 0.15 = 70%).
     test_size: 0.15
     val_size: 0.15
     seed: 42
-    # How to handle points only some families can use - the sequence builder drops rows with
-    # non-finite covariates that the tabular preprocessor keeps.
-    #   intersect  - split over the points EVERY active family can use, so the test set is
-    #                identical row for row and metrics are strictly comparable. Costs sklearn rows.
-    #   assign_all - label every point; each family takes the subset it holds. Test sets share
-    #                membership, but sklearn's is a superset.
-    # The per-family delta is logged either way. Flip this key to A/B the two.
+    # Some points can only be used by some model types - e.g. deep-learning models need complete
+    # time series and drop points that classic models can still use. This decides how to handle
+    # that mismatch:
+    #   intersect  - only use points that EVERY model type can use, so all models see the exact
+    #                same test set and their scores are perfectly comparable. Costs you some
+    #                training data for the model types that could have used more points.
+    #   assign_all - each model type uses every point it can handle; test sets overlap but aren't
+    #                identical, since some model types end up with a larger usable set than others.
     population_policy: intersect
-    # Floor on what `intersect` may leave behind, as a fraction of the source frame. Below it the
-    # run stops and names the narrowest family instead of quietly training everything on that
-    # family's tiny population. Raise it to be stricter; 0 disables the check.
+    # Safety check for `intersect` above: if the shared set of usable points drops below this
+    # fraction of your full dataset, the run stops with an error instead of silently training on a
+    # tiny slice of your data. Raise it to be more cautious, or set to 0 to disable the check.
     min_population_ratio: 0.5
-    # Path to a previously written data_splits/split_assignments.parquet. Set it to freeze the
-    # test set across runs even as the source data grows. null rebuilds the split each run.
+    # Path to a previously saved split (a data_splits/split_assignments.parquet file). Set this to
+    # reuse the exact same test set across multiple runs, even as you add more data. Leave as null
+    # to compute a fresh split every run.
     plan_path: null
-    # Read only when strategy is spatial_group. Any BaseSpatialClusterStrategy.
+    # Only used when strategy is spatial_group above: which clustering method groups points into
+    # clusters, and its settings.
     group:
       class_path: yg_eo_soilnet.clustering_utils.KMeansClusterStrategy
       params:
         n_clusters: 12
-        # cell_size_m: 5000   # SpatialGridClusterStrategy instead of KMeans
+        # cell_size_m: 5000   # use SpatialGridClusterStrategy (grid cells) instead of KMeans
 
-  # --- data quality: one missingness rule for every training family ------------------------
-  # A blank covariate used to mean two different things depending on who was reading it. sklearn
-  # median-filled it and handed the result to the model as if it were measured; the Lightning
-  # builders deleted every affected row. On one real dataset three columns that were 99.7% blank
-  # cost the sequence family 5744 of 5761 points - and nothing said so.
+  # --- missing data: one rule for every model type ----------------------------------------------
+  # If a feature column is missing a lot of values, that's usually a sign something is wrong with
+  # the data rather than something to quietly work around - a column that's almost entirely blank
+  # can end up wiping out most of your usable data (deep-learning models drop rows with missing
+  # values outright).
   #
-  # Now there is one rule, applied by both:
-  #   blank on MORE than max_missing_column_ratio of rows -> the run STOPS and names the column
-  #   blank on LESS                                       -> median-filled and flagged, row kept
-  # A validity flag is carried only for columns that actually have gaps, so a fully populated
-  # dataset (like the current one) is completely unaffected.
+  # The rule below is applied the same way for every model type:
+  #   a column blank in MORE than max_missing_column_ratio of rows -> the run STOPS with an error
+  #                                                                    naming that column
+  #   a column blank in LESS than that                              -> filled in with the column's
+  #                                                                    median value, and flagged so
+  #                                                                    the model knows it was
+  #                                                                    filled in rather than measured
   data_quality:
     max_missing_column_ratio: 0.2
-    # Names exempted from the check: kept and imputed however sparse they are. Use when the
-    # imputed value is genuinely wanted, not to silence a warning.
+    # Column names to exempt from the check above: always kept and filled in, however sparse they
+    # are. Only use this when you genuinely want the filled-in value used - not just to silence an
+    # error for a column you haven't looked at yet.
     allow_sparse_columns: []
-    # false downgrades the stop to a warning and trains anyway. Off by default because the whole
-    # point is that this failure used to be silent.
+    # Set to false to turn the stop-the-run error above into a warning instead, and keep training
+    # anyway. True by default, since this kind of missing-data problem is easy to miss otherwise.
     fail_on_sparse_columns: true
 
+  # Stop the whole run if EVERY model fails for a given target, instead of finishing with no
+  # results for it.
   FAIL_IF_ALL_MODELS_FAIL_FOR_TARGET: true
+  # If a single model errors out, false (default) skips it and keeps training the rest; true stops
+  # the entire run on the first model failure.
   FAIL_ON_MODEL_ERROR: false
+  # Paths to the other config files this pipeline reads, relative to this file's own folder.
   DATA_SPEC_PATH: "data_spec.yml"
   SKLEARN_CONFIG_PATH: "sklearn/config.yml"
   LIGHTNING_CONFIG_PATH: "lightning/config.yml"
   SKLEARN_REGISTRY_PATH: "sklearn/model_registry.yml"
   LIGHTNING_REGISTRY_PATH: "lightning/lightning_registry.yml"
+  # --- time-series (satellite/weather) inputs -----------------------------------------------
   temporal:
-    enabled: true
-    # Source path lives under `data.timeseries` above.
+    enabled: true   # turn off to ignore the time-series file entirely and use static data only
+    # Column in the time-series file that holds each observation's date.
     time_column: "observation_date"
+    # How to tell which columns in the time-series file belong to which data source, by the
+    # prefix on their column name - e.g. every column starting with "S2_" is Sentinel-2 data.
     modality_prefix_map:
       s2: "S2_"
       s1_asc: "S1_asc_"
@@ -102,178 +127,196 @@ common:
       soil: "SOIL_"
       ag: "AG_"
       clim: "CLIM_"
-  MAIN_FILE_LOGGING_ENABLED: true
-  MLFLOW_EXPERIMENT_EXPORT_ENABLED: false
+  MAIN_FILE_LOGGING_ENABLED: true   # also write a log file for the run, not just console output
+  MLFLOW_EXPERIMENT_EXPORT_ENABLED: false   # export MLflow experiment data to a portable format
   MLFLOW_EXPERIMENT_EXPORT_PATH: "mlflow_exports"
 
-  # --- MLflow tracking -------------------------------------------------------
-  # Empty means <repo>/mlruns. An experiment's artifact_location is an ABSOLUTE path fixed when the
-  # experiment is created, so the original Soil_Model_Training_Experiment - created in a different
-  # checkout - has been writing its metadata and its artifacts to two different directories. This
-  # experiment is new, so MLflow derives a correct artifact_location under the tracking root below.
-  # Old runs are untouched and still readable; comparisons do not span the two.
-  MLFLOW_TRACKING_URI: ""
-  MLFLOW_EXPERIMENT_NAME: "Soil_Model_Training_v2"
-  # Register each fitted model as a new version of <target>_<model>, and move the `champion` alias
-  # onto it when its rmse_test beats the version currently aliased. Note the scope: an MLflow alias
-  # belongs to ONE registered name, so champion means "the best version of this model on this
-  # target", not "the best model for this target" - the leaderboard still decides between soil_cnn
-  # and XGBoost. false stops versions accumulating for throwaway experiments.
+  # --- experiment tracking (MLflow) -----------------------------------------------------------
+  # MLflow is the tool that logs every run's settings, metrics, and saved models so you can browse
+  # and compare them later (via `mlflow ui`).
+  MLFLOW_TRACKING_URI: ""    # where MLflow stores its data; empty means the local <repo>/mlruns folder
+  MLFLOW_EXPERIMENT_NAME: "Soil_Model_Training_v2"   # groups runs together under this name in the UI
+  # If true, every fitted model is also saved into MLflow's Model Registry as a new version of
+  # <target>_<model_name>, and gets tagged "champion" if it beats the current champion version's
+  # test RMSE. Note that "champion" only compares versions of the SAME model on the SAME target -
+  # it doesn't decide which model type is best for a target overall, you still compare across
+  # model types yourself (e.g. on the leaderboard). Set to false for throwaway/experimental runs
+  # so they don't clutter the registry with versions you don't actually want to keep.
   MLFLOW_REGISTER_MODELS: true
 
-  # --- Explainability (SHAP) ------------------------------------------------
-  # EXPLAIN_ENABLED is the master switch. false skips every explainer and writes no explain/
-  # artifacts; training, metrics and every other artifact are untouched, and shap is never
-  # imported. Every key here is also settable as an environment variable of the same name.
+  # --- Explainability (SHAP) --------------------------------------------------------------------
+  # SHAP explains WHY a model made each prediction, by scoring how much each feature pushed that
+  # prediction up or down. EXPLAIN_ENABLED is the master on/off switch: when false, none of this
+  # runs, nothing is written to the explain/ folder, and the `shap` library isn't even loaded -
+  # training and every other output are unaffected either way. (Every setting below can also be
+  # set via an environment variable of the same name.)
   EXPLAIN_ENABLED: false
-  # Test rows explained. Subsampled deterministically from RANDOM_SEED when the split is larger.
+  # How many test rows to explain. If the test set is larger than this, a random (but repeatable)
+  # subset is used.
   EXPLAIN_MAX_SAMPLES: 500
-  # Reference rows the explainer integrates against. Larger is more stable and slower.
+  # How many reference rows SHAP compares against when judging each feature's effect. More is more
+  # accurate but slower.
   EXPLAIN_BACKGROUND_SAMPLES: 100
-  # Rows drawn in the beeswarm and bar plots. The full unranked table is always written to
-  # explain/shap_values.parquet, so this caps the picture and never the data.
+  # How many rows to show in the summary plots (beeswarm/bar charts). This only limits the picture,
+  # not the data - the full results are always saved to explain/shap_values.parquet.
   EXPLAIN_MAX_DISPLAY: 25
-  # Ceiling on model evaluations for the model-agnostic explainer. Tree and linear models are exact
-  # and cheap and ignore this; anything else (TabICL) is estimated first and SKIPPED with the reason
-  # recorded in meta/run_summary.json when it would cost more. Raise it to explain an expensive
-  # model deliberately, ideally together with a smaller EXPLAIN_MAX_SAMPLES.
+  # Budget, in number of model calls, for explaining models that don't have a fast/exact SHAP
+  # method. Tree-based and linear models are always fast and exact and ignore this setting; other
+  # models (like TabICL) are estimated first and SKIPPED if they'd cost more than this budget - the
+  # reason is recorded in meta/run_summary.json. Raise this if you deliberately want to explain
+  # such a model anyway; consider lowering EXPLAIN_MAX_SAMPLES at the same time to keep the total
+  # cost reasonable.
   EXPLAIN_MAX_EVALS: 200000
-  # [] explains every trained model. Name registry entries to restrict it, e.g. ["XGBoost"].
+  # Which models to explain. [] (default) explains every trained model; list specific registry
+  # names (e.g. ["XGBoost"]) to restrict it to just those.
   EXPLAIN_MODELS: []
-  # Never explained unless EXPLAIN_MODELS names them explicitly (an allowlist entry wins over this).
-  # TabICL is an in-context learner: a single prediction re-processes the training set, measured at
-  # ~13 ms/row against microseconds for a tree, which puts its SHAP run at 13-80 minutes.
-  # EXPLAIN_MAX_EVALS counts evaluations and cannot price that, so the exclusion is by name.
-  # For reference, XGBoost on the same data measures ~28 s and stays enabled.
+  # Models to always skip, regardless of EXPLAIN_MAX_EVALS above - unless a model is also listed
+  # in EXPLAIN_MODELS, which wins. TabICL is skipped by default: it re-examines the whole training
+  # set for every single prediction it makes, so explaining it can take much longer than a model
+  # like XGBoost on the same data.
   EXPLAIN_SKIP_MODELS: ["TabICL"]
-  # false records an explainer failure in meta/run_summary_*.json and keeps the training run.
+  # If explaining a model fails, false (default) just records the failure in
+  # meta/run_summary_*.json and keeps the training run's other results.
   EXPLAIN_FAIL_ON_ERROR: false
 
-  # --- Predictive uncertainty ------------------------------------------------
-  # Every model here used to emit exactly one number per (sample, target). This block makes it emit
-  # a mean AND a standard deviation, and turns that standard deviation into a calibrated interval.
+  # --- Predictive uncertainty ----------------------------------------------------------------
+  # Normally each model gives you a single predicted number per point. This block turns that into
+  # a predicted number PLUS a margin of error, by training several versions of the same model (an
+  # "ensemble") and looking at how much their predictions disagree with each other.
   #
-  # Two sources, kept separate all the way to the eval frame because they answer different questions:
-  #   epistemic  - spread ACROSS ensemble members. "the models disagree here." Shrinks with data.
-  #   aleatoric  - the per-point variance a heteroscedastic head predicts. "the data is noisy here."
-  #                Does not shrink with data. Lightning only; see `heteroscedastic` below.
-  # total_sigma = sqrt(var(mu_k) + mean(sigma_k^2)), the deep-ensemble decomposition.
+  # There are two different reasons a prediction can be uncertain, and this pipeline tracks them
+  # separately because they answer different questions:
+  #   epistemic uncertainty  - how much the ensemble members disagree with each other. Roughly,
+  #                            "how sure is the model, given what it has learned so far?" This
+  #                            tends to shrink as you add more training data.
+  #   aleatoric uncertainty  - noise in the data itself at that point - e.g. "this kind of soil is
+  #                            just inherently variable here." This does NOT shrink with more data,
+  #                            and is only available for Lightning (deep-learning) models - see
+  #                            `heteroscedastic` below.
+  # The two are combined into one total margin of error ("sigma") for each prediction.
   #
-  # Neither is trustworthy on its own - an ensemble is systematically overconfident - so the sigma
-  # is then CALIBRATED by split conformal against a held-out set. That is what makes the bar on the
-  # pred-vs-obs plot mean "95% of observations land in here" rather than "the model felt this sure",
-  # and it is what makes a sklearn interval and a Lightning interval the same kind of object.
-  # picp_test is logged beside every run so the claim is checkable rather than decorative.
+  # Raw ensemble disagreement tends to be overconfident (too narrow), so the margin is then
+  # CALIBRATED against a held-out set of real answers, so that a "95% interval" on a plot actually
+  # does contain the true value about 95% of the time - not just whatever the model feels sure
+  # about. The `picp_test` metric logged with every run checks whether that promise actually held.
   uncertainty:
-    # The master switch. false is not a plot suppressor: no member loop runs, no extra columns are
-    # written, and the run costs exactly what it costs today.
+    # Master on/off switch. When false, none of the below runs: no extra models are trained, no
+    # extra columns are written, and the run costs exactly what it would without this block.
     enabled: false
-    # Members per model per target group. Training time scales with this LINEARLY - 5 members of a
-    # 500-epoch soil_cnn is 5 runs of it. 3 is enough to iterate, 5 to report, 10 to publish.
-    # On the Lightning side it also multiplies CHECKPOINT STORAGE by this number: every member logs
-    # its own weights, so its predictions can be reconstructed later without the ensemble having to
-    # be retrained. A soil_cnn checkpoint is ~75 MB, so 5 members per target is ~375 MB per target.
+    # How many versions of each model to train per target (the ensemble size). Training time scales
+    # directly with this - 5 members means training that model 5 separate times. 3 is enough while
+    # iterating, 5 for a report, 10 for a final/published result. On Lightning models this also
+    # multiplies how much disk space checkpoints use, since each member saves its own weights
+    # (roughly n_members times the size of one checkpoint, per target).
     n_members: 5
-    # Member k trains at RANDOM_SEED + k * this. A stride rather than +1 so a member seed never
-    # collides with split.seed or with an entry's own `random_seed`, which would quietly correlate
-    # two members that are supposed to be independent draws.
+    # Each ensemble member gets its own random seed, computed as RANDOM_SEED + member_index * this
+    # value. Using a large stride (rather than +1) keeps a member's seed from ever accidentally
+    # matching the seed used for the data split, or a model's own seed setting.
     member_seed_stride: 1000
-    # auto | always | never. Members of a DETERMINISTIC estimator (Ridge, PLS - anything with no
-    # random_state to set) are otherwise five identical fits: sigma collapses to exactly 0 and the
-    # run reports total confidence. `auto` bootstrap-resamples the fit pool for exactly those
-    # entries and leaves stochastic ones (XGBoost, GradientBoosting) alone.
+    # auto | always | never. Some models (Ridge, PLS) have no randomness of their own to vary
+    # between members, so without help every member would train identically and the "disagreement"
+    # would always be exactly zero - falsely reporting perfect confidence. `auto` fixes this by
+    # re-sampling the training data slightly differently for each member of exactly those models,
+    # and leaves models that already vary run-to-run (XGBoost, GradientBoosting) alone.
     bootstrap: auto
-    # Lightning only: the head emits (mu, log var) and the loss becomes beta-NLL instead of MSE.
-    # This is the only way to get a bar that is WIDER where the data is noisier rather than merely
-    # where the members disagree. Note two consequences: val_loss is then an NLL and is no longer
-    # comparable to an MSE run's, and soil_graph does not inherit the shared regression base so it
-    # ignores this key and gets ensemble-only uncertainty.
+    # Lightning models only. When true, instead of predicting just one number, the model directly
+    # predicts a value AND how uncertain it is about that value, and is trained to get both right.
+    # This is the only way to get a margin of error that's wider specifically where the DATA is
+    # noisier, rather than only where the ensemble members happen to disagree. Two things change
+    # when this is on: the training loss becomes harder to compare against a plain run's, and the
+    # soil_graph model doesn't support this option and will ignore it.
     heteroscedastic: false
-    # beta-NLL weight (Seitzer et al. 2022). Plain Gaussian NLL (0.0) is known to stop fitting the
-    # mean wherever it has already decided the variance is large, which shows up as a model that
-    # gave up on its hard points. 1.0 is fully variance-weighted; 0.5 is the paper's middle.
+    # Only used when heteroscedastic is true. Tunes how much the training loss penalizes the model
+    # for claiming high uncertainty instead of trying harder to fit difficult points. 0.0 is the
+    # plain statistical formula, which lets a model "give up" on hard points by simply calling them
+    # very uncertain; 1.0 fully corrects for that; 0.5 is a commonly used middle ground and the
+    # default here.
     beta_nll: 0.5
-    # --- what the lower/upper columns and the plotted bars actually are ---------------
-    # The sigma columns are written whatever this says. This decides how that sigma becomes an
-    # interval, and the three answers are NOT interchangeable:
+    # --- how the margin of error becomes the interval shown on plots -------------------------
+    # A margin-of-error ("sigma") value is always computed once uncertainty is enabled. This
+    # setting decides how that turns into the lower/upper bounds you see on plots - the options
+    # below mean different things and are NOT interchangeable:
     #
-    #   conformal  mean +- q*sigma, q fitted on held-out residuals. The only one whose coverage is
-    #              guaranteed rather than assumed, and the only one that means the same thing on
-    #              both training families. The default, and what you want unless you know otherwise.
-    #   gaussian   mean +- z(1-alpha/2)*sigma. A normal-theory band. It is a real confidence
-    #              interval only if the predictive distribution is Normal AND sigma is on the right
-    #              scale - on the Ridge ensemble the fitted conformal q was 50.3 against a Gaussian
-    #              1.96, so this would have covered a fraction of what it claims.
-    #   sigma      mean +- k*sigma. Claims nothing beyond "k standard deviations", which is the
-    #              honest thing to draw when you want the model's own spread rather than a
-    #              calibrated band. Graded against what k implies (0.683 at k=1), not against alpha.
-    #   none       sigma columns only, no interval, no bars.
+    #   conformal  the interval is fitted so it actually contains about 95% (or whatever `alpha`
+    #              you set implies) of true values, checked against real held-out data. This is the
+    #              only option with a checked guarantee behind it, and the only one guaranteed to
+    #              mean the same thing for both sklearn and Lightning models. Recommended default -
+    #              use this unless you have a specific reason not to.
+    #   gaussian   a classic statistical confidence interval, which assumes the errors follow a
+    #              normal (bell-curve) distribution and that sigma is already on the right scale.
+    #              That assumption can be quite wrong for some models, so treat this option with
+    #              more caution than `conformal`.
+    #   sigma      just "the prediction, plus or minus k standard deviations", with no claim about
+    #              what percentage of true values that should cover. The honest choice if you want
+    #              to show the model's raw spread rather than a calibrated guarantee.
+    #   none       write the sigma value, but don't compute an interval or draw any bars.
     #
-    # Only `conformal` needs rows the model never saw - so under gaussian and sigma the sklearn
-    # family keeps its full fit pool instead of reserving the val split. See `calibration.source`.
+    # Only `conformal` needs a chunk of data set aside purely for calibration (see
+    # `calibration.source` below) - with `gaussian` or `sigma`, sklearn models can use all of their
+    # usual training data instead of holding some back.
     interval:
       method: sigma
-      # Miscoverage rate for conformal and gaussian: 0.05 is a 95% interval. The plotted bar and
-      # picp_test both read this, so there is one number behind the picture and the metric that
-      # checks it. Ignored by `sigma`.
+      # For `conformal` and `gaussian`: how much of the true values the interval is allowed to
+      # miss, e.g. 0.05 means a 95% interval. Not used by `sigma`.
       alpha: 0.05
-      # Half-width in standard deviations, read only by `method: sigma`.
+      # For `method: sigma` only: how many standard deviations wide the interval is.
       k: 1.0
     calibration:
-      # `method` moved to the `interval` block above, because gaussian and sigma calibrate nothing
-      # and naming them a calibration method would be a lie. Setting it here still works - it is
-      # read when `interval.method` is absent, with `split_conformal` meaning `conformal`.
+      # Same idea as interval.alpha above; kept here for configs written before the `interval`
+      # block existed. If `interval.method` is set, that takes priority - this is only read as a
+      # fallback.
       alpha: 0.05
-      # WHERE the calibration residuals come from. This is the key with a real cost attached.
-      #
-      # val     - the val split this file already carves. Honest by construction on the Lightning
-      #           side. On the sklearn side X_train is currently train u val (sklearn validates by
-      #           k-fold INSIDE that pool), so calibrating on val would calibrate on rows the model
-      #           was fitted on and the coverage guarantee would be void. Choosing `val` therefore
-      #           moves the sklearn members onto train-only and logs uncertainty_fit_pool=train_only.
-      #           Cost: sklearn trains on ~15% fewer rows. Buys: under population_policy=intersect
-      #           the two families calibrate on the SAME point ids, so their intervals are directly
-      #           comparable - the same property the unified metrics module exists to protect.
-      # cv_oof  - out-of-fold residuals from the k-fold GridSearchCV already runs. Costs no rows and
-      #           keeps the full fit pool. sklearn only: there is no equivalent for a Lightning run.
+      # WHERE the data used to calibrate the `conformal` interval comes from - this choice has a
+      # real cost attached:
+      #   val     - use the validation split. The safe, honest choice, but on sklearn models it
+      #             means holding back the validation data from training too (sklearn models
+      #             otherwise train on train+validation combined and validate internally via
+      #             cross-validation) - so sklearn ends up training on somewhat less data. In
+      #             exchange, both model families calibrate on the exact same points, so their
+      #             intervals are directly comparable to each other.
+      #   cv_oof  - reuse the "out-of-fold" predictions already produced during sklearn's own
+      #             cross-validation search, at no extra cost in training data. sklearn models
+      #             only - there's no equivalent step for Lightning models.
       source: val
-    # [] applies uncertainty to every enabled entry. Name entries to restrict it.
+    # Which registry entries to build an ensemble for. [] (default) applies it to every enabled
+    # model; list specific names to restrict it.
     models: []
-    # Never given an ensemble unless `models` names them explicitly. TabICL is excluded for the same
-    # reason it is excluded from SHAP: fit() is a full in-context pass over the training set, and
-    # n_members of those is the path that got a run OOM-killed by the kernel twice.
-    skip_models: ["TabICL"] #"TabICL"
-    # false records the failure in meta/run_summary.json and keeps the point predictions.
+    # Models to always exclude from ensembling, regardless of `models` above (unless a model is
+    # also explicitly listed in `models`, which wins). TabICL is excluded by default: building an
+    # ensemble of it means repeating its expensive full-dataset pass n_members times, which can
+    # easily run out of memory.
+    skip_models: ["TabICL"]
+    # If building the ensemble for a model fails, false (default) records the failure in
+    # meta/run_summary.json and keeps that model's regular (non-ensembled) prediction.
     fail_on_error: false
 
-  # --- Per-point prediction export -------------------------------------------
-  # One file per run answering "what did every model predict for this point?", keyed on
-  # POINT_ID_COLUMN. Two are written to the PARENT run:
-  #   predictions/point_predictions_wide.csv   one row per point, one column per <target>__<model>
-  #   predictions/point_predictions_long.csv   one row per point x target x model
-  # The long file is the authoritative one - target and model names both contain underscores, so a
-  # wide column name is readable but not reliably parseable back into its two parts.
+  # --- Per-point prediction export ------------------------------------------------------------
+  # Writes out "what did every model predict for this point?" for every point in your dataset,
+  # identified by POINT_ID_COLUMN. Two files are written:
+  #   predictions/point_predictions_wide.csv   one row per point, one column per target+model pair
+  #   predictions/point_predictions_long.csv   one row per (point, target, model) combination -
+  #                                             use this one if you need to parse target/model
+  #                                             names back apart, since both can contain underscores
   #
-  # Where an entry was ensembled the exported number is the ensemble MEAN. No sigma, no interval:
-  # this file is about the estimates. The uncertainty lives in eval_results.csv and the
-  # uncertainty/ artifacts.
+  # If a model was ensembled (see `uncertainty` above), the exported value is the ensemble's
+  # average prediction - no margin of error here. For that, look at eval_results.csv and the
+  # uncertainty/ folder instead.
   #
-  # Two things to know before reading the output:
-  #
-  #   * It covers EVERY point the pipeline could featurize, not just the test split - so most rows
-  #     are training rows the model has already seen. Their predictions are in-sample and will look
-  #     far better than the model's real skill. Nothing in the file marks them; cross-reference
-  #     data_splits/split_assignments.parquet, which is keyed on the same point ids, to separate
-  #     them.
-  #   * It costs a full-population inference pass per model, which nothing else in the run does.
-  #     That is why this is off by default and why `skip_models` exists.
+  # Two things to know before using this file:
+  #   * It covers EVERY point, not just the test set - so most rows are points a model was already
+  #     trained on, and its predictions for those will look much better than its real, honest
+  #     accuracy. Nothing in this file marks which rows are which; cross-reference
+  #     data_splits/split_assignments.parquet (keyed on the same point ids) to tell them apart.
+  #   * Producing it means running every model over your entire dataset, which is extra work that
+  #     nothing else in the pipeline does - that's why it's off by default.
   export_point_predictions:
     enabled: false
-    # [] exports every model that supports it. Naming entries restricts it, and an entry named here
-    # wins over skip_models below.
+    # Which models to export predictions for. [] (default) exports every model that supports it;
+    # list specific names to restrict it - a name listed here overrides `skip_models` below.
     models: []
-    # A pass over every point with an in-context model is measured in hours - the same reason TabICL
-    # is excluded from SHAP and from ensembling.
-    skip_models: ["TabICL"] #"TabICL"
-    # false records the failure in meta/run_summary.json and keeps the rest of the run.
+    # Models to always exclude, since running them over the full dataset can take a very long time
+    # (the same reason TabICL is excluded from SHAP and ensembling above).
+    skip_models: ["TabICL"]
+    # If exporting a model's predictions fails, false (default) records the failure in
+    # meta/run_summary.json and continues with the rest of the run.
     fail_on_error: false

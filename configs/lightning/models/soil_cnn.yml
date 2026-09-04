@@ -1,0 +1,201 @@
+# Combines your static (non-time-series) features with the time-series data, using one CNN
+# (convolutional neural network - the kind of model commonly used on images) per data source
+# ("modality" - e.g. Sentinel-2 imagery, weather, soil moisture) to learn patterns over time.
+#
+# To make the time series usable by a CNN, each point's ragged, irregularly-dated readings are laid
+# out onto a regular grid of (year, month) cells - essentially turning the time series into a small
+# image, with years as one axis and calendar months as the other. Years are counted backwards from
+# each point's own most recent observation, so it works regardless of the actual date range in your
+# data. How many years fit is worked out automatically from your data.
+#
+# Shares its `defaults:` (trainer/callback/datamodule settings) with every other model in this
+# folder - see ../lightning_registry.yml.
+soil_cnn:
+  enabled: false
+  input_kind: sequence
+  import_path: yg_eo_soilnet.models.lightningmodules.soil_cnn_lightning_module.SoilCNNLightningModule
+  datamodule_import_path: yg_eo_soilnet.datamodules.sequence.sequence_datamodule.SoilSequenceDataModule
+  init_args:
+    static_dim: auto                    # worked out automatically from your data. Only counts
+                                         # numeric (continuous) features - categorical ones (below)
+                                         # are handled separately.
+    target_dim: auto                    # worked out automatically: how many targets you're
+                                         # predicting at once
+    modality_dims: auto                 # worked out automatically: how many time-series columns
+                                         # each data source (modality) contributes
+    grid_years: auto                    # how many years of history the model looks at - worked
+                                         # out automatically from your data
+
+    # --- categorical features: learned embeddings -------------------------------------------------
+    # Columns declared as CATEGORICAL_FEATURES in data_spec.yml (e.g. a soil-texture class) are
+    # handled here. Rather than feeding the model a raw category label, each distinct category is
+    # given its own learned vector of numbers (an "embedding") that the model tunes during
+    # training - similar to how word embeddings work in language models. The set of categories is
+    # learned only from the TRAINING data; a category seen only at prediction time (never seen
+    # during training) is mapped to a reserved "unknown" slot instead of causing an error.
+    categorical_cardinalities: auto     # worked out automatically: how many distinct categories
+                                         # each column has (plus one, for the "unknown" slot)
+    categorical_vocabularies: auto      # worked out automatically; saved into the checkpoint so
+                                         # it's self-contained
+    categorical_feature_names: auto     # worked out automatically
+    embedding_dims: auto                # how wide each category's embedding vector is. auto picks
+                                         # a width based on how many categories that column has
+                                         # (more categories -> wider embedding), capped below
+    embedding_max_dim: 50               # the cap used by the auto heuristic above
+    embedding_dropout: 0.0              # "dropout" randomly zeroes out a fraction of values during
+                                         # training only, so the model can't over-rely on any single
+                                         # one of them - a common trick against overfitting. This
+                                         # applies dropout to the combined embedding vector. 0.0 = off.
+    continuous_norm: none                # none | batch | layer - whether/how to normalize the
+                                          # numeric (non-categorical) features before combining them
+                                          # with the embeddings above. Normalizing can make training
+                                          # more stable.
+
+    # Which method scans the (year x month) grid for patterns over time:
+    #   dilated_tempcnn  scans across months with an increasingly wide field of view, specifically
+    #                    built to connect a month to the SAME month a year earlier (useful for
+    #                    seasonal patterns).
+    #   annual_grid2d    scans across months and years as a 2-D grid, like scanning a small image
+    #                    in both directions.
+    temporal_encoder: dilated_tempcnn
+    # How wide each convolution layer is, one number per layer - same idea as head_hidden_dims
+    # further down. [128, 128] is two layers, both 128 wide. Can also be set per modality instead
+    # of one shared list, e.g. {s2: [64, 128], s1: [32]}.
+    cnn_hidden_dims: [128, 128]
+    modality_embed_dim: 64              # width of the summary vector produced per data source
+                                         # (modality); can be a single number or a per-modality map
+    cnn_norm: batch                     # how to normalize inside the conv layers: batch | group |
+                                         # none. `group` avoids issues on grid cells with no data.
+    pool: masked_avg                    # how the per-month values are combined into one summary:
+                                         # masked_avg (average, ignoring empty cells) | avg (average
+                                         # over everything, including empty cells)
+    month_positional: false             # add an explicit "which month is this" signal to each
+                                         # cell, so the model can still tell position after pooling
+    use_validity_channels: true         # tell the model, per data point, whether each value was
+                                         # actually measured or filled in for a gap
+
+    # --- using other measured lab values as extra inputs (off by default) --------------------------
+    # Lets the model use OTHER already-measured soil properties as extra inputs when predicting a
+    # target - e.g. using measured clay and pH as inputs when predicting organic matter. This is a
+    # deliberate exception to the rule that a lab value (LABEL_COLUMNS) is never used as a feature,
+    # so only use it for values that are genuinely available at prediction time too. Naming a
+    # column that's also one of your current TARGET_COLUMNS raises an error rather than silently
+    # allowing it, since a model should obviously never see the value it's supposed to predict.
+    # Missing values in these columns are filled in with the training-set median and flagged; check
+    # how complete a column actually is before choosing to use it, since a very sparse column will
+    # mostly be filled-in values rather than real measurements.
+    auxiliary_label_columns: []         # e.g. [clay_pct, ph_water]; [] turns this feature off
+    auxiliary_available_names: auto     # worked out automatically: the full set of columns these
+                                         # names can be chosen from
+    auxiliary_validity_channels: true   # also tell the model which values were measured vs filled in
+    # [] feeds these values into the model as-is (after standardizing). A non-empty list instead
+    # passes them through a small extra stack of layers first (same width-list idea as
+    # cnn_hidden_dims above) - useful so a handful of lab columns don't get "drowned out" once
+    # combined with a much larger set of other features.
+    auxiliary_hidden_dims: []
+    auxiliary_dropout: 0.0              # dropout (see embedding_dropout above) inside that stack
+
+    # --- location (coordinate) branch (off unless enabled in data_spec.yml) ------------------------
+    # This branch only activates if USE_HARMONIC_COORDS is turned on in data_spec.yml; otherwise
+    # it's skipped entirely and has zero effect on the model, so leaving these settings here is
+    # harmless if you're not using coordinates.
+    #
+    # Position is encoded as a set of sine/cosine values (see USE_HARMONIC_COORDS in data_spec.yml
+    # for why), at several different frequencies: low frequencies capture broad regional gradients,
+    # higher frequencies let the model tell apart points that are close together.
+    coord_dim: auto                     # worked out automatically: 2 (lat/lon) if coordinates are
+                                         # enabled, 0 (branch off) otherwise
+    harmonic_num_frequencies: 6         # how many different frequencies to encode position at -
+                                         # more gives finer-grained location detail
+    harmonic_include_input: true        # also include the raw normalized lat/lon values themselves,
+                                         # not just the sine/cosine encoding
+    # [] feeds the position encoding into the model as-is. A non-empty list passes it through a
+    # small extra stack of layers first (same idea as auxiliary_hidden_dims above).
+    harmonic_hidden_dims: []
+    harmonic_dropout: 0.0               # dropout (see embedding_dropout above) inside that stack
+
+    static_hidden_dims: [64]            # width of the layers processing your static features
+                                         # (same width-list idea as cnn_hidden_dims above)
+    # The final stack of layers that turns the combined features into the prediction - here,
+    # combined-features -> 64 -> prediction. Each layer normalizes its output EXCEPT the very last
+    # one before the prediction, unless head_norm_final below turns that on too.
+    head_hidden_dims: [64]
+    head_norm_final: false              # true also normalizes the layer right before the prediction
+    dropout: 0.2                        # dropout (see embedding_dropout above), applied throughout
+                                         # the static branch, every conv layer, AND the head
+
+    # --- loss function: what "being wrong" costs during training -----------------------------------
+    # The loss function is the score training tries to minimize - it defines what counts as a
+    # "mistake" and how much different kinds of mistakes cost. Options: mse | huber | smooth_l1 |
+    # mahalanobis | correlation_penalty | cosine
+    #
+    # IMPORTANT: each loss only pays attention to a SUBSET of the settings below it - the others
+    # are simply ignored, with no warning. Changing an ignored setting will not change your
+    # results, even though it still gets logged to MLflow as if it mattered - e.g. loss_lambda has
+    # no effect while loss_name is mahalanobis.
+    #
+    #   loss_name            settings it actually uses
+    #   -------------------  ------------------------------------------------------------------
+    #   mse                  (none)
+    #   huber | smooth_l1    huber_delta
+    #   mahalanobis          loss_shrinkage
+    #   correlation_penalty  loss_base (+ huber_delta if loss_base is huber/smooth_l1),
+    #                        loss_lambda, loss_min_batch
+    #   cosine               loss_base (+ huber_delta likewise), loss_lambda, cosine_space
+    #
+    # What each option means:
+    #   mse                  the standard choice: average squared error, i.e. bigger mistakes are
+    #                        penalized much more heavily than small ones.
+    #   huber / smooth_l1    like mse for small mistakes, but grows linearly instead of squared for
+    #                        big ones - less swayed by rare extreme outliers than plain mse.
+    #   mahalanobis          only usable with several targets at once (needs
+    #                        MULTI_TARGET_MODE: joint in data_spec.yml). A version of mse that also
+    #                        accounts for how the targets relate to each other - e.g. it costs more
+    #                        to mispredict two targets in a way that breaks their usual correlation
+    #                        than to miss them in a way that keeps it intact. Behaves exactly like
+    #                        mse when the targets don't correlate with each other at all.
+    #   correlation_penalty  also needs MULTI_TARGET_MODE: joint. Adds a penalty when the
+    #                        correlations AMONG the model's predictions (across a batch of samples)
+    #                        don't match the correlations seen in the training data. Needs a decent
+    #                        batch_size to be meaningful - see loss_min_batch below.
+    #   cosine               also needs MULTI_TARGET_MODE: joint. Adds a penalty on the RATIO
+    #                        between predicted targets, per sample rather than per batch - useful
+    #                        when getting the relative proportions between targets right matters as
+    #                        much as getting each one right individually.
+    loss_name: mahalanobis
+    huber_delta: 1.0                    # huber/smooth_l1: how big an error has to be before it
+                                         # switches from squared to linear penalty
+    loss_base: mse                      # correlation_penalty, cosine: the ordinary accuracy term
+                                         # these add their structural penalty on top of
+    loss_lambda: 0.1                    # correlation_penalty, cosine: how strongly to weight the
+                                         # structural penalty against the ordinary accuracy term
+    loss_shrinkage: 0.05                # mahalanobis: a stability safeguard for the internal
+                                         # correlation math; leave at the default unless you know
+                                         # you need to change it
+    loss_min_batch: 16                  # correlation_penalty: below this batch size, the
+                                         # correlation statistic is too noisy to trust, so it falls
+                                         # back to loss_base instead
+    # cosine only. original | standardized. `original` compares targets in their real, physical
+    # units - closer to how a domain expert would judge by eye, but needs a larger loss_lambda to
+    # have much effect. `standardized` compares them as z-scores instead (each target rescaled to
+    # the same range) - more sensitive to the overall SHAPE of the error than to physical ratios.
+    cosine_space: original
+    learning_rate: 0.00017098640419999995   # how big a step the optimizer takes each update - the
+                                             # single most impactful setting to tune
+    temporal_enabled: true              # use the time-series branch at all (false = static-only)
+    optimizer_name: adamw               # the optimization algorithm; adamw is a solid general
+                                         # default for deep learning
+    weight_decay: 1.146047247855197e-06 # a mild penalty on large weights, to reduce overfitting
+    scheduler_type: plateau             # automatically reduce the learning rate once progress
+                                         # stalls (a "plateau")
+    scheduler_factor: 0.5               # multiply the learning rate by this when that happens
+    scheduler_patience: 20              # how many epochs to wait for improvement before reducing
+                                         # the learning rate
+    scheduler_min_lr: 1.0e-06           # never reduce the learning rate below this floor
+    scheduler_monitor: val_loss         # which metric the scheduler above watches
+  datamodule_init_args:
+    max_sequence_length: null           # cut off very long time series to at most this many
+                                         # observations (keeping the most recent ones); null keeps
+                                         # every observation regardless of length
+  tags:
+    architecture: calendar-grid-cnn

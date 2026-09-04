@@ -1,0 +1,105 @@
+# An alternative to soil_cnn: combines static features with one sequence-model encoder per data
+# source (modality), instead of a CNN over a fixed grid. A learned "gate" decides how much to
+# weight each modality's contribution to the final prediction.
+#
+# Unlike soil_cnn, this model reads each point's time series directly as a sequence of dated
+# readings (in whatever order and spacing they actually occurred), rather than reshaping them onto
+# a fixed year/month grid first. Because of that, a trained model isn't tied to any particular
+# number of observations or time span, and keeps working on future data with a different length or
+# spacing of readings.
+#
+# Shares its `defaults:` (trainer/callback/datamodule settings) with every other model in this
+# folder - see ../lightning_registry.yml.
+soil_sequence:
+  enabled: false
+  input_kind: sequence
+  import_path: yg_eo_soilnet.models.lightningmodules.soil_sequence_lightning_module.SoilSequenceLightningModule
+  datamodule_import_path: yg_eo_soilnet.datamodules.sequence.sequence_datamodule.SoilSequenceDataModule
+  init_args:
+    static_dim: auto                     # see soil_cnn.yml for what these `auto` settings mean
+    target_dim: auto
+    modality_dims: auto
+    # No temporal_steps and no edge_attr_dim here on purpose: this model doesn't need a fixed
+    # sequence length or a spatial graph (that's what soil_graph.yml is for).
+
+    # --- categorical features: learned embeddings (see soil_cnn.yml) -------------------------------
+    categorical_cardinalities: auto      # worked out automatically: how many distinct categories
+                                          # each column has (plus one, for the "unknown" slot)
+    categorical_vocabularies: auto       # worked out automatically; saved into the checkpoint
+    categorical_feature_names: auto
+    embedding_dims: auto                 # auto picks a width based on category count, capped below
+    embedding_max_dim: 50                # the cap used by the auto heuristic above
+    embedding_dropout: 0                 # dropout (see soil_cnn.yml) on the combined embeddings
+    continuous_norm: none                # none | batch | layer, on the numeric features pre-combine
+
+    # Which method reads the time series for each data source:
+    #   time_transformer  a Transformer (the architecture behind most modern language models),
+    #                     adapted to read irregularly-spaced dated readings instead of words.
+    #                     Generally the stronger option, especially with more data.
+    #   time_lstm         an LSTM (a more traditional sequence model that reads the series step by
+    #                     step, in order). Can work better with less data or shorter sequences.
+    temporal_encoder: time_transformer   # time_transformer | time_lstm
+    modality_embed_dim: 64               # width of the summary vector produced per data source;
+                                          # can be a single number or a per-modality map
+    fusion_dim: 64                       # width of the combined vector after merging all sources
+    static_hidden_dims: [64]             # see soil_cnn.yml
+
+    # --- settings used only when temporal_encoder: time_transformer --------------------------------
+    d_model: 48                          # internal width of the transformer; must be evenly
+                                          # divisible by nhead below
+    nhead: 4                             # number of parallel "attention heads" - roughly, how many
+                                          # different patterns the transformer can attend to at once
+    num_layers: 2                        # how many transformer layers are stacked
+    time2vec_dim: 8                      # width of the learned encoding used to represent each
+                                          # reading's date/position in the sequence
+    # --- settings used only when temporal_encoder: time_lstm ---------------------------------------
+    lstm_hidden_dim: 64                  # width of the LSTM's internal memory
+    lstm_num_layers: 1                   # how many LSTM layers are stacked
+    lstm_bidirectional: false            # true reads the sequence both forwards and backwards
+    # How the per-timestep outputs are combined into one summary per modality:
+    #   mean_max_last  combine the average, the maximum, and the most recent reading
+    #   last           just use the most recent reading
+    #   attention      let the model learn which timesteps matter most, and weight accordingly
+    temporal_pooling: mean_max_last      # mean_max_last | last | attention
+
+    span_cap_years: 8.0                  # caps how far back a reading's "age" (relative to the
+                                          # point's most recent observation) is allowed to count -
+                                          # NOT a hard limit on how much history is used
+    delta_cap_months: 24.0               # similarly caps how large a gap between consecutive
+                                          # readings is allowed to count
+    dropout: 0.1                         # see embedding_dropout in soil_cnn.yml
+
+    # The layers that turn the combined features into the prediction (see head_hidden_dims in
+    # soil_cnn.yml). [] would mean a single layer straight from the combined features to the
+    # prediction.
+    head_hidden_dims: [64]
+    use_layer_norm: true
+    # How the combined feature vector is normalized before the head above: batch | layer | none.
+    # `batch` (default) keeps each sample's overall scale intact, which regression tends to need;
+    # `layer` rescales each sample to a fixed range, which can make it harder for the model to
+    # predict values far from the average.
+    fusion_norm_type: batch
+
+    # --- loss and optimizer: see soil_cnn.yml for what each of these means, and which settings
+    # each loss_name actually reads (only mse | huber | smooth_l1 make sense with a single target;
+    # the other three need MULTI_TARGET_MODE: joint in data_spec.yml). ------------------------------
+    loss_name: mse
+    huber_delta: 1.0
+    loss_base: mse
+    loss_lambda: 0.1
+    loss_shrinkage: 0.05
+    loss_min_batch: 16
+    cosine_space: original
+    learning_rate: 0.01
+    temporal_enabled: true
+    optimizer_name: adamw
+    weight_decay: 0.005
+    scheduler_type: plateau
+    scheduler_factor: 0.5
+    scheduler_patience: 10               # counted in epochs
+    scheduler_min_lr: 1.0e-06
+    scheduler_monitor: val_loss
+  datamodule_init_args:
+    max_sequence_length: null            # cut off very long time series (see soil_cnn.yml)
+  tags:
+    architecture: static-dynamic-sequence

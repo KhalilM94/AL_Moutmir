@@ -1,0 +1,76 @@
+# An older architecture, superseded by soil_sequence.yml - kept here, off by default, purely as
+# a reproducible reference baseline to compare newer models against (see lightning_logs/version_79
+# for that reference run, which scored around R2 = 0.20). Not recommended for new work.
+#
+# Technically this is a graph neural network: instead of treating each point independently, points
+# within spatial_radius of each other can be connected as a "graph" and share information - though
+# that spatial-sharing behaviour is turned off by default here (spatial_graph_enabled: false),
+# making it behave like an ordinary per-point model with an LSTM-based temporal branch.
+#
+# Shares its `defaults:` (trainer/callback/datamodule settings) with every other model in this
+# folder - see ../lightning_registry.yml.
+soil_graph:
+  enabled: false
+  input_kind: graph
+  import_path: yg_eo_soilnet.models.lightningmodules.soil_graph_lightning_module.SoilGraphLightningModule
+  datamodule_import_path: yg_eo_soilnet.datamodules.lightning.lightning_graph.SingleNodeGraphDataModule
+  init_args:
+    static_dim: auto
+    target_dim: auto
+    modality_dims: auto
+    temporal_steps: auto
+    edge_attr_dim: auto
+    num_graph_layers: 1              # only used if spatial_graph_enabled below is turned on
+
+    # --- per-modality width: how much capacity each data source gets -------------------------------
+    static_hidden_dims: [32]         # 13 covariates -> 32
+    temporal_lstm_num_layers: 1
+    temporal_lstm_dropout: 0.1       # only applies since temporal_lstm_num_layers is more than 1
+    temporal_lstm_bidirectional: false
+    temporal_pooling: last           # how each modality's time series becomes one summary vector:
+                                      # here, just the most recent value
+    temporal_lstm_hidden_dim:        # width of the LSTM per data source; a single number applies
+      s2: 48                         # the same width to every modality, or set one per modality
+      s1: 32                         # like this
+      soil: 16
+      ag: 16
+      clim: 16
+
+    # The layers that turn the combined features into the prediction (see head_hidden_dims in
+    # soil_cnn.yml).
+    head_hidden_dims: [64, 32, 32]
+
+    # --- normalization (applied in the static branch, the head, and the graph blocks) --------------
+    use_layer_norm: true
+    fusion_norm_type: batch          # batch | layer | none - see the note under soil_sequence.yml
+
+    # --- loss: mse | huber | smooth_l1 (huber_delta is the Huber delta / SmoothL1 beta - see
+    # soil_cnn.yml) --------------------------------------------------------------------------------
+    loss_name: mse
+    huber_delta: 1.0
+
+    dropout: 0.1
+    learning_rate: 0.001
+    temporal_enabled: true
+    spatial_graph_enabled: false     # turn on to let nearby points (within spatial_radius below)
+                                      # share information through the graph layers above
+    optimizer_name: adamw
+    weight_decay: 0.0001
+    scheduler_type: plateau
+    scheduler_factor: 0.5
+    scheduler_patience: 20           # counted in epochs
+    scheduler_min_lr: 1.0e-06
+    scheduler_monitor: val_loss
+  datamodule_init_args:
+    batch_size: 32
+  # Only relevant if spatial_graph_enabled above is turned on - controls how the spatial graph
+  # connecting nearby points is built.
+  graph_data_args:
+    convert_coordinates_to_utm: true # convert lat/lon into metres, so spatial_radius below can be
+                                      # a distance rather than degrees
+    coordinate_crs: EPSG:4326        # the coordinate system your input lat/lon values are in
+    spatial_radius: 5000             # connect points within this many metres of each other
+    baseline_method: knn             # how neighbours are chosen: k-nearest-neighbours
+    baseline_k_neighbors: 20         # how many neighbours to connect each point to
+  tags:
+    architecture: single-node-graph

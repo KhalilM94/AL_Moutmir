@@ -1,0 +1,53 @@
+# Uses ONLY your static (non-time-series) features - no time-series branch at all. This is the
+# baseline for answering "does the time-series data actually help?": it shares the same data
+# pipeline, loss, and optimizer setup as soil_sequence.yml and soil_cnn.yml, so any difference in
+# accuracy comes purely from having (or not having) the time-series information. Off by default -
+# turn it on alongside a temporal model to compare them.
+#
+# Shares its `defaults:` (trainer/callback/datamodule settings) with every other model in this
+# folder - see ../lightning_registry.yml.
+soil_tabular:
+  enabled: false
+  input_kind: sequence
+  import_path: yg_eo_soilnet.models.lightningmodules.soil_tabular_lightning_module.SoilTabularLightningModule
+  datamodule_import_path: yg_eo_soilnet.datamodules.sequence.sequence_datamodule.SoilSequenceDataModule
+  init_args:
+    static_dim: auto                     # see soil_cnn.yml for what these `auto` settings mean
+    target_dim: auto
+
+    # --- categorical features: learned embeddings (see soil_cnn.yml) -------------------------------
+    categorical_cardinalities: auto
+    categorical_vocabularies: auto
+    categorical_feature_names: auto
+    embedding_dims: auto                 # auto = min(embedding_max_dim, half of the category count)
+    embedding_max_dim: 50
+    embedding_dropout: 0.3
+    continuous_norm: batch                # none | batch | layer
+
+    static_hidden_dims: [64]
+    head_hidden_dims: [256, 256, 128, 64, 32]  # a 5-layer head: 256 -> 256 -> 128 -> 64 -> 32 ->
+                                                # prediction (see head_hidden_dims in soil_cnn.yml)
+    dropout: 0.1
+    activation: relu                     # the nonlinearity used between layers: relu | gelu
+                                          # (relu is the classic default; gelu is smoother and used
+                                          # in many modern architectures)
+    use_layer_norm: true
+
+    # --- loss and optimizer: see soil_cnn.yml for details -------------------------------------------
+    loss_name: mse
+    huber_delta: 1.0
+    loss_base: mse
+    loss_lambda: 0.1
+    loss_shrinkage: 0.05
+    loss_min_batch: 16
+    cosine_space: original
+    learning_rate: 0.001
+    optimizer_name: adamw
+    weight_decay: 0.0001
+    scheduler_type: plateau
+    scheduler_factor: 0.5
+    scheduler_patience: 20
+    scheduler_min_lr: 1.0e-06
+    scheduler_monitor: val_loss
+  tags:
+    architecture: tabular-entity-embeddings
