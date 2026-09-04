@@ -68,6 +68,10 @@ class ArtifactLayout:
     EVAL_RESULTS_FILE = "eval_results.csv"
     SPLIT_SUMMARY_FILE = "split_summary.json"
     RUN_SUMMARY_FILE = "run_summary.json"
+    # Why a JOINT fit has no explanation under it. A joint model is explained once, so the reason it
+    # was not - disabled, skipped by name, over budget, errored - belongs to the model run, said
+    # once, rather than copied into every per-target child.
+    EXPLAIN_SUMMARY_FILE = "explain_summary.json"
     CV_RESULTS_FILE = "cv_results.csv"
     PRED_OBS_FILE = "pred_obs.png"
     # Lightning names its checkpoints epoch=NN-step=MMM.ckpt, which differs between any two runs

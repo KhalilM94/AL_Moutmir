@@ -1,6 +1,7 @@
 from yg_eo_soilnet.models.lightningmodules.soil_cnn_lightning_module import SoilCNNLightningModule
 from yg_eo_soilnet.models.lightningmodules.soil_graph_lightning_module import SoilGraphLightningModule
 from yg_eo_soilnet.models.lightningmodules.soil_sequence_lightning_module import SoilSequenceLightningModule
+from yg_eo_soilnet.models.lightningmodules.spatial_encoders import HarmonicPositionEncoder
 from yg_eo_soilnet.models.lightningmodules.temporal_cnn_encoders import (
     AnnualGrid2DEncoder,
     CalendarGridRasterizer,
@@ -23,6 +24,7 @@ __all__ = [
     "ConcatGatedFusion",
     "DilatedTempCNNEncoder",
     "GatedFusion",
+    "HarmonicPositionEncoder",
     "SoilCNNLightningModule",
     "SoilGraphLightningModule",
     "SoilSequenceLightningModule",

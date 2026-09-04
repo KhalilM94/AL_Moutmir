@@ -547,7 +547,7 @@ class ChildRunLogger:
                 calibrator=calibrator,
                 artifact_path=ArtifactLayout.uncertainty_path(target if multi_target else None),
             )
-        except Exception as exc:  # pragma: no cover - defensive, mirrors _log_shap_artifacts
+        except Exception as exc:  # pragma: no cover - defensive, mirrors _shap_failure_summary
             return {"error": f"{type(exc).__name__}: {exc}"}
 
     def _log_point_predictions(
@@ -897,27 +897,29 @@ class ChildRunLogger:
             # A registry that will not take the alias must not lose a finished training run.
             return {"promoted": False, "reason": f"{type(exc).__name__}: {exc}"}
 
-    def _log_shap_artifacts(
-        self,
-        config,
-        target: str,
-        model_name: str,
-        backend: str,
-        payload: dict,
-    ) -> dict:
-        """Build and log the SHAP artifacts for one child run, or explain why it did not.
+    # --- SHAP: explained ONCE per fitted model ------------------------------
+    # An explanation is a property of the MODEL, not of a target. A joint fit therefore explains
+    # once, at model-run scope, and each target's slice is written into the run that already holds
+    # that target's metrics and plots. It used to be explained inside the per-target fan-out, which
+    # bought the same answer N times: on the Lightning side, where the explainer returns every
+    # output whatever `target` says, that also nested explain/<target>/ inside EVERY child run -
+    # nine artifact sets for three targets, each child's run summary claiming to have explained the
+    # other two, and the copies disagreeing with each other because GradientExplainer is stochastic.
+    #
+    # The seam is split in three so the two halves can happen in different runs:
+    #   _shap_gate           - the off-switch, before any import;
+    #   _build_shap_results  - the ONE explainer pass, on the model run;
+    #   _log_shap_results    - writes explain/ into whatever run is active.
+    # _log_shap_artifacts composes them and keeps its old signature: it is what the gate and budget
+    # tests call directly, and it is still the only door into the explain package.
 
-        This method is the SHAP off-switch, and it is deliberately the ONLY place that reaches for
-        the explain package. Three properties it has to keep:
+    @staticmethod
+    def _shap_gate(config, model_name: str) -> dict | None:
+        """The SHAP off-switch. ``None`` means go ahead; a dict is the reason not to.
 
-        * ``EXPLAIN_ENABLED: false`` returns before importing anything - ``shap`` pulls in numba and
-          is slow to import, and a run that asked for no explainability must not pay for it, nor
-          risk tripping the ``filterwarnings = ["error"]`` pytest setting on a warning it emits;
-        * the import is local to this function for the same reason;
-        * a failure here is recorded, not raised, unless ``EXPLAIN_FAIL_ON_ERROR`` - losing a
-          finished training run because an explainer choked is a bad trade.
-
-        Returns the dict that goes into the run summary's ``explain`` key.
+        Runs BEFORE anything is imported: ``shap`` pulls in numba and is slow to import, and a run
+        that asked for no explainability must not pay for it, nor risk tripping the
+        ``filterwarnings = ["error"]`` pytest setting on a warning it emits.
         """
         if not bool(getattr(config, "EXPLAIN_ENABLED", True)):
             return {"enabled": False, "reason": "EXPLAIN_ENABLED is false"}
@@ -945,12 +947,58 @@ class ChildRunLogger:
                 ),
             }
 
+        return None
+
+    @staticmethod
+    def _shap_failure_summary(exc: Exception, config) -> dict:
+        """What an explainer failure puts in the run summary. Shared by the build and log halves.
+
+        A failure here is recorded, not raised, unless ``EXPLAIN_FAIL_ON_ERROR`` - losing a finished
+        training run because an explainer choked is a bad trade.
+        """
+        # A budget skip is a decision, not a failure: the run is healthy and the explanation was
+        # declined on cost. It is reported as "skipped" so it is not mistaken for a crash, and
+        # it is NOT escalated by EXPLAIN_FAIL_ON_ERROR, which is there for genuine errors.
+        # Compared by NAME so this path never has to import the explain package to raise.
+        if type(exc).__name__ == "ExplainBudgetExceeded":
+            return {"enabled": True, "logged": False, "skipped": True, "reason": str(exc)}
+        if bool(getattr(config, "EXPLAIN_FAIL_ON_ERROR", False)):
+            raise exc
+        return {"enabled": True, "logged": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def _build_shap_results(
+        self,
+        config,
+        target: str,
+        model_name: str,
+        backend: str,
+        payload: dict,
+    ) -> tuple[list | None, dict]:
+        """Explain the fitted model ONCE, for every output it has. Call this on the MODEL run.
+
+        Returns ``(results, summary)``. ``results`` is ``None`` when nothing was computed, and then
+        ``summary`` says why - disabled, skipped, over budget, or errored - in the exact shape the
+        run summary's ``explain`` key has always had.
+        """
+        gate = self._shap_gate(config, model_name)
+        if gate is not None:
+            return None, gate
+
         try:
-            from yg_eo_soilnet.explain import build_shap_results, log_shap_artifacts
+            from yg_eo_soilnet.explain import build_shap_results
 
             results = build_shap_results(config=config, backend=backend, **payload)
-            if not results:
-                return {"enabled": True, "logged": False, "reason": "explainer produced no values"}
+        except Exception as exc:
+            return None, self._shap_failure_summary(exc, config)
+
+        if not results:
+            return None, {"enabled": True, "logged": False, "reason": "explainer produced no values"}
+        return results, {"enabled": True}
+
+    def _log_shap_results(self, results, *, config) -> dict:
+        """Write ``explain/`` for the results handed in, into the CURRENTLY ACTIVE run."""
+        try:
+            from yg_eo_soilnet.explain import log_shap_artifacts
 
             written = log_shap_artifacts(
                 results,
@@ -958,14 +1006,112 @@ class ChildRunLogger:
             )
             return {"enabled": True, "logged": True, **written}
         except Exception as exc:
-            # A budget skip is a decision, not a failure: the run is healthy and the explanation was
-            # declined on cost. It is reported as "skipped" so it is not mistaken for a crash, and
-            # it is NOT escalated by EXPLAIN_FAIL_ON_ERROR, which is there for genuine errors.
-            if type(exc).__name__ == "ExplainBudgetExceeded":
-                return {"enabled": True, "logged": False, "skipped": True, "reason": str(exc)}
-            if bool(getattr(config, "EXPLAIN_FAIL_ON_ERROR", False)):
-                raise
-            return {"enabled": True, "logged": False, "error": f"{type(exc).__name__}: {exc}"}
+            return self._shap_failure_summary(exc, config)
+
+    def _log_shap_artifacts(
+        self,
+        config,
+        target: str,
+        model_name: str,
+        backend: str,
+        payload: dict,
+    ) -> dict:
+        """Explain a model and log every output of it into the current run.
+
+        The whole seam in one call. Both training families now use the two halves separately - they
+        build on the model run and log each slice in its target's run - so nothing in src calls
+        this; it is kept because it is the smallest thing that exercises the gate, the budget skip
+        and the failure summary end to end, which is what tests/test_explain_switch.py and
+        tests/test_explain_budget.py do with it. It composes the same units production uses, so
+        there is no second copy of that logic to drift.
+        """
+        results, summary = self._build_shap_results(config, target, model_name, backend, payload)
+        if results is None:
+            return summary
+        return self._log_shap_results(results, config=config)
+
+    @staticmethod
+    def _shap_result_for(results, target: str, target_names):
+        """This target's slice of an explanation computed for the whole joint model.
+
+        By name first, then by position. A name miss is expected rather than a bug: both explainers
+        fall back to synthetic names when the model carries no target names or the wrong number of
+        them, so the position in the group is the only thing left tying an output to a target.
+        """
+        for result in results:
+            if str(result.target_name) == str(target):
+                return result
+
+        names = [str(name) for name in (target_names or [])]
+        if str(target) in names and len(results) == len(names):
+            return results[names.index(str(target))]
+
+        return results[0] if len(results) == 1 else None
+
+    def _log_shap_slice(
+        self,
+        results,
+        summary: dict,
+        *,
+        target: str,
+        target_names,
+        config,
+        is_model_run: bool,
+    ) -> dict:
+        """Log THIS target's slice of the joint explanation, into the run that holds this target.
+
+        The slice goes to the FLAT explain/ path, which is where a single-target run has always
+        written it: the run is now the per-target scope, so there is no second target in this run to
+        nest away from - and a joint fit's explain/ then compares directly against a single-target
+        fit's, which is what ArtifactLayout's flat paths exist for.
+
+        With nothing to log, the reason belongs to the MODEL, not to this target. On the model run
+        itself it is returned in full, as it always was. In a per-target child it becomes a pointer:
+        the full reason is recorded once, on the model run, by _record_model_run_explain.
+        """
+        if not results:
+            if is_model_run:
+                return summary
+            return {
+                "enabled": summary.get("enabled", False),
+                "logged": False,
+                "scope": "model_run",
+            }
+
+        result = self._shap_result_for(results, target, target_names)
+        if result is None:
+            return {
+                "enabled": True,
+                "logged": False,
+                "reason": f"the explainer returned no output named {target}",
+            }
+        return self._log_shap_results([result], config=config)
+
+    def _record_model_run_explain(self, summary: dict, *, results, target_runs) -> None:
+        """On the model run, say once why a joint fit has no explanation anywhere beneath it.
+
+        Call AFTER the fan-out, with what it returned: the child run contexts have closed by then,
+        so this lands on the model run. Only when the run actually fanned out - a single-target
+        group's model run IS its target run, and _log_shap_slice has already put the full reason in
+        its run summary. Tagged as well as written, for the same reason _tag_model_logging tags its
+        outcome: the absence of a beeswarm is not by itself evidence of why, and a reader should not
+        have to open a JSON to find out.
+        """
+        if results is not None or len(target_runs or []) <= 1:
+            return
+
+        status = "skipped" if summary.get("skipped") else ("error" if summary.get("error") else "not_logged")
+        if not summary.get("enabled", False):
+            status = "disabled"
+        try:
+            mlflow.set_tags({"explain_status": status})
+        except Exception:
+            pass
+        self._write_json_artifact(
+            summary,
+            ArtifactLayout.EXPLAIN_SUMMARY_FILE,
+            artifact_path=ArtifactLayout.META,
+        )
 
     def _log_plots(self, plot_functions: dict, target: str, model_name: str):
         """
@@ -1189,6 +1335,25 @@ class ChildRunLogger:
                 n_expected=len(X_all),
             )
 
+        # --- SHAP, computed ONCE for the fitted model ---
+        # On the MODEL run, before the fan-out: best_model is the joint estimator that predicts
+        # every target in the group, so explaining it once per target bought N copies of one answer
+        # and, for a permutation explainer, N times the EXPLAIN_MAX_EVALS budget. log_one writes
+        # each target's slice into that target's own run.
+        shap_results, shap_summary = self._build_shap_results(
+            config,
+            target,
+            model_name,
+            "sklearn",
+            {
+                "fitted_estimator": best_model,
+                "X_train": X_train,
+                "X_test": X_test,
+                "target": target,
+                "target_names": target_names,
+            },
+        )
+
         def log_one(frame, target_name):
             """Everything that is about ONE target, in whichever run holds that target."""
             metrics = regression_metrics(frame[target_name], frame["prediction"])
@@ -1245,19 +1410,14 @@ class ChildRunLogger:
                 calibrator=(ensemble.calibrators.get(target_name) if ensemble else None),
             )
 
-            # --- SHAP ---
-            explain_summary = self._log_shap_artifacts(
-                config=config,
+            # --- SHAP: this target's slice of the explanation computed above ---
+            explain_summary = self._log_shap_slice(
+                shap_results,
+                shap_summary,
                 target=target_name,
-                model_name=model_name,
-                backend="sklearn",
-                payload={
-                    "fitted_estimator": best_model,
-                    "X_train": X_train,
-                    "X_test": X_test,
-                    "target": target_name,
-                    "target_names": target_names,
-                },
+                target_names=target_names,
+                config=config,
+                is_model_run=(target_name == target),
             )
 
             # The same split_summary.json the Lightning path writes, so the two families' holdouts
@@ -1287,7 +1447,8 @@ class ChildRunLogger:
             )
             return explain_summary
 
-        self._log_per_target_runs(eval_df, target, model_name, log_one)
+        target_runs = self._log_per_target_runs(eval_df, target, model_name, log_one)
+        self._record_model_run_explain(shap_summary, results=shap_results, target_runs=target_runs)
 
         # --- The train-fit diagnostic, LAST ---
         # One number - R2 of the fitted model against its own training split - that costs a full
@@ -1583,6 +1744,26 @@ class ChildRunLogger:
             full_population_predictions=full_population_predictions,
         )
 
+        # --- SHAP, computed ONCE for the fitted model ---
+        # The same rule the sklearn path follows, and the one this family needed most: the Lightning
+        # explainer returns EVERY output whatever `target` says, so running it inside the fan-out
+        # wrote explain/<target>/ for all N targets inside each of the N child runs - N^2 artifact
+        # sets, each run's summary claiming to have explained the others, and the copies disagreeing
+        # because GradientExplainer is stochastic. _resolve_target_names is the same function the
+        # fan-out uses to decide which children exist, so the ordering here matches theirs.
+        group_target_names = (
+            self._resolve_target_names(evaluation_df, run_target)
+            if evaluation_df is not None
+            else [run_target]
+        )
+        shap_results, shap_summary = self._build_shap_results(
+            config,
+            run_target,
+            model_name,
+            "lightning",
+            {"model": model, "bundle": bundle, "target": run_target},
+        )
+
         def log_one(frame, target_name):
             """Everything that is about ONE target, in whichever run holds that target."""
             is_model_run = target_name == run_target
@@ -1625,12 +1806,13 @@ class ChildRunLogger:
                 calibrator=calibrators.get(target_name),
             )
 
-            explain_summary = self._log_shap_artifacts(
-                config=config,
+            explain_summary = self._log_shap_slice(
+                shap_results,
+                shap_summary,
                 target=target_name,
-                model_name=model_name,
-                backend="lightning",
-                payload={"model": model, "bundle": bundle, "target": target_name},
+                target_names=group_target_names,
+                config=config,
+                is_model_run=is_model_run,
             )
 
             summary = {
@@ -1662,7 +1844,9 @@ class ChildRunLogger:
             )
             return explain_summary
 
-        self._log_per_target_runs(evaluation_df, run_target, model_name, log_one)
+        target_runs = self._log_per_target_runs(evaluation_df, run_target, model_name, log_one)
+        self._record_model_run_explain(shap_summary, results=shap_results, target_runs=target_runs)
+
 
 class ParentRunLogger:
     def __init__(self):

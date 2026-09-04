@@ -47,13 +47,13 @@ CARRY_LABEL_COLUMNS: true
 # The subset of LABEL_COLUMNS to actually fit models for in this run. A name on either side is
 # treated as a label and kept out of the features; only these get models fitted.
 TARGET_COLUMNS:
-  - organic_matter_g_kg
+  # - organic_matter_g_kg
   # - clay_pct
   # - sand_pct
   # - total_silt_pct
   # - ph_water
   # - caco3_pct_total
-  # - c_e_c_meq_100g
+  - c_e_c_meq_100g
   # - c_n_ratio
   # - p2o5_ehangable_olsen_ppm
 
@@ -63,9 +63,40 @@ TARGET_COLUMNS:
 # Both families obey this. A registry entry may override it with its own `multi_target:` key; an
 # sklearn entry must additionally declare `multi_target: native` to be eligible for a joint fit,
 # since most scikit estimators cannot take a 2-D y.
-MULTI_TARGET_MODE: joint
+MULTI_TARGET_MODE: per_target
 
 PREDICTOR_COLUMNS: []
+
+# --- spatial awareness (both switchable, both off/empty by default) -------------------------
+# Route lat/lon into the CNN's harmonic coordinate branch. With this off the coordinates stay
+# exactly where they have always been: metadata, listed in IGNORED_COLUMNS below and dropped by
+# filter_schema for every training family.
+#
+# Turning it on does NOT make them ordinary predictors. They bypass the feature frame entirely -
+# the same deliberate bypass CARRY_LABEL_COLUMNS authorises for lab values - and reach only
+# SoilCNNLightningModule's coordinate branch, which normalizes them against the TRAIN-split
+# bounding box and expands them into a multi-frequency sine/cosine embedding. The sklearn family
+# and the tabular/sequence models never see them either way.
+#
+# Two consequences worth knowing before flipping it:
+#   * A point with a missing lat or lon is DROPPED, because there is no honest fill for a
+#     coordinate. The count is logged, and the unified splitter sees the reduced population.
+#   * A model that can read position will exploit spatial autocorrelation, so `split.strategy:
+#     random` in main_config.yml will overstate its skill. Evaluate with `spatial_group` too.
+USE_HARMONIC_COORDS: true
+
+# Precomputed spatial-context columns - patch variance, neighbourhood statistics, anything already
+# computed per point and sitting in the static CSV. These enter TabularStaticEncoder as ordinary
+# CONTINUOUS covariates, standardized like any other; naming them here only groups them, so they
+# can be switched off as a set and attributed as a block in the SHAP output.
+#
+# Note the asymmetry with the flag above: naming a column here makes it switchable, which means
+# USE_CONTEXT_FEATURES: false REMOVES a column that would otherwise be an ordinary feature. That
+# is the ablation, and it is intended. An empty list changes nothing anywhere.
+#
+# A name that is not in the data raises, exactly as an unknown CATEGORICAL_FEATURES entry does.
+CONTEXT_FEATURES: []
+USE_CONTEXT_FEATURES: false
 
 # Metadata only. Lab values live in LABEL_COLUMNS and no longer need blacklisting here.
 IGNORED_COLUMNS: &ignored_columns
@@ -78,15 +109,13 @@ IGNORED_COLUMNS: &ignored_columns
   - date
   # - texture_20cm
   # - landform_class
-  - bd_median_0_30cm
-  - clay_median_0_30cm
-  - ph_median_0_30cm
-  - sand_median_0_30cm
-  - soc_median_0_30cm
-  - swc_median_0_30cm
-  - ClimDef_trend_slope
-  - SM_trend_slope
-  - ETa_trend_slope
+  # - bd_median_0_30cm
+  # - clay_median_0_30cm
+  # - ph_median_0_30cm
+  # - sand_median_0_30cm
+  # - soc_median_0_30cm
+  # - swc_median_0_30cm
+
   # - organic_matter_g_kg__soil_cnn
   # - clay_pct__soil_cnn
   # - ph_water__soil_cnn

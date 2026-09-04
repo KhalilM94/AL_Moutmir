@@ -12,6 +12,7 @@ from yg_eo_soilnet.models.lightningmodules._regression_base import (
     batch_get,
 )
 from yg_eo_soilnet.models.lightningmodules.mlp import build_mlp_stack
+from yg_eo_soilnet.models.lightningmodules.spatial_encoders import HarmonicPositionEncoder
 from yg_eo_soilnet.models.lightningmodules.tabular_encoders import TabularStaticEncoder
 from yg_eo_soilnet.models.lightningmodules.temporal_cnn_encoders import (
     AnnualGrid2DEncoder,
@@ -33,10 +34,13 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
 
         x_static ---> static_encoder --------------------------------.
                                                                       \\
-        sequences[m] + mask + time + validity                          >-- ConcatGatedFusion
-                 |                                                    /            |
-                 '--> CalendarGridRasterizer ---> CNN_m ---> concat --'             v
-                      (ragged -> years x months)                        LayerNorm+GELU MLP head
+        sequences[m] + mask + time + validity                          \\
+                 |                                                      >-- ConcatGatedFusion
+                 '--> CalendarGridRasterizer ---> CNN_m ---> concat ---/            |
+                      (ragged -> years x months)                      /            v
+                                                                     /   LayerNorm+GELU MLP head
+        x_coords ---> HarmonicPositionEncoder ----------------------'
+        (train-bbox normalized lat/lon; absent unless USE_HARMONIC_COORDS)
 
     Convolution replaces recurrence, so every month is processed in parallel and annual seasonality
     is a property of the receptive field rather than something the network has to learn to remember.
@@ -52,6 +56,14 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
     is only sound when the named values are genuinely available at inference time too - predicting
     organic matter for a sample whose texture and pH were measured, say. Naming a column that is
     also being fitted raises rather than being filtered out.
+
+    ``coord_dim`` optionally adds a third branch reading the point's own position. It is 0 unless
+    the data carries coordinates, which happens only under ``USE_HARMONIC_COORDS``; at 0 the branch
+    is an ``nn.Identity`` contributing no parameters and no state_dict keys, so a model built
+    without it is indistinguishable from one built before the option existed. Unlike the temporal
+    branch, which is built so that nothing encodes an absolute epoch, this one encodes absolute
+    position deliberately - that is the signal - and the train bounding box that anchors it travels
+    in the datamodule's preprocessing state.
     """
 
     def __init__(
@@ -82,6 +94,14 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         auxiliary_validity_channels: bool = True,
         auxiliary_hidden_dims: Optional[Sequence[int]] = None,
         auxiliary_dropout: float = 0.0,
+        # --- harmonic coordinate branch -----------------------------------------------------
+        # Inert at coord_dim=0, which is what the datamodule reports unless USE_HARMONIC_COORDS put
+        # coordinates on the bundle. See spatial_encoders.HarmonicPositionEncoder.
+        coord_dim: int = 0,
+        harmonic_num_frequencies: int = 6,
+        harmonic_include_input: bool = True,
+        harmonic_hidden_dims: Optional[Sequence[int]] = None,
+        harmonic_dropout: float = 0.0,
         static_hidden_dims: Sequence[int] = (64,),
         head_hidden_dims: Sequence[int] = (128, 64),
         head_norm_final: bool = False,
@@ -137,6 +157,9 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         auxiliary_label_columns = [str(name) for name in (auxiliary_label_columns or [])]
         auxiliary_available_names = [str(name) for name in (auxiliary_available_names or [])]
         auxiliary_hidden_dims = [int(width) for width in (auxiliary_hidden_dims or [])]
+        # Same reason: a tuple default and a YAML list must both land in hyper_parameters as a
+        # plain list of ints, or the checkpoint stops reloading under weights_only=True.
+        harmonic_hidden_dims = [int(width) for width in (harmonic_hidden_dims or [])]
         target_names = [str(name) for name in (target_names or [])]
         # Every target the RUN fits, which under per-target grouping is a superset of this model's
         # outputs. Defaults to target_names so a hand-built module keeps the old behaviour.
@@ -253,10 +276,20 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
             auxiliary_dropout,
         )
 
+        self.coordinate_encoder = self._build_coordinate_encoder(
+            coord_dim,
+            harmonic_num_frequencies,
+            harmonic_include_input,
+            harmonic_hidden_dims,
+            harmonic_dropout,
+        )
+
         # The static branch keeps its width even when static_dim is 0, so the fused vector has a
         # fixed shape regardless of whether covariates are present.
         temporal_dim = sum(encoder.output_dim for encoder in self.temporal_encoders.values())
-        self.fusion = ConcatGatedFusion(self.static_hidden_dim, temporal_dim)
+        self.fusion = ConcatGatedFusion(
+            self.static_hidden_dim, temporal_dim, self.coordinate_output_dim
+        )
         self.output_head = build_mlp_stack(
             self.fusion.output_dim + self.auxiliary_output_dim,
             head_hidden_dims,
@@ -377,6 +410,40 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         self.auxiliary_output_dim = hidden_dims[-1] if hidden_dims else input_dim
         return encoder
 
+    def _build_coordinate_encoder(
+        self,
+        coord_dim: Any,
+        num_frequencies: int,
+        include_input: bool,
+        hidden_dims: list[int],
+        dropout: float,
+    ) -> nn.Module:
+        """The harmonic branch, or an ``nn.Identity`` contributing nothing when there are no coords.
+
+        Returning Identity rather than a zero-width encoder is what keeps the promise that this
+        option is free when unused: ``nn.Identity`` registers no parameters and no state_dict keys,
+        so a model at ``coord_dim=0`` has exactly the parameter count and exactly the key set of one
+        built before the branch existed, and a checkpoint from either loads into the other.
+        """
+        self.coord_dim = int(coord_dim or 0)
+        self.coordinate_output_dim = 0
+        if self.coord_dim <= 0:
+            return nn.Identity()
+
+        encoder = HarmonicPositionEncoder(
+            num_coordinates=self.coord_dim,
+            num_frequencies=num_frequencies,
+            include_input=include_input,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+        )
+        self.coordinate_output_dim = encoder.output_dim
+        return encoder
+
+    @property
+    def has_coordinates(self) -> bool:
+        return self.coord_dim > 0
+
     @property
     def has_auxiliary_labels(self) -> bool:
         return bool(self.auxiliary_label_columns)
@@ -422,6 +489,40 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
                 (x_static.size(0), self.static_hidden_dim), device=x_static.device, dtype=x_static.dtype
             )
         return self.static_encoder(x_static, x_categorical)
+
+    def _select_coordinates(self, batch: Any, device, dtype) -> Optional[torch.Tensor]:
+        """The normalized coordinates as they enter ``coordinate_encoder``.
+
+        Separated from :meth:`_encode_coordinates` for the same reason ``_select_auxiliary`` is
+        separated from ``_encode_auxiliary``: an explainer attributes to these two raw columns,
+        which mean ``lat`` and ``lon``, rather than to the encoder's output, whose channels are
+        sines of them and mean nothing individually.
+        """
+        if not self.has_coordinates:
+            return None
+
+        coords = batch_get(batch, "x_coords")
+        if coords is None:
+            raise KeyError(
+                "Batch is missing 'x_coords'; this model was built with coord_dim="
+                f"{self.coord_dim} and needs the normalized coordinates the sequence datamodule "
+                "collates under USE_HARMONIC_COORDS."
+            )
+        coords = coords.to(device=device, dtype=dtype)
+        if coords.size(-1) != self.coord_dim:
+            # The alternative is a silent axis swap: at the wrong width the encoder would read
+            # longitude out of the latitude column and still return a well-shaped tensor.
+            raise ValueError(
+                f"Batch carries {coords.size(-1)} coordinate column(s) but this model was built "
+                f"for {self.coord_dim}."
+            )
+        return coords
+
+    def _encode_coordinates(self, batch: Any, device, dtype) -> Optional[torch.Tensor]:
+        coords = self._select_coordinates(batch, device=device, dtype=dtype)
+        if coords is None:
+            return None
+        return self.coordinate_encoder(coords)
 
     def _select_auxiliary(self, batch: Any, device, dtype) -> Optional[torch.Tensor]:
         """The auxiliary lab block as it enters ``auxiliary_encoder``: values, then validity flags.
@@ -535,7 +636,10 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
 
         static_features = self._encode_static(x_static, x_categorical)
         temporal_features = self._encode_temporal(batch, device=device, dtype=dtype)
-        fused = self.fusion(static_features, temporal_features)
+        # Inside the gate, not appended after it: the gate reads the whole concatenation, so giving
+        # it position lets it damp or admit the other branches conditioned on where the point is.
+        coordinate_features = self._encode_coordinates(batch, device=device, dtype=dtype)
+        fused = self.fusion(static_features, temporal_features, coordinate_features)
 
         # Appended AFTER the gate, so a measured lab value reaches the head at full strength rather
         # than being traded off against the branches that had to infer it.
@@ -569,11 +673,16 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
             raise KeyError("Batch is missing 'x_static'")
         x_static = x_static.to(device=device, dtype=dtype)
 
+        # Context columns are ordinary continuous covariates living in x_static - they are NOT a
+        # separate part, and nothing about the forward pass distinguishes them. Only the group's
+        # `kind` differs, which is what lets an explainer roll the declared group up as a block
+        # instead of scattering it among the other covariates.
+        context_names = set(getattr(self, "context_feature_names", None) or [])
         parts: list[torch.Tensor] = [x_static]
         groups: list[dict[str, Any]] = [
             {
                 "part": 0,
-                "kind": "static",
+                "kind": "context" if name in context_names else "static",
                 "name": name,
                 "columns": [index],
             }
@@ -638,6 +747,23 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
                     }
                 )
 
+        # Coordinates: the two NORMALIZED columns, not the harmonic channels they expand into. The
+        # expansion is differentiable, so forward_from_parts recomputes it and the explainer gets
+        # two rows that mean `lat` and `lon` instead of 4*K rows that individually mean nothing.
+        coords = self._select_coordinates(batch, device=device, dtype=dtype)
+        if coords is not None:
+            part_index = len(parts)
+            parts.append(coords)
+            for index, name in enumerate(self._coordinate_names(coords.size(-1))):
+                groups.append(
+                    {
+                        "part": part_index,
+                        "kind": "spatial",
+                        "name": name,
+                        "columns": [index],
+                    }
+                )
+
         # Auxiliary lab block: raw values, followed by validity flags when they are enabled.
         selected = self._select_auxiliary(batch, device=device, dtype=dtype)
         if selected is not None:
@@ -696,7 +822,12 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
                 grids[modality_name] = (grid, grid[:, observed_index] > 0.5)
             temporal_features = self._encode_temporal_from_grids(grids)
 
-        fused = self.fusion(static_features, temporal_features)
+        coordinate_features = None
+        if self.has_coordinates:
+            coordinate_features = self.coordinate_encoder(parts[cursor])
+            cursor += 1
+
+        fused = self.fusion(static_features, temporal_features, coordinate_features)
 
         if self.has_auxiliary_labels:
             fused = torch.cat([fused, self.auxiliary_encoder(parts[cursor])], dim=-1)
@@ -714,6 +845,13 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         if len(names) == width:
             return names
         return [f"static_{index}" for index in range(width)]
+
+    def _coordinate_names(self, width: int) -> list[str]:
+        """Names for the coordinate block, falling back to positions when none were stored."""
+        names = list(getattr(self, "coord_names", None) or [])
+        if len(names) == width:
+            return names
+        return [f"coord_{index}" for index in range(width)]
 
     def _modality_column_names(self, modality_name: str, width: int) -> list[str]:
         """Band names for one modality, falling back to positions when none were stored."""

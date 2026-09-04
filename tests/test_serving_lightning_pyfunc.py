@@ -352,3 +352,175 @@ def test_a_model_with_auxiliary_columns_still_predicts(trained_with_auxiliary) -
     through_predictor = SoilSequencePredictor(model).predict(bundle)
 
     assert np.allclose(through_pyfunc, through_predictor, atol=1e-5)
+
+
+# --- models that USE harmonic coordinates ------------------------------------
+# The same shape as the auxiliary section above, and it broke the same way. With coord_dim=0
+# _select_coordinates returns before the width check, so no test above executes the path at all -
+# and every model logged under USE_HARMONIC_COORDS failed with "Batch carries 0 coordinate
+# column(s) but this model was built for 2", which stopped registration for four runs while each
+# one still finished green.
+
+COORD_NAMES = ["lat", "lon"]
+
+
+@pytest.fixture
+def trained_with_coords():
+    """A model with the harmonic coordinate branch, as USE_HARMONIC_COORDS produces."""
+    torch.manual_seed(0)
+    generator = np.random.default_rng(0)
+
+    bundle = SoilSequenceBundle(
+        point_ids=[f"p{index}" for index in range(N_POINTS)],
+        static_features=generator.normal(20, 5, (N_POINTS, len(STATIC))).astype(np.float32),
+        static_feature_names=list(STATIC),
+        static_categoricals=np.asarray(
+            [[generator.choice(["sandy", "loam"])] for _ in range(N_POINTS)], dtype=object
+        ),
+        categorical_feature_names=["texture"],
+        # Realistic Morocco degrees, and deliberately NOT round numbers: a float32 round trip
+        # would round these off, and the assertion below would catch it.
+        coords=np.column_stack(
+            [
+                generator.uniform(28.60413, 35.65917, N_POINTS),
+                generator.uniform(-10.00382, -1.93641, N_POINTS),
+            ]
+        ),
+        coord_names=list(COORD_NAMES),
+        targets=generator.normal(3, 1, (N_POINTS, 1)).astype(np.float32),
+        target_names=["organic_matter_pct"],
+        sequences={
+            "s2": [
+                generator.normal(0.2, 0.05, (int(generator.integers(3, 7)), len(BANDS))).astype(np.float32)
+                for _ in range(N_POINTS)
+            ]
+        },
+        sequence_times={},
+        modality_columns={"s2": list(BANDS)},
+        temporal_enabled=True,
+    )
+    bundle.sequence_times = {
+        "s2": [
+            2020.0 + np.sort(generator.random(values.shape[0])) * 2.0
+            for values in bundle.sequences["s2"]
+        ]
+    }
+
+    datamodule = SoilSequenceDataModule(
+        sequence_bundle=bundle, batch_size=8, val_size=0.25, test_size=0.25, seed=42
+    )
+    datamodule.setup("fit")
+
+    model = SoilCNNLightningModule(
+        static_dim=datamodule.static_dim,
+        target_dim=datamodule.target_dim,
+        target_names=datamodule.target_names,
+        categorical_cardinalities=datamodule.categorical_cardinalities,
+        categorical_vocabularies=datamodule.categorical_vocabularies,
+        categorical_feature_names=datamodule.categorical_feature_names,
+        modality_dims=datamodule.modality_dims,
+        temporal_enabled=True,
+        grid_years=datamodule.grid_years,
+        coord_dim=datamodule.coord_dim,
+        static_hidden_dims=[6],
+        head_hidden_dims=[6],
+        cnn_hidden_dims=[4],
+        modality_embed_dim=4,
+        dropout=0.0,
+        target_mean=datamodule.target_mean_,
+        target_scale=datamodule.target_scale_,
+    )
+    model.attach_preprocessing_state(datamodule.preprocessing_state())
+    model.eval()
+    return model, bundle, datamodule
+
+
+def test_a_coordinate_model_can_be_logged_at_all(trained_with_coords) -> None:
+    """The regression test proper.
+
+    This is mlflow_loggers._log_lightning_serialized_model's own sequence - build the example, then
+    predict through the wrapper to infer a signature. It raised "Batch carries 0 coordinate
+    column(s) but this model was built for 2", model logging was skipped, and because registration
+    is downstream of logging no version was ever created.
+    """
+    model, bundle, _datamodule = trained_with_coords
+    example = build_input_example(model, bundle, n_rows=3)
+
+    predictions = SoilSequencePyfunc(model).predict(None, example)
+
+    assert len(predictions) == 3
+    assert np.isfinite(predictions.to_numpy(dtype=float)).all()
+
+
+def test_the_example_carries_the_coordinate_columns(trained_with_coords) -> None:
+    model, bundle, _datamodule = trained_with_coords
+    example = build_input_example(model, bundle, n_rows=3)
+
+    for name in COORD_NAMES:
+        assert name in example.columns, f"{name} missing from the serving contract"
+    np.testing.assert_allclose(example["lat"].to_numpy(), bundle.coords[:3, 0])
+
+
+def test_coordinates_survive_the_round_trip_without_losing_precision(trained_with_coords) -> None:
+    """float64 end to end. float32 resolves about a metre here, and the train-bbox normalization
+    downstream subtracts two nearby numbers, so it would spend most of that."""
+    model, bundle, _datamodule = trained_with_coords
+    state = model.get_preprocessing_state()
+
+    rebuilt = bundle_from_frame(frame_from_bundle(bundle, state), state)
+
+    assert rebuilt.coord_names == COORD_NAMES
+    assert rebuilt.coords.dtype == np.float64
+    np.testing.assert_array_equal(rebuilt.coords, bundle.coords)
+
+
+def test_a_round_tripped_point_normalizes_exactly_as_it_did_in_training(
+    trained_with_coords,
+) -> None:
+    """The property that actually matters: the served point must land on the same spot of the
+    train bounding box it occupied during training, not merely carry the same degrees."""
+    model, bundle, datamodule = trained_with_coords
+    state = model.get_preprocessing_state()
+
+    served = SoilSequenceDataModule(
+        sequence_bundle=bundle_from_frame(frame_from_bundle(bundle, state), state), batch_size=4
+    )
+    served.apply_preprocessing_state(state)
+
+    torch.testing.assert_close(
+        served.collate(np.arange(4))["x_coords"], datamodule.collate(np.arange(4))["x_coords"]
+    )
+
+
+def test_a_missing_coordinate_column_is_refused_by_name(trained_with_coords) -> None:
+    """Required, not optional: there is no honest fill for a position, so it must fail loudly
+    rather than reach the model as a zero-width block - which is what it used to do."""
+    model, bundle, _datamodule = trained_with_coords
+    state = model.get_preprocessing_state()
+    without_latitude = frame_from_bundle(bundle, state).drop(columns=["lat"])
+
+    with pytest.raises(KeyError, match="lat"):
+        bundle_from_frame(without_latitude, state)
+
+
+def test_the_wrapper_matches_the_predictor_for_a_coordinate_model(trained_with_coords) -> None:
+    """The frame path and the bundle path must agree. Only the frame path lost the coordinates,
+    so a disagreement here is exactly the bug returning."""
+    model, bundle, _datamodule = trained_with_coords
+    example = build_input_example(model, bundle, n_rows=N_POINTS)
+
+    through_pyfunc = SoilSequencePyfunc(model).predict(None, example).to_numpy(dtype=float)
+    through_predictor = SoilSequencePredictor(model).predict(bundle)
+
+    assert np.allclose(through_pyfunc, through_predictor, atol=1e-5)
+
+
+def test_a_model_without_coordinates_asks_for_none(trained) -> None:
+    """The backward-compatibility guarantee: a checkpoint trained before the branch, or with the
+    flag off, has no coord_names in its state, so the contract is unchanged."""
+    model, bundle = trained
+    state = model.get_preprocessing_state()
+    frame = frame_from_bundle(bundle, state)
+
+    assert not [name for name in frame.columns if name in COORD_NAMES]
+    assert bundle_from_frame(frame, state).coord_dim == 0

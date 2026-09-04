@@ -19,6 +19,8 @@ column                       type                        meaning
 one per static feature       double                      covariates in RAW units, unscaled
 one per categorical feature  string                      raw labels; unseen ones hit the OOV index
 one per label feature        double, optional            only when the model uses lab auxiliaries
+one per coordinate           double                      raw lat/lon; required when the model has
+                                                         a coordinate branch
 ``<modality>__time``         ``Array(Double)``           decimal years, one per observation
 ``<modality>__values``       ``Array(Array(Double))``    per observation, one value per band
 ===========================  ==========================  ===================================
@@ -164,12 +166,22 @@ def bundle_from_frame(frame: pd.DataFrame, state: Mapping[str, Any]):
     static_names = list(state.get("static_feature_names") or [])
     categorical_names = list(state.get("categorical_feature_names") or [])
     label_names = list(state.get("label_feature_names") or [])
+    # Empty unless the model was trained with USE_HARMONIC_COORDS, so a checkpoint without the
+    # coordinate branch - or one predating it - requires nothing new and rebuilds nothing.
+    coord_names = list(state.get("coord_names") or [])
     modality_columns = {
         str(name): list(columns)
         for name, columns in (state.get("modality_column_names") or {}).items()
     }
 
-    missing = [name for name in static_names + categorical_names if name not in frame.columns]
+    # Coordinates are REQUIRED, alongside the static and categorical blocks, rather than optional
+    # like the lab columns. A model built with coord_dim=2 cannot predict without a position, and
+    # there is no honest fill for one: the train-median trick that rescues a covariate would place
+    # the sample at a location it does not occupy, and the encoder would read that as a confident
+    # position rather than as an absence. The builder drops such a row for the same reason.
+    missing = [
+        name for name in static_names + categorical_names + coord_names if name not in frame.columns
+    ]
     if missing:
         raise KeyError(
             f"Input is missing {len(missing)} column(s) this model was trained on: "
@@ -190,6 +202,14 @@ def bundle_from_frame(frame: pd.DataFrame, state: Mapping[str, Any]):
         frame[categorical_names].astype(object).to_numpy()
         if categorical_names
         else np.empty((n_rows, 0), dtype=object)
+    )
+    # float64, not the float32 the static block uses: the bundle keeps coordinates in float64
+    # because float32 resolves about a metre at this latitude, and the train-bbox normalization
+    # downstream subtracts two nearby numbers and would spend most of it.
+    coords = (
+        frame[coord_names].to_numpy(dtype=np.float64)
+        if coord_names
+        else np.empty((n_rows, 0), dtype=np.float64)
     )
     # The lab block is rebuilt at FULL ROSTER WIDTH, with each supplied column at its own roster
     # position and the rest left NaN.
@@ -251,6 +271,8 @@ def bundle_from_frame(frame: pd.DataFrame, state: Mapping[str, Any]):
         static_feature_names=static_names,
         static_categoricals=static_categoricals,
         categorical_feature_names=categorical_names,
+        coords=coords,
+        coord_names=coord_names,
         targets=np.empty((n_rows, 0), dtype=np.float32),
         target_names=list(state.get("target_names") or []),
         label_features=label_features,
@@ -293,6 +315,17 @@ def frame_from_bundle(
     categoricals = np.asarray(bundle.static_categoricals, dtype=object)
     for index, name in enumerate(state.get("categorical_feature_names") or []):
         data[name] = [str(value) for value in categoricals[:count, index]]
+
+    # Coordinates, when the model was trained with the harmonic branch. Omitting them is what made
+    # every logged model fail with "Batch carries 0 coordinate column(s) but this model was built
+    # for 2" - the round trip produced a zero-width coords block, the datamodule collated an empty
+    # x_coords, and the branch refused it. Nothing was logged, so nothing was registered, and the
+    # run still finished green. Same failure the lab roster had; see bundle_from_frame.
+    #
+    # float64 to match the bundle's own dtype - see bundle_from_frame for why the precision matters.
+    coords = np.asarray(bundle.coords)
+    for index, name in enumerate(state.get("coord_names") or []):
+        data[name] = np.asarray(coords[:count, index], dtype=np.float64)
 
     labels = np.asarray(bundle.label_features)
     wanted = {str(name) for name in (auxiliary_columns or [])}

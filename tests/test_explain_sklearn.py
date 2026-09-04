@@ -186,3 +186,49 @@ def test_unprefixed_feature_names_fall_back_rather_than_raising() -> None:
 
     assert _blocks_from_feature_names(["clay_pct", "ph"]) == ["features", "features"]
     assert _blocks_from_feature_names(["num__a", "weird__b"]) == ["continuous", "features"]
+
+
+def test_a_joint_fit_returns_every_output_correctly_sliced(config, frame) -> None:
+    """One explainer pass yields every target, and each target gets ITS OWN attributions.
+
+    The caller explains the joint model once, at model-run scope, and routes each output to the run
+    that holds that target's evaluation - so this must not slice down to a single output. It used
+    to, keyed on `target`, which meant the full multi-output explanation was recomputed once per
+    target only to discard all but one of its outputs each time.
+
+    The last assertion is the one that would have caught the original `[..., 0]` bug, where every
+    target's plots showed the FIRST target's attributions under its own name.
+    """
+    features, _ = frame
+    targets = pd.DataFrame(
+        {
+            "clay_pct_out": features["clay_pct"] * 1.0 + features["ph"] * 0.0,
+            "ph_out": features["clay_pct"] * 0.0 + features["ph"] * 1.0,
+        }
+    )
+    pipeline = PipelineBuilder().build(
+        RandomForestRegressor(n_estimators=10, random_state=0),
+        False,
+        categorical_cols=["texture"],
+        numeric_cols=["clay_pct", "ph"],
+    )
+    pipeline.fit(features, targets)
+
+    results = build_shap_results(
+        config=config,
+        backend="sklearn",
+        fitted_estimator=pipeline,
+        X_train=features,
+        X_test=features,
+        # The GROUP label, which names no single output - the explainer must not try to match it.
+        target="clay_pct_out__ph_out",
+        target_names=["clay_pct_out", "ph_out"],
+    )
+
+    assert len(results) == 2
+    assert [result.target_name for result in results] == ["clay_pct_out", "ph_out"]
+    assert not np.allclose(results[0].values, results[1].values)
+
+    # Each output is driven by the column it was built from, so the slices are not interchangeable.
+    assert results[0].feature_names[results[0].ranking()[0]] == "num__clay_pct"
+    assert results[1].feature_names[results[1].ranking()[0]] == "num__ph"

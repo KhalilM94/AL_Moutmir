@@ -82,6 +82,7 @@ class SoilSequenceBuilder:
         blocks = resolve_categorical_columns(
             self.config, static_df, feature_frame.columns, logger=self.logger
         )
+        self._assert_context_features_present(static_df, blocks.continuous_columns)
         feature_columns = list(blocks.continuous_columns)
         assert_columns_are_dense_enough(
             static_df,
@@ -92,15 +93,42 @@ class SoilSequenceBuilder:
             allow=getattr(self.config, "ALLOW_SPARSE_COLUMNS", ()) or (),
             fail=bool(getattr(self.config, "FAIL_ON_SPARSE_COLUMNS", True)),
         )
-        # Targets only. A missing category becomes the reserved embedding index and a missing
-        # continuous covariate becomes a train-median fill plus a validity flag; neither is a reason
-        # to delete the soil sample. A missing LABEL is, because there is nothing to learn from it.
+        # Targets, and coordinates when the harmonic branch is on. A missing category becomes the
+        # reserved embedding index and a missing continuous covariate becomes a train-median fill
+        # plus a validity flag; neither is a reason to delete the soil sample. A missing LABEL is,
+        # because there is nothing to learn from it - and so is a missing COORDINATE, because the
+        # fill that rescues a covariate has no honest analogue here: a median lat/lon is a location
+        # in the middle of the study area that the sample does not occupy, and the encoder would
+        # read it as a confident position rather than as an absence.
+        #
+        # Done HERE rather than in build() on purpose. usable_point_ids() calls this method to
+        # answer "which points can this family use?" for the unified splitter; deciding the coord
+        # rule in build() instead would let the splitter assign points that build() then drops, and
+        # under population_policy=intersect that shrinks the whole run's population silently.
+        coordinate_columns = [
+            column for column in self._coordinate_columns() if column in static_df.columns
+        ]
+        if coordinate_columns:
+            # Attributed to the coordinates specifically, rather than reported as the drop that
+            # drop_non_finite_rows performs below: that one also removes rows with a missing target,
+            # which would have gone whatever this flag said, and blaming those on the coordinates
+            # would send someone to audit their lat/lon over a lab problem.
+            missing_coords = int(
+                (~build_finite_row_mask(static_df, numeric_columns=coordinate_columns)).sum()
+            )
+            if missing_coords:
+                self.logger.info(
+                    f"USE_HARMONIC_COORDS is on: {missing_coords} of {len(static_df)} point(s) have "
+                    f"a missing or non-finite {' / '.join(coordinate_columns)} and are dropped. "
+                    "Turning the flag off restores them."
+                )
+
         cleaned = drop_non_finite_rows(
             static_df,
             logger=self.logger,
             label="static sequence source",
-            required_columns=[point_col, *target_columns],
-            numeric_columns=list(target_columns),
+            required_columns=[point_col, *target_columns, *coordinate_columns],
+            numeric_columns=[*target_columns, *coordinate_columns],
         )
         return cleaned, blocks
 
@@ -128,6 +156,14 @@ class SoilSequenceBuilder:
         )
         targets = static_df[target_columns].to_numpy(dtype=np.float32)
         label_features, label_feature_names = self._extract_label_features(static_df)
+        coords, coord_names = self._extract_coordinates(static_df)
+        # Order taken from continuous_columns, not from the config: these names index positions in
+        # static_features, and a list in declaration order would mislabel them the moment the config
+        # and the frame disagree about ordering.
+        context_columns = set(self.data_manager.context_feature_columns())
+        context_feature_names = [
+            column for column in blocks.continuous_columns if column in context_columns
+        ]
         point_ids = (
             static_df[point_col].tolist() if point_col in static_df.columns else list(range(len(static_df)))
         )
@@ -151,6 +187,9 @@ class SoilSequenceBuilder:
             static_validity_names=static_validity_names,
             static_categoricals=static_categoricals,
             categorical_feature_names=list(blocks.categorical_columns),
+            context_feature_names=context_feature_names,
+            coords=coords,
+            coord_names=coord_names,
             targets=targets,
             target_names=target_columns,
             label_features=label_features,
@@ -164,6 +203,48 @@ class SoilSequenceBuilder:
         bundle.validate()
         self._log_summary(bundle)
         return bundle
+
+    # --- spatial context group --------------------------------------------
+
+    def _assert_context_features_present(
+        self, static_df: pd.DataFrame, continuous_columns: list[str]
+    ) -> None:
+        """Refuse a CONTEXT_FEATURES entry the data does not carry, or that something else dropped.
+
+        Mirrors ``resolve_categorical_columns``' treatment of CATEGORICAL_FEATURES, and for the same
+        reason: a declared column absent from the frame is nearly always a config left over from a
+        retired dataset, and skipping it quietly means the run trains without the context features
+        while the config says it has them.
+
+        Only checked when the group is ON. With it off the columns are *supposed* to be gone - that
+        is the ablation - so demanding their presence would make the switch unusable.
+        """
+        selected = self.data_manager.context_feature_columns()
+        if not selected:
+            return
+
+        absent = [column for column in selected if column not in static_df.columns]
+        if absent:
+            raise KeyError(
+                f"CONTEXT_FEATURES names column(s) the static source does not carry: "
+                f"{', '.join(sorted(absent))}. Add them to the static CSV, remove them from the "
+                "list, or set USE_CONTEXT_FEATURES: false to run without the group."
+            )
+
+        # Present in the frame but filtered out before reaching the features. Distinguished from the
+        # case above because the fix is elsewhere entirely: the column exists and is spelled right,
+        # and something else - IGNORED_COLUMNS, LABEL_COLUMNS, CATEGORICAL_FEATURES - is removing it.
+        withheld = [
+            column
+            for column in selected
+            if column in static_df.columns and column not in set(continuous_columns)
+        ]
+        if withheld:
+            raise ValueError(
+                f"CONTEXT_FEATURES names column(s) that are present but not continuous features: "
+                f"{', '.join(sorted(withheld))}. Something else is removing them - check "
+                "IGNORED_COLUMNS/ELIMINATED_FEATURES, LABEL_COLUMNS and CATEGORICAL_FEATURES."
+            )
 
     # --- covariate gaps ---------------------------------------------------
 
@@ -237,6 +318,62 @@ class SoilSequenceBuilder:
         # statistic, and there is no meaningful lab value it could represent.
         values[~np.isfinite(values)] = np.nan
         return values.astype(np.float32), label_columns
+
+    # --- coordinates ------------------------------------------------------
+
+    def _coordinate_columns(self) -> list[str]:
+        """The lat/lon column names when the harmonic branch wants them, else nothing.
+
+        The single place the flag is read. Both :meth:`clean_static_frame` - which must drop rows
+        with no coordinate - and :meth:`_extract_coordinates` - which reads the values - go through
+        it, so the row rule and the value rule can never disagree about whether coordinates are in
+        play. That matters more than it looks: ``usable_point_ids`` calls the former and feeds the
+        unified splitter, so a disagreement would have the splitter assign points this builder then
+        deletes.
+        """
+        if not getattr(self.config, "USE_HARMONIC_COORDS", False):
+            return []
+        return list(self.data_manager.coordinate_columns())
+
+    def _extract_coordinates(self, static_df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
+        """lat/lon as a dedicated block, kept OUT of the feature frame.
+
+        Deliberately bypasses ``filter_schema``, whose whole job is to remove these. What authorises
+        that is ``USE_HARMONIC_COORDS`` - the same shape of opt-in ``CARRY_LABEL_COLUMNS`` gives the
+        lab values, and with the flag off this returns nothing, so the bundle and every batch
+        collated from it are identical to a build that had never heard of coordinates.
+
+        Carrying them does not make them predictors. They never enter ``blocks.continuous_columns``,
+        are never standardized alongside the covariates, and are read by exactly one consumer: the
+        CNN's harmonic branch, which normalizes them against the train bounding box. Passing them
+        through ``filter_schema`` instead would have handed raw degrees to every sklearn model as an
+        ordinary column, and would have z-scored them - which is the wrong transform for a
+        positional encoding, whose frequencies are defined on a known interval.
+
+        float64 throughout: see ``to_decimal_year`` for the same argument. float32 resolves about a
+        metre at this latitude and the normalization downstream subtracts two nearby numbers.
+        """
+        coordinate_columns = self._coordinate_columns()
+        if not coordinate_columns:
+            return np.empty((len(static_df), 0), dtype=np.float64), []
+
+        missing = [column for column in coordinate_columns if column not in static_df.columns]
+        if missing:
+            raise KeyError(
+                f"USE_HARMONIC_COORDS is on but the static frame has no {', '.join(missing)} "
+                f"column(s). Coordinates often live in the TARGETS source rather than the covariates "
+                f"one; DataManager joins them across automatically, so check that "
+                f"LAT_COLUMN/LON_COLUMN name columns that exist in one of the two. "
+                f"Available: {', '.join(map(str, static_df.columns))}"
+            )
+
+        values = np.column_stack(
+            [
+                pd.to_numeric(static_df[column], errors="coerce").to_numpy(dtype=np.float64)
+                for column in coordinate_columns
+            ]
+        )
+        return values, coordinate_columns
 
     # --- temporal assembly ------------------------------------------------
 

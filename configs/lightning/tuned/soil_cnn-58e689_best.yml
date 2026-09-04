@@ -96,6 +96,15 @@ soil_cnn:
     auxiliary_validity_channels: true
     auxiliary_hidden_dims: []
     auxiliary_dropout: 0.0
+    # Not part of the study - it predates the branch. coord_dim resolves to 0 unless
+    # USE_HARMONIC_COORDS is set in data_spec.yml, and at 0 this model is identical to the one the
+    # study tuned. Turning it on changes the fusion width, so the tuned widths below no longer
+    # describe the fitted network exactly; retune, or treat the result as a starting point.
+    coord_dim: auto
+    harmonic_num_frequencies: 6
+    harmonic_include_input: true
+    harmonic_hidden_dims: []
+    harmonic_dropout: 0.0
     static_hidden_dims:
     - 64
     - 64
@@ -109,7 +118,7 @@ soil_cnn:
     loss_lambda: 0.1
     cosine_space: standardized
     loss_min_batch: 16 
-    # loss_shrinkage: 0.05
+    loss_shrinkage: 0.05
     huber_delta: 1.0
     learning_rate: 0.00010038360509669296
     temporal_enabled: true

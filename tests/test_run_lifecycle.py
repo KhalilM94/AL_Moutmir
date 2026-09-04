@@ -231,9 +231,12 @@ def test_the_train_fit_diagnostic_is_switchable(enabled, monkeypatch) -> None:
 
     logger = ChildRunLogger()
     for name in ("_log_cv_results", "_log_table_artifact", "_log_metric_dict", "_promote_champion",
-                 "_log_plots", "_log_shap_artifacts", "_write_split_summary", "_write_json_artifact",
+                 "_log_plots", "_log_shap_slice", "_write_split_summary", "_write_json_artifact",
                  "_evaluate_sklearn_target"):
         setattr(logger, name, MagicMock())
+    # The explanation is built once, on the model run, and sliced per target. (None, {}) is "nothing
+    # to explain"; a bare MagicMock would fail the tuple unpack at the call site.
+    logger._build_shap_results = MagicMock(return_value=(None, {}))
     logged: dict = {}
     logger._log_metric_dict = lambda metrics: logged.update(metrics)
 
@@ -283,9 +286,10 @@ def test_the_train_fit_diagnostic_can_be_declined_per_model(monkeypatch) -> None
     estimator = _CountingEstimator()
     logger = ChildRunLogger()
     for name in ("_log_cv_results", "_log_table_artifact", "_promote_champion", "_log_plots",
-                 "_log_shap_artifacts", "_write_split_summary", "_write_json_artifact",
+                 "_log_shap_slice", "_write_split_summary", "_write_json_artifact",
                  "_evaluate_sklearn_target"):
         setattr(logger, name, MagicMock())
+    logger._build_shap_results = MagicMock(return_value=(None, {}))
     logged: dict = {}
     logger._log_metric_dict = lambda metrics: logged.update(metrics)
 
@@ -345,9 +349,10 @@ def test_a_model_enters_the_registry_only_after_its_metrics_exist(monkeypatch) -
     )
 
     logger = ChildRunLogger()
-    for name in ("_log_cv_results", "_log_table_artifact", "_log_plots", "_log_shap_artifacts",
+    for name in ("_log_cv_results", "_log_table_artifact", "_log_plots", "_log_shap_slice",
                  "_write_split_summary", "_write_json_artifact", "_evaluate_sklearn_target"):
         setattr(logger, name, MagicMock())
+    logger._build_shap_results = MagicMock(return_value=(None, {}))
     logger._log_metric_dict = lambda metrics: order.append("metrics")
     promote = MagicMock(return_value={})
     logger._promote_champion = promote

@@ -33,6 +33,12 @@ FACTORY_RESOLVED_MODEL_KEYS = frozenset(
         "temporal_steps",
         "edge_attr_dim",
         "grid_years",
+        # Whether the data carries coordinates at all - a property of USE_HARMONIC_COORDS, not a
+        # hyperparameter. Sweeping it would change the fusion width without changing the batch, so
+        # the branch would read a tensor that is not there. `harmonic_num_frequencies`,
+        # `harmonic_include_input` and `harmonic_hidden_dims` are deliberately absent: those are
+        # genuine search dimensions.
+        "coord_dim",
         "categorical_cardinalities",
         "categorical_vocabularies",
         "categorical_feature_names",

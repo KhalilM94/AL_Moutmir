@@ -75,7 +75,7 @@ __all__ = [
 def uncertainty_enabled_for(config: Any, model_name: str) -> bool:
     """Whether this registry entry should be trained as an ensemble.
 
-    Same allowlist-beats-denylist rule ``ChildRunLogger._log_shap_artifacts`` applies, and for the
+    Same allowlist-beats-denylist rule ``ChildRunLogger._shap_gate`` applies, and for the
     same reason: the cost of uncertainty is per model, not per run, so naming an entry explicitly
     has to be able to override a blanket exclusion.
     """

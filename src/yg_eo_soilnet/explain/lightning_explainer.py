@@ -102,9 +102,12 @@ def _colour_values(model, parts, groups: list[dict], categorical_codes, state: d
 
     A group that spans several columns has no single value of its own, so each kind gets the scalar
     that actually means something for it: the de-standardized reading for a static feature, the
-    integer code for a categorical one, the point's mean observed value for a temporal band, and the
-    raw lab value for an auxiliary column. The month positional pair gets NaN, which shap renders
-    grey - it is a coordinate, not a measurement.
+    integer code for a categorical one, the point's mean observed value for a temporal band, the raw
+    lab value for an auxiliary column, and the coordinate in DEGREES for a spatial one. The month
+    positional pair gets NaN, which shap renders grey - it is a coordinate, not a measurement.
+
+    ``context`` is coloured exactly like ``static`` because that is exactly what it is: the group
+    lives in the same part, standardized by the same statistics, and differs only in being named.
     """
     n_samples = int(parts[0].shape[0])
     colours = np.full((n_samples, len(groups)), np.nan, dtype=np.float64)
@@ -120,6 +123,8 @@ def _colour_values(model, parts, groups: list[dict], categorical_codes, state: d
 
     label_mean = np.asarray(state.get("label_mean") or [], dtype=np.float64)
     label_scale = np.asarray(state.get("label_scale") or [], dtype=np.float64)
+    coord_min = np.asarray(state.get("coord_min") or [], dtype=np.float64)
+    coord_max = np.asarray(state.get("coord_max") or [], dtype=np.float64)
     auxiliary_index = getattr(model, "auxiliary_index", None)
     auxiliary_index = None if auxiliary_index is None else auxiliary_index.detach().cpu().numpy()
 
@@ -131,8 +136,20 @@ def _colour_values(model, parts, groups: list[dict], categorical_codes, state: d
     for column, group in enumerate(groups):
         kind = group["kind"]
 
-        if kind == "static":
+        if kind in ("static", "context"):
             colours[:, column] = static_values[:, group["columns"][0]]
+
+        elif kind == "spatial":
+            # Back to degrees, undoing the train-bbox mapping the datamodule applied. Colouring by
+            # the normalized value would work but reads as a meaningless -1..1; in degrees the
+            # beeswarm's colour axis is literally "how far north", which is the thing worth seeing.
+            normalized = parts[group["part"]].detach().cpu().numpy().astype(np.float64)
+            position = group["columns"][0]
+            value = normalized[:, position]
+            if position < coord_min.size and position < coord_max.size:
+                span = coord_max[position] - coord_min[position]
+                value = (value + 1.0) / 2.0 * span + coord_min[position]
+            colours[:, column] = value
 
         elif kind == "categorical" and categorical_codes is not None:
             if group["name"] in categorical_names:
@@ -171,6 +188,11 @@ def _colour_values(model, parts, groups: list[dict], categorical_codes, state: d
 
 
 def lightning_shap_results(*, config, model, bundle, target: str) -> list[ShapResult]:
+    """One ShapResult per model output, in output order.
+
+    ``target`` is only a naming fallback for when the model carries no ``target_names``: a joint
+    module is explained once and every one of its outputs comes back. See ``build_shap_results``.
+    """
     import shap
     import torch
     from torch import nn

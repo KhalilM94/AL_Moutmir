@@ -19,7 +19,13 @@ class SoilSequenceBundle:
     the data came from, so a 2030-2035 series is the same kind of object as a 2017-2025 one, and
     points with 40 readings sit beside points with 90 without any padding at rest.
 
-    Deliberately absent, because there is no graph: coords, edges, edge attributes and residuals.
+    Deliberately absent, because there is no graph: edges, edge attributes and residuals.
+
+    ``coords`` is present but is NOT the graph's notion of coordinates - there is nothing here that
+    relates one point to another. It is a per-point attribute, carried only when
+    ``USE_HARMONIC_COORDS`` asks for it, and read by exactly one consumer: the CNN's harmonic
+    coordinate branch. With the flag off it is ``(n, 0)`` and every batch is identical to a build
+    that had never heard of coordinates.
     """
 
     point_ids: list[Any] = field(default_factory=list)
@@ -40,6 +46,21 @@ class SoilSequenceBundle:
     # split does not exist yet. The datamodule fits it in setup(), beside the scaler.
     static_categoricals: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=object))
     categorical_feature_names: list[str] = field(default_factory=list)
+    # The subset of static_feature_names declared as spatial context. A NAME LIST, not an array:
+    # the values stay in static_features, so x_static keeps its width, its column order and its
+    # standardization, and the columns really do reach TabularStaticEncoder as ordinary continuous
+    # variables. Grouping them buys the ablation switch and a SHAP block, nothing else.
+    context_feature_names: list[str] = field(default_factory=list)
+    # (n_points, 2) float64 lat/lon, or (n, 0) when USE_HARMONIC_COORDS is off. float64 rather than
+    # float32 for the same reason sequence_times is: float32 resolves about a metre at this
+    # latitude, and the train-bbox normalization downstream is a subtraction of two nearby numbers,
+    # which would spend most of that.
+    #
+    # NaN is NOT preserved here, unlike static_features and label_features above: there is no
+    # honest fill for a coordinate - a median lat/lon is a point in the middle of the study area
+    # that no sample occupies - so the builder drops the row instead, and says how many.
+    coords: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float64))
+    coord_names: list[str] = field(default_factory=list)
     targets: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
     target_names: list[str] = field(default_factory=list)
     # Measured lab values, (n_points, n_labels) float32. Every LABEL_COLUMNS entry the static frame
@@ -90,6 +111,15 @@ class SoilSequenceBundle:
         Reading it off an array would break on a bundle whose first point has no observations.
         """
         return {name: len(columns) for name, columns in self.modality_columns.items()}
+
+    @property
+    def coord_dim(self) -> int:
+        """How many coordinate columns travel with the bundle: 2, or 0 when the flag is off.
+
+        From the names rather than the array, for the same reason modality_dims is: a bundle with
+        no points at all has a (0, 0) array whose width would disagree with the name list.
+        """
+        return len(self.coord_names)
 
     @property
     def label_dim(self) -> int:
@@ -185,6 +215,31 @@ class SoilSequenceBundle:
                 )
         if self.targets.size and self.targets.shape[0] != num_points:
             raise ValueError(f"targets has {self.targets.shape[0]} row(s) but there are {num_points} point(s)")
+
+        # Coordinates ARE checked for finiteness, unlike every other input block above. There is no
+        # train-median fill waiting for them downstream, so a NaN here would reach the normalizer
+        # and silently produce a NaN embedding for that point.
+        coords = np.asarray(self.coords)
+        if coords.ndim == 2 and coords.shape[1]:
+            if coords.shape[0] != num_points:
+                raise ValueError(
+                    f"coords has {coords.shape[0]} row(s) but there are {num_points} point(s)"
+                )
+            if coords.shape[1] != len(self.coord_names):
+                raise ValueError(
+                    f"coords has {coords.shape[1]} column(s) but {len(self.coord_names)} "
+                    f"coordinate name(s)"
+                )
+            self._validate_numeric_array("coords", coords, list(self.coord_names))
+
+        unknown_context = [
+            name for name in self.context_feature_names if name not in self.static_feature_names
+        ]
+        if unknown_context:
+            raise ValueError(
+                f"context_feature_names must be a subset of static_feature_names; unknown: "
+                f"{unknown_context}"
+            )
 
         # Deliberately NOT run through _validate_numeric_array: a missing lab value is legitimate
         # here and becomes a train-median fill once the split is known. Only the alignment matters.

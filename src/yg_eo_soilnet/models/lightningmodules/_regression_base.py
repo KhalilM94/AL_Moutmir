@@ -436,6 +436,12 @@ class SoilRegressionLightningBase(LightningModule):
         self.modality_column_names = {
             str(name): list(columns) for name, columns in (payload.get("modality_column_names") or {}).items()
         }
+        # The declared spatial-context subset of static_feature_names, and the coordinate column
+        # names. Both ride this channel rather than being constructor arguments, for the same reason
+        # static_feature_names does: they label attributions and change no shape, so making them
+        # hyperparameters would put a purely cosmetic list in the load_from_checkpoint contract.
+        self.context_feature_names = list(payload.get("context_feature_names") or [])
+        self.coord_names = list(payload.get("coord_names") or [])
 
     def get_preprocessing_state(self) -> dict:
         """The attached state, empty when this module was never given one."""

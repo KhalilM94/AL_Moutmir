@@ -256,14 +256,14 @@ def sklearn_shap_results(
 
     # A joint fit has one output per target. `_as_values` keeps that axis - it used to be dropped
     # with `[..., 0]`, so every target's plots showed the FIRST target's attributions under its own
-    # name. `target` names the output wanted: the caller runs this once per target, inside that
-    # target's run.
+    # name. EVERY output is returned, in output order: the caller explains the joint model once, at
+    # model-run scope, and routes each output to the run that holds that target's evaluation. This
+    # used to slice down to the single output matching `target`, which paid for the full multi-output
+    # explanation N times over to throw away N-1 of it each time.
     n_outputs = values.shape[2] if values.ndim == 3 else 1
     names = [str(name) for name in (target_names or [])]
     if len(names) != n_outputs:
         names = [str(target)] if n_outputs == 1 else [f"{target}_{index}" for index in range(n_outputs)]
-
-    wanted = [names.index(str(target))] if str(target) in names else list(range(n_outputs))
 
     return [
         ShapResult(
@@ -276,5 +276,5 @@ def sklearn_shap_results(
             base_value=_base_value_at(base_value, index),
             explainer=explainer_name,
         )
-        for index in wanted
+        for index in range(n_outputs)
     ]

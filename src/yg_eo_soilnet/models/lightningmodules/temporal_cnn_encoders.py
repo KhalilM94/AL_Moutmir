@@ -406,22 +406,39 @@ class AnnualGrid2DEncoder(nn.Module):
 
 
 class ConcatGatedFusion(nn.Module):
-    """``Z = concat(static, temporal) * sigmoid(Linear(concat(static, temporal)))``.
+    """``Z = concat(branches) * sigmoid(Linear(concat(branches)))``.
 
-    A self-gate over the concatenation, so the output keeps both branches at full width and the gate
+    A self-gate over the concatenation, so the output keeps every branch at full width and the gate
     decides per feature how much of each survives. Note this is *not* the interpolating gate the
     sequence model uses, which trades one branch off against the other at a shared width.
+
+    ``coordinate_dim`` adds a third branch. Putting position INSIDE the gate rather than appending
+    it afterwards is the point of doing it here: the gate reads the concatenation, so it can damp or
+    admit a static covariate or a temporal embedding *conditioned on where the point is* - a
+    reflectance band that means one thing on an irrigated plain and another on a limestone slope.
+    Appending after the gate would let position reach the head unmediated but would leave it unable
+    to modulate anything.
+
+    A third named parameter rather than ``*part_dims``: callers construct this by keyword, and a
+    varargs signature would break them. ``coordinate_dim=0`` builds exactly the two-branch module
+    this class has always been - same ``output_dim``, same ``gate`` shape, same state_dict keys.
     """
 
-    def __init__(self, static_dim: int, temporal_dim: int):
+    def __init__(self, static_dim: int, temporal_dim: int, coordinate_dim: int = 0):
         super().__init__()
-        self.output_dim = int(static_dim) + int(temporal_dim)
+        self.output_dim = int(static_dim) + int(temporal_dim) + int(coordinate_dim)
         self.gate = nn.Linear(self.output_dim, self.output_dim)
 
-    def forward(self, static_features: torch.Tensor, temporal_features: Optional[torch.Tensor]) -> torch.Tensor:
-        joined = (
-            static_features
-            if temporal_features is None
-            else torch.cat([static_features, temporal_features], dim=-1)
-        )
+    def forward(
+        self,
+        static_features: torch.Tensor,
+        temporal_features: Optional[torch.Tensor],
+        coordinate_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        parts = [
+            part
+            for part in (static_features, temporal_features, coordinate_features)
+            if part is not None
+        ]
+        joined = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
         return joined * torch.sigmoid(self.gate(joined))

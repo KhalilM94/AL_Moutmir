@@ -311,6 +311,10 @@ class LightningConfigFactory:
             # Calendar-grid span, inferred from the data by the sequence datamodule. Only the CNN
             # rasterises, so only it declares this argument.
             "grid_years": getattr(datamodule, "grid_years", None),
+            # 2 when USE_HARMONIC_COORDS put coordinates on the bundle, 0 otherwise. Like grid_years
+            # this is meaningful to the CNN alone, so `offer` filters it away from the models that
+            # do not declare it.
+            "coord_dim": getattr(datamodule, "coord_dim", None),
             # Entity-embedding contract, fitted train-only by the datamodule's setup(). The
             # vocabularies travel into the model's hyper_parameters so the checkpoint carries its
             # own label->index mapping instead of re-deriving one from whatever frame it is given.

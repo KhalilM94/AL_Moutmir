@@ -3,14 +3,14 @@
 The two entry points the logger uses:
 
 * :func:`build_shap_results` dispatches to the backend explainer and returns one
-  :class:`~yg_eo_soilnet.explain.result.ShapResult` per target;
+  :class:`~yg_eo_soilnet.explain.result.ShapResult` per MODEL OUTPUT;
 * :func:`log_shap_artifacts` turns those into the ``explain/`` artifacts.
 
 **Nothing in this package imports ``shap`` at module scope, and nothing outside it imports this
 package at module scope.** ``shap`` pulls in numba and is slow to import, so a run with
 ``EXPLAIN_ENABLED: false`` must not pay for it - and, because the test suite runs with
 ``filterwarnings = ["error"]``, must not risk a warning from a library it never asked for.
-``ChildRunLogger._log_shap_artifacts`` checks the switch before importing this module;
+``ChildRunLogger._shap_gate`` checks the switch before this module is imported;
 ``tests/test_explain_switch.py`` asserts ``"shap" not in sys.modules`` after a disabled run.
 """
 
@@ -35,7 +35,13 @@ __all__ = [
 
 
 def build_shap_results(*, config, backend: str, **payload) -> list[ShapResult]:
-    """Explain one fitted model. ``backend`` is ``"sklearn"`` or ``"lightning"``."""
+    """Explain one fitted model. ``backend`` is ``"sklearn"`` or ``"lightning"``.
+
+    One contract for both backends: this returns one :class:`ShapResult` per model OUTPUT, in output
+    order. A joint fit is explained ONCE and yields every target; the caller routes each output to
+    the run that holds that target's evaluation. The ``target`` in the payload is only a naming
+    fallback, used when the model's own target names are missing or do not match the output count.
+    """
     if backend == "sklearn":
         from yg_eo_soilnet.explain.sklearn_explainer import sklearn_shap_results
 

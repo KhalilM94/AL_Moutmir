@@ -129,6 +129,13 @@ class SoilSequenceDataModule(LightningDataModule):
         self.label_mean_: Optional[np.ndarray] = None
         self.label_scale_: Optional[np.ndarray] = None
         self.label_median_: Optional[np.ndarray] = None
+        # The TRAIN-split bounding box, which is what maps lat/lon onto the [-1, 1] the harmonic
+        # encoder's frequencies are defined on. Train-only for the same reason every statistic here
+        # is, and stored in preprocessing_state for a reason specific to this one: a serving request
+        # can be a SINGLE point, whose own bounding box is degenerate, so a re-fit would normalize
+        # every served point to the centre of itself.
+        self.coord_min_: Optional[np.ndarray] = None
+        self.coord_max_: Optional[np.ndarray] = None
 
         # The shape contract the Lightning config factory reads off the datamodule. Note the
         # deliberate absence of `temporal_steps` and `edge_attr_dim`: the model is length-agnostic
@@ -142,6 +149,16 @@ class SoilSequenceDataModule(LightningDataModule):
         )
         self.target_dim = int(np.asarray(self.sequence_bundle.targets).shape[1])
         self.static_feature_names = list(self.sequence_bundle.static_feature_names)
+        # The subset of the above declared as spatial context. Purely descriptive: these columns are
+        # already inside static_features and are standardized with the rest, so this changes no
+        # shape. It travels so the explainer can roll them up as a block instead of scattering them
+        # among the ordinary covariates.
+        self.context_feature_names = list(self.sequence_bundle.context_feature_names)
+        # 2 when USE_HARMONIC_COORDS put coordinates on the bundle, 0 otherwise. The config factory
+        # reads it as coord_dim, and 0 is what keeps the model's coordinate branch an nn.Identity
+        # with no parameters and no state_dict keys.
+        self.coord_dim = int(self.sequence_bundle.coord_dim)
+        self.coord_names = list(self.sequence_bundle.coord_names)
         # Categorical shape contract. The names are known now, but the cardinalities are not: they
         # depend on the vocabulary, which depends on the train split, which setup() decides. The
         # config factory reads these AFTER calling setup(), so by then they are filled in.
@@ -187,6 +204,14 @@ class SoilSequenceDataModule(LightningDataModule):
             # Without this a served model would rebuild the flags from whatever the request happens
             # to be missing and hand the network a different width than it was trained on.
             "static_validity_names": list(self.static_validity_names),
+            # Which of those covariates are the declared spatial-context group. Carried so a
+            # restored model can label its attributions the way the training run did.
+            "context_feature_names": list(self.context_feature_names),
+            # The train bounding box, without which a served point cannot be placed on the same
+            # [-1, 1] interval the model was trained on. Empty when coordinates are switched off.
+            "coord_min": as_list(self.coord_min_),
+            "coord_max": as_list(self.coord_max_),
+            "coord_names": list(self.coord_names),
             "sequence_mean": {name: as_list(values) for name, values in self.sequence_mean_.items()},
             "sequence_scale": {name: as_list(values) for name, values in self.sequence_scale_.items()},
             "modality_column_names": {
@@ -232,6 +257,17 @@ class SoilSequenceDataModule(LightningDataModule):
         # even when the incoming request happens to be missing a different set of covariates.
         if "static_validity_names" in state:
             self.static_validity_names = [str(name) for name in (state.get("static_validity_names") or [])]
+        if "context_feature_names" in state:
+            self.context_feature_names = [str(name) for name in (state.get("context_feature_names") or [])]
+        # Installed rather than re-fitted, which is the whole point of this method: a serving batch
+        # can be one point, and a bounding box fitted on one point is a single location that
+        # normalizes to the centre of itself. Every request must be placed on the interval the model
+        # was trained on, so a point outside the training extent lands outside [-1, 1] - correct, and
+        # not clipped: the encoder is periodic and handles it.
+        self.coord_min_ = as_array(state.get("coord_min"), dtype=np.float64)
+        self.coord_max_ = as_array(state.get("coord_max"), dtype=np.float64)
+        if "coord_names" in state:
+            self.coord_names = [str(name) for name in (state.get("coord_names") or [])]
         self.target_mean_ = as_array(state.get("target_mean"))
         self.target_scale_ = as_array(state.get("target_scale"))
         self.label_mean_ = as_array(state.get("label_mean"))
@@ -362,6 +398,12 @@ class SoilSequenceDataModule(LightningDataModule):
         indices = np.asarray(train_idx, dtype=np.int64)
         if indices.size == 0:
             return
+
+        coords = np.asarray(self.sequence_bundle.coords)
+        if coords.size and coords.shape[1]:
+            train_coords = np.asarray(coords[indices], dtype=np.float64)
+            self.coord_min_ = train_coords.min(axis=0)
+            self.coord_max_ = train_coords.max(axis=0)
 
         static_features = np.asarray(self.sequence_bundle.static_features)
         if static_features.size:
@@ -518,6 +560,32 @@ class SoilSequenceDataModule(LightningDataModule):
         positions = [self.static_feature_names.index(name) for name in self.static_validity_names]
         return measured[:, positions].astype(np.float32)
 
+    def _normalize_coords(self, values: np.ndarray) -> np.ndarray:
+        """lat/lon -> the [-1, 1] interval the harmonic frequencies are defined on.
+
+        A min-max onto the TRAIN bounding box, not a z-score. The distinction matters: the encoder's
+        frequency k is ``2**k * pi``, so it resolves about 1/2**k of the interval, and that is a
+        statement about the study area only while the study area IS the interval. Standardizing
+        instead would make the same k mean a different distance on every dataset.
+
+        A point outside the training extent lands outside [-1, 1] and is NOT clipped. Clipping would
+        collapse every point beyond the edge onto the boundary, making a distant location
+        indistinguishable from one just outside; sine and cosine are periodic and handle the
+        overflow without any special case.
+        """
+        values = np.asarray(values, dtype=np.float64)
+        if values.size == 0 or self.coord_min_ is None or self.coord_max_ is None:
+            return values.astype(np.float32)
+
+        span = np.asarray(self.coord_max_, dtype=np.float64) - np.asarray(self.coord_min_, dtype=np.float64)
+        # A degenerate axis - every training point on one meridian, or a single training point -
+        # carries no positional information at all. Mapping it to a constant 0 is the honest answer;
+        # dividing by it would produce inf and poison every downstream channel.
+        safe_span = np.where(np.isfinite(span) & (np.abs(span) > 1e-12), span, 1.0)
+        normalized = 2.0 * (values - self.coord_min_) / safe_span - 1.0
+        normalized = np.where(np.abs(span) > 1e-12, normalized, 0.0)
+        return normalized.astype(np.float32)
+
     def _standardize_labels(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Lab values -> ``(standardized, validity)``, filling what is missing from the train median.
 
@@ -600,9 +668,19 @@ class SoilSequenceDataModule(LightningDataModule):
             x_labels = np.zeros((indices.size, 0), dtype=np.float32)
             x_label_validity = np.zeros((indices.size, 0), dtype=bool)
 
+        # Normalized against the TRAIN bounding box, never against this batch. Always well-shaped
+        # and zero-width when coordinates are switched off, exactly as x_categorical is, so nothing
+        # downstream needs a None branch.
+        coords = np.asarray(bundle.coords)
+        if coords.size and coords.shape[1]:
+            x_coords = self._normalize_coords(coords[indices])
+        else:
+            x_coords = np.zeros((indices.size, 0), dtype=np.float32)
+
         batch: dict[str, Any] = {
             "x_static": torch.as_tensor(x_static, dtype=torch.float32),
             "x_categorical": torch.as_tensor(x_categorical, dtype=torch.long),
+            "x_coords": torch.as_tensor(x_coords, dtype=torch.float32),
             "x_labels": torch.as_tensor(x_labels, dtype=torch.float32),
             "x_label_validity": torch.as_tensor(x_label_validity, dtype=torch.bool),
             "y": torch.as_tensor(y, dtype=torch.float32),

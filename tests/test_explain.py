@@ -29,11 +29,18 @@ LAB_ROSTER = ["ph_lab", "clay_lab", "sand_lab"]
 AUXILIARY = ["ph_lab", "clay_lab"]
 
 
-def _model(*, categorical: bool = True, auxiliary: bool = True) -> SoilCNNLightningModule:
+def _model(
+    *,
+    categorical: bool = True,
+    auxiliary: bool = True,
+    coords: bool = False,
+    context: bool = False,
+) -> SoilCNNLightningModule:
     model = SoilCNNLightningModule(
         static_dim=len(STATIC_NAMES),
         target_dim=1,
         target_names=["organic_matter_pct"],
+        coord_dim=2 if coords else 0,
         categorical_cardinalities=[4] if categorical else [],
         categorical_vocabularies=[["a", "b", "c", "unk"]] if categorical else [],
         categorical_feature_names=["texture"] if categorical else [],
@@ -58,13 +65,24 @@ def _model(*, categorical: bool = True, auxiliary: bool = True) -> SoilCNNLightn
             "sequence_scale": {"s2": [0.05, 0.06], "clim": [10.0]},
             "label_mean": [7.0, 30.0, 40.0],
             "label_scale": [0.5, 5.0, 6.0],
+            "context_feature_names": [STATIC_NAMES[1]] if context else [],
+            "coord_names": ["lat", "lon"],
+            "coord_min": [31.0, -8.0],
+            "coord_max": [36.0, -3.0],
         }
     )
     model.eval()
     return model
 
 
-def _batch(n: int, *, categorical: bool = True, auxiliary: bool = True, seed: int = 0) -> dict:
+def _batch(
+    n: int,
+    *,
+    categorical: bool = True,
+    auxiliary: bool = True,
+    coords: bool = False,
+    seed: int = 0,
+) -> dict:
     generator = torch.Generator().manual_seed(seed)
     length = 5
     batch = {
@@ -92,6 +110,8 @@ def _batch(n: int, *, categorical: bool = True, auxiliary: bool = True, seed: in
     if auxiliary:
         batch["x_labels"] = torch.randn(n, len(LAB_ROSTER), generator=generator)
         batch["x_label_validity"] = torch.ones(n, len(LAB_ROSTER))
+    if coords:
+        batch["x_coords"] = torch.rand(n, 2, generator=generator) * 2 - 1
     return batch
 
 
@@ -100,9 +120,10 @@ def _batch(n: int, *, categorical: bool = True, auxiliary: bool = True, seed: in
 
 @pytest.mark.parametrize("categorical", [True, False])
 @pytest.mark.parametrize("auxiliary", [True, False])
-def test_forward_from_parts_reproduces_forward_exactly(categorical, auxiliary) -> None:
-    model = _model(categorical=categorical, auxiliary=auxiliary)
-    batch = _batch(6, categorical=categorical, auxiliary=auxiliary)
+@pytest.mark.parametrize("coords", [True, False])
+def test_forward_from_parts_reproduces_forward_exactly(categorical, auxiliary, coords) -> None:
+    model = _model(categorical=categorical, auxiliary=auxiliary, coords=coords)
+    batch = _batch(6, categorical=categorical, auxiliary=auxiliary, coords=coords)
 
     with torch.no_grad():
         direct = model(batch)
@@ -116,11 +137,11 @@ def test_forward_from_parts_reproduces_forward_exactly(categorical, auxiliary) -
 
 
 def test_every_incoming_feature_gets_exactly_one_group() -> None:
-    model = _model()
-    _parts, groups = model.explanation_parts(_batch(4))
+    model = _model(coords=True)
+    _parts, groups = model.explanation_parts(_batch(4, coords=True))
     names = [group["name"] for group in groups]
 
-    for expected in STATIC_NAMES + ["texture"] + S2_BANDS + CLIM_BANDS + AUXILIARY:
+    for expected in STATIC_NAMES + ["texture"] + S2_BANDS + CLIM_BANDS + AUXILIARY + ["lat", "lon"]:
         assert expected in names, f"{expected} has no SHAP row"
 
     assert len(names) == len(set(names)), f"duplicate feature rows: {names}"
@@ -188,11 +209,14 @@ def test_cell_mask_is_recoverable_from_the_grid() -> None:
 # --- the Lightning explainer ------------------------------------------------
 
 
-def _shap_result(model, **config_overrides) -> ShapResult:
+def _shap_result(model, *, coords: bool = False, **config_overrides) -> ShapResult:
     settings = {"RANDOM_SEED": 42, "EXPLAIN_MAX_SAMPLES": 8, "EXPLAIN_BACKGROUND_SAMPLES": 16}
     settings.update(config_overrides)
     datamodule = SimpleNamespace(
-        test_dataloader=lambda: [_batch(16, seed=1), _batch(16, seed=2)],
+        test_dataloader=lambda: [
+            _batch(16, coords=coords, seed=1),
+            _batch(16, coords=coords, seed=2),
+        ],
         setup=lambda stage: None,
     )
     results = build_shap_results(
@@ -273,6 +297,40 @@ def test_temporal_colours_use_the_bands_own_scale() -> None:
 
     # sequence_mean 50.0, sequence_scale 10.0.
     assert 10.0 < float(np.nanmean(precip)) < 90.0
+
+
+def test_spatial_rows_are_coloured_in_degrees_not_in_normalized_units() -> None:
+    """The colour axis should read as "how far north", which -1..1 does not."""
+    result = _shap_result(_model(coords=True), coords=True)
+    latitude = result.data[:, result.feature_names.index("lat")]
+
+    # coord_min 31.0, coord_max 36.0 against coordinates normalized onto [-1, 1].
+    assert np.isfinite(latitude).all()
+    assert 31.0 <= float(np.nanmin(latitude)) and float(np.nanmax(latitude)) <= 36.0
+
+
+def test_a_context_column_is_coloured_like_the_static_column_it_is() -> None:
+    """It shares the part and the statistics; only the block name differs.
+
+    Compared against the very same column explained WITHOUT the declaration: naming a column as
+    context must change how it is grouped and nothing about how it is valued.
+    """
+    context_name = STATIC_NAMES[1]
+    plain = _shap_result(_model())
+    grouped = _shap_result(_model(context=True))
+
+    np.testing.assert_allclose(
+        grouped.data[:, grouped.feature_names.index(context_name)],
+        plain.data[:, plain.feature_names.index(context_name)],
+    )
+
+
+def test_the_spatial_and_context_groups_are_their_own_blocks() -> None:
+    result = _shap_result(_model(coords=True, context=True), coords=True)
+
+    assert {"spatial", "context"} <= set(result.blocks)
+    # And the column that was NOT declared stays where it was.
+    assert "static" in set(result.blocks)
 
 
 def test_a_model_without_the_seam_is_refused_by_name() -> None:

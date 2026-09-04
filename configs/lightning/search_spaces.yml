@@ -152,11 +152,11 @@ soil_cnn:
     datamodule.num_workers: 4
     datamodule.persistent_workers: true
     callbacks.early_stopping.patience: 20
+    model.dropout: 0.3
 
   params:
     model.learning_rate: {type: float, low: 1.0e-4, high: 1.0e-2, log: true}
     model.weight_decay: {type: float, low: 1.0e-6, high: 1.0e-2, log: true}
-    model.dropout: {type: float, low: 0.0, high: 0.5, step: 0.05}
     model.embedding_dropout: {type: float, low: 0.0, high: 0.3, step: 0.05}
     model.continuous_norm: {type: categorical, choices: [none, batch, layer]}
     model.temporal_encoder: {type: categorical, choices: [dilated_tempcnn, annual_grid2d]}

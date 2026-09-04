@@ -395,6 +395,20 @@ class Config:
         # metadata_columns still refuses for every LABEL_COLUMNS entry. A model then names the subset
         # it wants; see soil_cnn's auxiliary_label_columns.
         self.CARRY_LABEL_COLUMNS = self._get_config('CARRY_LABEL_COLUMNS', False)
+        # Whether lat/lon travel with the data as a HARMONIC POSITIONAL INPUT. Off by default, so a
+        # config that has not opted in behaves exactly as before: the coordinates stay metadata and
+        # filter_schema keeps dropping them for every family. Turning it on does NOT make them
+        # ordinary predictors - they bypass the feature frame entirely and reach only the CNN's
+        # coordinate branch, which normalizes them against the train bbox and encodes them.
+        self.USE_HARMONIC_COORDS = self._get_config('USE_HARMONIC_COORDS', False)
+        # Precomputed spatial-context columns (patch variance, neighbourhood statistics), declared
+        # as a named group so they can be ablated and attributed as a set. Empty means the group
+        # does not exist and nothing anywhere changes.
+        self.CONTEXT_FEATURES = self._get_config('CONTEXT_FEATURES', [])
+        # The group's switch. Note the asymmetry with the flag above: naming a column in
+        # CONTEXT_FEATURES makes it switchable, so turning this OFF removes a column that would
+        # otherwise be an ordinary continuous covariate. That is the ablation, and it is intended.
+        self.USE_CONTEXT_FEATURES = self._get_config('USE_CONTEXT_FEATURES', True)
         self.PREDICTOR_COLUMNS = self._get_config('PREDICTOR_COLUMNS', self._get_config('predictor_columns', []))
         self.IGNORED_COLUMNS = self._get_config('IGNORED_COLUMNS', self._get_config('ignored_columns', []))
         self.TREE_CATEGORICAL_ENCODING = self._get_sklearn_categorical_config('TREE_CATEGORICAL_ENCODING', 'onehot')

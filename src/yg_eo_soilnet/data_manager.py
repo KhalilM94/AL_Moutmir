@@ -28,12 +28,45 @@ class DataManager:
 
     # --- schema filtering -------------------------------------------------
 
-    def metadata_columns(self, target_columns: Optional[list[str]] = None, *, include_targets: bool = True) -> set[str]:
-        """Columns that identify or measure a sample rather than describe it."""
-        columns = {
-            getattr(self.config, "POINT_ID_COLUMN", "point_id"),
+    def coordinate_columns(self) -> tuple[str, str]:
+        """The ``(lat, lon)`` column names, from the configuration.
+
+        One place rather than a ``getattr(config, "LAT_COLUMN", "lat")`` at every call site: the
+        pair is read by the schema filter, the targets join, the unified splitter and - since
+        USE_HARMONIC_COORDS - the sequence builder, and a default that drifted between them would
+        route coordinates to some of those and not others.
+        """
+        return (
             getattr(self.config, "LAT_COLUMN", "lat"),
             getattr(self.config, "LON_COLUMN", "lon"),
+        )
+
+    def context_feature_columns(self) -> list[str]:
+        """The declared spatial-context columns, empty when the group is switched off.
+
+        Deliberately NOT metadata: these are ordinary continuous predictors that happen to be
+        grouped so they can be ablated and attributed together. The group being off is what puts
+        them in :meth:`excluded_columns`, which is where a gated *feature* belongs - putting them
+        in :meth:`metadata_columns` would say they can never be predictors, which is the opposite
+        of what they are.
+        """
+        if not getattr(self.config, "USE_CONTEXT_FEATURES", True):
+            return []
+        return [str(column) for column in (getattr(self.config, "CONTEXT_FEATURES", []) or [])]
+
+    def metadata_columns(self, target_columns: Optional[list[str]] = None, *, include_targets: bool = True) -> set[str]:
+        """Columns that identify or measure a sample rather than describe it.
+
+        Coordinates stay here whatever USE_HARMONIC_COORDS says. That flag routes lat/lon to the
+        CNN's own coordinate branch by reading them straight off the raw frame, exactly as
+        CARRY_LABEL_COLUMNS routes lab values - it does not promote them to features, and letting
+        them through here would hand raw degrees to every sklearn model as an ordinary predictor.
+        """
+        lat_column, lon_column = self.coordinate_columns()
+        columns = {
+            getattr(self.config, "POINT_ID_COLUMN", "point_id"),
+            lat_column,
+            lon_column,
             "geometry",
         }
         if include_targets:
@@ -47,10 +80,18 @@ class DataManager:
         return columns
 
     def excluded_columns(self, columns: Iterable[str]) -> set[str]:
-        """Configured non-feature columns: eliminated, excluded categorical and ignored bands."""
+        """Configured non-feature columns: eliminated, excluded categorical and ignored bands.
+
+        Plus the spatial-context group when it is switched off. Subtracting the live group from the
+        declared one is what makes the switch an ablation rather than a no-op: with the group on
+        this contributes nothing and the columns behave as they always did, and with it off the
+        declared names are dropped even though they are present and numeric.
+        """
+        declared_context = {str(column) for column in (getattr(self.config, "CONTEXT_FEATURES", []) or [])}
         return (
             set(getattr(self.config, "ELIMINATED_FEATURES", []) or [])
             | set(getattr(self.config, "EXCLUDE_CATEGORICAL", []) or [])
+            | (declared_context - set(self.context_feature_columns()))
             | self.hyperspectral_drop_columns(columns)
         )
 
@@ -221,11 +262,12 @@ class DataManager:
         Static and targets may be one joint file or two separate files/folders; time-series always
         arrives separately and is loaded lazily. Every framework consumes the returned bundle.
         """
+        lat_column, lon_column = self.coordinate_columns()
         return SoilDataset(
             tabular=self.load_tabular_data(),
             point_id_column=getattr(self.config, "POINT_ID_COLUMN", "point_id"),
-            lat_column=getattr(self.config, "LAT_COLUMN", "lat"),
-            lon_column=getattr(self.config, "LON_COLUMN", "lon"),
+            lat_column=lat_column,
+            lon_column=lon_column,
             target_columns=list(getattr(self.config, "TARGET_COLUMNS", [])),
             temporal_enabled=self._temporal_enabled(),
             _load_timeseries=self.load_timeseries_data,
@@ -305,7 +347,7 @@ class DataManager:
         # carries only the point id. Carry them across when only the targets file has them.
         coordinate_columns = [
             column
-            for column in (getattr(self.config, "LAT_COLUMN", "lat"), getattr(self.config, "LON_COLUMN", "lon"))
+            for column in self.coordinate_columns()
             if column not in static_df.columns and column in targets_df.columns
         ]
         if coordinate_columns:

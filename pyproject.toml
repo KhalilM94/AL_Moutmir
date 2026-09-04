@@ -5,7 +5,7 @@ name = "yg-eo-soilnet"
 requires-python = ">= 3.12,<3.13"
 version = "0.1.0"
 readme = "README.md"
-dependencies = ["mlflow==3.14.*", "psutil>=7.2.2,<8", "pip>=26.1.2,<27", "ipykernel>=7.3.0,<8"]
+dependencies = ["mlflow==3.14.*", "psutil>=7.2.2,<8", "pip>=26.1.2,<27", "ipykernel>=7.3.0,<8", "clhs>=1.0.2,<2"]
 
 [project.urls]
 Homepage = "https://github.com/KhalilM94/yg-eo-soilnet"

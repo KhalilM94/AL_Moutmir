@@ -105,6 +105,26 @@ soil_cnn:
     auxiliary_hidden_dims: []
     auxiliary_dropout: 0.0              # only applies inside those blocks
 
+    # --- harmonic coordinate branch (OFF unless the data carries coordinates) ---
+    # coord_dim is 2 only when USE_HARMONIC_COORDS in data_spec.yml put lat/lon on the bundle;
+    # otherwise it resolves to 0 and this whole branch is an nn.Identity with no parameters and no
+    # state_dict keys, so the model is byte-identical to one built before the option existed.
+    #
+    # Position is encoded as a bank of sines and cosines over the coordinates normalized onto
+    # [-1, 1] by the TRAIN-split bounding box. Frequency k is 2**k * pi, so it resolves about
+    # 1/2**k of the study area: k=0 is a regional gradient, k=5 separates neighbouring points.
+    # Note the contrast with the temporal branch, which is built so nothing encodes an absolute
+    # epoch - here absolute position IS the signal, and the bounding box that anchors it travels
+    # in the checkpoint's preprocessing state.
+    coord_dim: auto
+    harmonic_num_frequencies: 6         # embedding is 4*K (+2 with include_input) = 26 channels
+    harmonic_include_input: true        # the normalized lat/lon themselves, i.e. a linear gradient
+    # [] concatenates the raw bank onto the fusion. A non-empty list inserts Linear/LayerNorm/GELU
+    # blocks first, which decouples the branch's width from the frequency count - the same reason
+    # auxiliary_hidden_dims exists.
+    harmonic_hidden_dims: []
+    harmonic_dropout: 0.0               # only applies inside those blocks
+
     static_hidden_dims: [64]            # one width per block; [128, 64] deepens the static branch
     # Widths per block, then the readout: 384 -> 64 -> 1. GELU per block; LayerNorm on every block
     # EXCEPT the one feeding the readout, so a single-layer head like this one carries no norm at
