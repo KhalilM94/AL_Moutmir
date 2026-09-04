@@ -184,3 +184,52 @@ soil_cnn:
     
     # - dims_pyramid: {key: model.auxiliary_hidden_dims, min_depth: 0, max_depth: 2,
                     #  widths: [16, 32, 64], taper: 1.0}
+
+# --- soil_cnn with the head anchored on an existing prediction ---------------------------------
+# Same space as soil_cnn plus the base block's width. residual_base_columns is NOT searched: it is a
+# data contract, not a hyperparameter, and a trial that drew a different base would be optimizing a
+# different problem. Note the objective is a RESIDUAL-space val_loss, so the numbers here are not
+# comparable to the soil_cnn study's.
+soil_residual_cnn:
+  objective:
+    metric: val_loss
+    direction: minimize
+  sampler: {name: tpe, seed: 42}
+  pruner: {name: median, n_startup_trials: 5, n_warmup_steps: 10}
+
+  fixed:
+    trainer.max_epochs: 150
+    datamodule.num_workers: 4
+    datamodule.persistent_workers: true
+    callbacks.early_stopping.patience: 20
+    model.dropout: 0.3
+
+  params:
+    model.learning_rate: {type: float, low: 1.0e-4, high: 1.0e-2, log: true}
+    model.weight_decay: {type: float, low: 1.0e-6, high: 1.0e-2, log: true}
+    model.embedding_dropout: {type: float, low: 0.0, high: 0.3, step: 0.05}
+    model.continuous_norm: {type: categorical, choices: [none, batch, layer]}
+    model.temporal_encoder: {type: categorical, choices: [dilated_tempcnn, annual_grid2d]}
+    model.modality_embed_dim: {type: categorical, choices: [32, 64, 128, 256]}
+    model.cnn_norm: {type: categorical, choices: [batch, group, none]}
+    model.pool: {type: categorical, choices: [masked_avg, avg]}
+    model.month_positional: {type: categorical, choices: [true, false]}
+    model.use_validity_channels: {type: categorical, choices: [true, false]}
+    model.residual_base_validity_channels: {type: categorical, choices: [true, false]}
+    model.residual_base_dropout: {type: float, low: 0.0, high: 0.3, step: 0.05}
+    model.head_norm_final: {type: categorical, choices: [true, false]}
+    model.scheduler_patience: {type: int, low: 5, high: 30, step: 5}
+    datamodule.batch_size: {type: categorical, choices: [16, 32, 64]}
+
+  derive:
+    - dims_pyramid: {key: model.head_hidden_dims,   min_depth: 0, max_depth: 5,
+                     widths: [32, 64, 128, 256], taper: 0.5, floor: 8}
+    - dims_pyramid: {key: model.static_hidden_dims, min_depth: 1, max_depth: 5,
+                     widths: [32, 64, 128, 256], taper: 1.0}
+    - dims_pyramid: {key: model.cnn_hidden_dims,    min_depth: 1, max_depth: 5,
+                     widths: [16, 32, 64, 128, 256], taper: 1.0}
+    # min_depth 0 keeps raw concat reachable: an empty list IS the pass-through mode, so this knob
+    # searches across "append the base as it is" and "encode it first". Unlike the auxiliary
+    # equivalent this one is never inert - the base block is always built.
+    - dims_pyramid: {key: model.residual_base_hidden_dims, min_depth: 0, max_depth: 2,
+                     widths: [16, 32, 64], taper: 1.0}

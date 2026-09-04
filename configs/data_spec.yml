@@ -28,6 +28,7 @@ LABEL_COLUMNS:
   - cu_ppm_dtpa
   - zn_ppm_dtpa
   - b_ppm_hot_water
+  - soc_median_0_30cm
   # - total_silt_pct__soil_cnn
   # - c_e_c_meq_100g__soil_cnn
   # - caco3_pct_total__soil_cnn
@@ -47,13 +48,13 @@ CARRY_LABEL_COLUMNS: true
 # The subset of LABEL_COLUMNS to actually fit models for in this run. A name on either side is
 # treated as a label and kept out of the features; only these get models fitted.
 TARGET_COLUMNS:
-  # - organic_matter_g_kg
+  - organic_matter_g_kg
   # - clay_pct
   # - sand_pct
   # - total_silt_pct
   # - ph_water
   # - caco3_pct_total
-  - c_e_c_meq_100g
+  # - c_e_c_meq_100g
   # - c_n_ratio
   # - p2o5_ehangable_olsen_ppm
 
@@ -113,6 +114,7 @@ IGNORED_COLUMNS: &ignored_columns
   # - clay_median_0_30cm
   # - ph_median_0_30cm
   # - sand_median_0_30cm
+  # - silt_median_0_30cm
   # - soc_median_0_30cm
   # - swc_median_0_30cm
 

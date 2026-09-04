@@ -354,6 +354,18 @@ class LightningConfigFactory:
             value = getattr(datamodule, attribute, None)
             if value is not None and init_args.get(key) in (None, "auto"):
                 offer(key, [float(item) for item in np.asarray(value).ravel()])
+        # Lab standardization stats at the FULL roster width, on the same terms and for the same
+        # reason: only a model that reads a lab column in the target's own units needs them - the
+        # residual architecture, to undo this standardizer before re-expressing its base. Handled
+        # here rather than in shape_args because that loop's `value not in unset` test would run an
+        # elementwise comparison on the array and raise.
+        for key, attribute in (
+            ("auxiliary_label_mean", "label_mean_"),
+            ("auxiliary_label_scale", "label_scale_"),
+        ):
+            value = getattr(datamodule, attribute, None)
+            if value is not None and init_args.get(key) in (None, "auto"):
+                offer(key, [float(item) for item in np.asarray(value).ravel()])
         # The datamodule owns the choice of target transform; the model only needs to know so it can
         # invert it. Propagating it here keeps the two from ever disagreeing.
         if init_args.get("target_transform") in (None, "auto"):

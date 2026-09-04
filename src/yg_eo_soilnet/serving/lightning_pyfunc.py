@@ -473,6 +473,21 @@ def example_from_state(
     return pd.DataFrame(data)
 
 
+def required_label_columns(model) -> list[str]:
+    """The lab columns a request must supply for this model, as the model itself reports them.
+
+    ``serving_label_columns`` rather than ``auxiliary_label_columns`` because a model can read a lab
+    column for something other than the auxiliary branch - the residual architecture anchors its
+    head on one - and a column missing from the signature arrives NaN and is median-filled without
+    anything being raised. Falls back to the auxiliary list for a checkpoint restored into an older
+    class that has no such property.
+    """
+    columns = getattr(model, "serving_label_columns", None)
+    if columns is None:
+        columns = getattr(model, "auxiliary_label_columns", None)
+    return [str(column) for column in (columns or [])]
+
+
 def build_input_example(model, bundle, n_rows: int = 3) -> pd.DataFrame:
     """A small, valid serving frame for the model's own training bundle.
 
@@ -486,5 +501,5 @@ def build_input_example(model, bundle, n_rows: int = 3) -> pd.DataFrame:
         bundle,
         state,
         n_rows=n_rows,
-        auxiliary_columns=list(getattr(model, "auxiliary_label_columns", None) or []),
+        auxiliary_columns=required_label_columns(model),
     )

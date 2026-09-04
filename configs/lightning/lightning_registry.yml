@@ -191,6 +191,124 @@ soil_cnn:
   tags:
     architecture: calendar-grid-cnn
 
+# soil_cnn, but the head learns a CORRECTION to an existing prediction rather than the value.
+#
+# One lab-roster column is nominated as the BASE for each target - in practice a `<target>__<model>`
+# column written by predictions_export and merged back into the static or targets source. It is
+# mapped into the target's own space (undo the lab standardizer, apply 10*log1p, apply the target
+# standardizer) and ADDED to the readout, so `y` and the prediction stay in the same space and the
+# loss, the epoch metrics, predict_step's inversion, the uncertainty ensemble and serving are all
+# unchanged. The base also enters the network through a block of its own, so the head can condition
+# its correction on whether the base was large or small.
+#
+# READ val_loss AS A RESIDUAL-SPACE LOSS. It is not comparable to soil_cnn's. Compare r2_test /
+# rmse_test, which are in original units, and expect the run to beat the base predictions' own test
+# R2 on the same rows - if it does not, the head is fighting the anchor.
+#
+# LEAKAGE: `c_e_c_meq_100g__soil_cnn` clears the target check only because it is a different string
+# from `c_e_c_meq_100g`. That is right in principle - a prediction exists at inference time and the
+# measurement does not - but it is only SOUND if those predictions were produced OUT-OF-FOLD with
+# respect to the split this run uses. Nothing in the pipeline can verify that; in-fold predictions
+# will inflate every reported metric. The module logs a warning naming each base column.
+soil_residual_cnn:
+  enabled: true
+  input_kind: sequence
+  import_path: yg_eo_soilnet.models.lightningmodules.soil_residual_cnn_lightning_module.SoilResidualCNNLightningModule
+  datamodule_import_path: yg_eo_soilnet.datamodules.sequence.sequence_datamodule.SoilSequenceDataModule
+  init_args:
+    static_dim: auto
+    target_dim: auto
+    modality_dims: auto
+    grid_years: auto
+
+    categorical_cardinalities: auto
+    categorical_vocabularies: auto
+    categorical_feature_names: auto
+    embedding_dims: auto
+    embedding_max_dim: 50
+    embedding_dropout: 0.15000000000000002
+    continuous_norm: none
+
+    temporal_encoder: dilated_tempcnn
+    cnn_hidden_dims:
+    - 128
+    - 128
+    - 128
+    - 128
+    - 128
+    modality_embed_dim: 128
+    cnn_norm: batch
+    pool: masked_avg
+    month_positional: true
+    use_validity_channels: true
+
+    # --- the residual anchor (REQUIRED) ---
+    # One base column per target, by name. Must name EVERY target this model fits, and each column
+    # must be listed in LABEL_COLUMNS with CARRY_LABEL_COLUMNS: true so it travels with the data -
+    # from the static file or the targets file, either works. A column here may not also appear in
+    # auxiliary_label_columns: it already reaches the head through its own block.
+    residual_base_columns:
+      organic_matter_g_kg: soc_median_0_30cm
+    # [] = concat the base and its validity flag straight onto the fused vector; a non-empty list
+    # inserts Linear/LayerNorm/GELU blocks first, exactly as auxiliary_hidden_dims does.
+    residual_base_hidden_dims: []
+    residual_base_dropout: 0.0
+    residual_base_validity_channels: false   # measured-vs-filled flag per base column
+    # A missing base is median-filled, so the head would correct a constant instead of a prediction
+    # for that point - silent, and only visible as a mediocre run. Refuse above this fraction.
+    residual_base_max_missing: 0.05
+    # The full-roster lab statistics, injected from the training split. They undo the lab
+    # standardizer before the base is re-expressed in the target's space.
+    auxiliary_label_mean: auto
+    auxiliary_label_scale: auto
+
+    # The ordinary auxiliary branch still works alongside the base; see soil_cnn's notes.
+    auxiliary_label_columns: []
+    # c_e_c_meq_100g, c_n_ratio, caco3_pct_total
+    auxiliary_available_names: auto
+    auxiliary_validity_channels: true
+    auxiliary_hidden_dims: []
+    auxiliary_dropout: 0.0
+
+    coord_dim: auto
+    harmonic_num_frequencies: 6
+    harmonic_include_input: true
+    harmonic_hidden_dims: []
+    harmonic_dropout: 0.0
+
+    static_hidden_dims:
+    - 64
+    - 64
+    head_hidden_dims:
+    - 256
+    - 128
+    head_norm_final: false
+    dropout: 0.2
+
+    # mse rather than soil_cnn's mahalanobis: the structural losses read ACROSS targets and need
+    # MULTI_TARGET_MODE: joint, while residual_base_columns above names a single target. Switch
+    # both together if you fit a group.
+    loss_name: mse
+    huber_delta: 1.0
+    loss_base: mse
+    loss_lambda: 0.1
+    loss_shrinkage: 0.05
+    loss_min_batch: 16
+    cosine_space: original
+    learning_rate: 0.00010038360509669296
+    temporal_enabled: true
+    optimizer_name: adamw
+    weight_decay: 4.3691180514692865e-06
+    scheduler_type: plateau
+    scheduler_factor: 0.5
+    scheduler_patience: 10
+    scheduler_min_lr: 1.0e-06
+    scheduler_monitor: val_loss
+  datamodule_init_args:
+    max_sequence_length: null
+  tags:
+    architecture: residual-calendar-grid-cnn
+
 # Static covariates + one sequence encoder per modality, blended by a learned gate. No graph.
 #
 # Sequences are ragged and date-stamped: each point carries only its real observations, padded per

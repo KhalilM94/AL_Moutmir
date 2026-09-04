@@ -123,6 +123,10 @@ def _colour_values(model, parts, groups: list[dict], categorical_codes, state: d
 
     label_mean = np.asarray(state.get("label_mean") or [], dtype=np.float64)
     label_scale = np.asarray(state.get("label_scale") or [], dtype=np.float64)
+    # For the residual base block, which is published in the target's space rather than the lab
+    # standardizer's and so inverts with these instead.
+    target_mean = np.asarray(state.get("target_mean") or [], dtype=np.float64)
+    target_scale = np.asarray(state.get("target_scale") or [], dtype=np.float64)
     coord_min = np.asarray(state.get("coord_min") or [], dtype=np.float64)
     coord_max = np.asarray(state.get("coord_max") or [], dtype=np.float64)
     auxiliary_index = getattr(model, "auxiliary_index", None)
@@ -182,6 +186,20 @@ def _colour_values(model, parts, groups: list[dict], categorical_codes, state: d
                 roster_index = int(auxiliary_index[position])
                 if roster_index < label_mean.size and roster_index < label_scale.size:
                     value = value * label_scale[roster_index] + label_mean[roster_index]
+            colours[:, column] = value
+
+        elif kind == "residual_base":
+            # Already in the TARGET's space, not the lab standardizer's - that is the whole point of
+            # the block - so it inverts with the target statistics, not label_mean/label_scale. The
+            # result is the base prediction in original units, which is the number a reader
+            # comparing the correction against what it corrected actually wants.
+            block = parts[group["part"]].detach().cpu().numpy().astype(np.float64)
+            position = group["columns"][0]
+            value = block[:, position]
+            if position < target_mean.size and position < target_scale.size:
+                value = value * target_scale[position] + target_mean[position]
+            if bool(getattr(model, "targets_are_log1p", False)):
+                value = np.expm1(value / 10.0)
             colours[:, column] = value
 
     return colours

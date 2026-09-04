@@ -142,13 +142,13 @@ def relog(args: argparse.Namespace) -> dict[str, Any]:
             "input and is not servable. It predates attach_preprocessing_state; retrain instead."
         )
 
-    from yg_eo_soilnet.serving.lightning_pyfunc import example_from_state
+    from yg_eo_soilnet.serving.lightning_pyfunc import example_from_state, required_label_columns
 
     input_example = example_from_state(
         state,
         static_frame=load_static_frame(args.run_id, args.rows),
         n_rows=args.rows,
-        auxiliary_columns=list(getattr(model, "auxiliary_label_columns", None) or []),
+        auxiliary_columns=required_label_columns(model),
     )
 
     logger = ChildRunLogger()

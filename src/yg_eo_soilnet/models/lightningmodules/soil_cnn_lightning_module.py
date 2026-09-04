@@ -449,6 +449,17 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         return bool(self.auxiliary_label_columns)
 
     @property
+    def serving_label_columns(self) -> list[str]:
+        """The lab columns a served request must supply, i.e. every one the model actually reads.
+
+        Distinct from ``auxiliary_label_columns`` only for a subclass that reads a lab column for
+        some other purpose - the residual variant anchors on one. The serving signature is built
+        from this, so a column missing here arrives NaN, is median-filled from the training split
+        and is flagged unmeasured, with nothing raised.
+        """
+        return list(self.auxiliary_label_columns)
+
+    @property
     def has_static_features(self) -> bool:
         return self.static_dim > 0 or bool(self.categorical_cardinalities)
 
@@ -622,13 +633,17 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
             return None
         return self._encode_temporal_from_grids(self._rasterize(batch, device=device, dtype=dtype))
 
-    def forward(self, batch: Any) -> torch.Tensor:
+    def _fuse(self, batch: Any, *, device, dtype) -> torch.Tensor:
+        """Every branch, concatenated into the vector the head reads. Everything but the readout.
+
+        Split out of :meth:`forward` so a subclass can reuse the trunk and change only what happens
+        to the fused vector. SoilResidualCNNLightningModule appends a block of its own here and
+        offsets the readout; copying this body instead is how the two silently drift apart.
+        """
         x_static = batch_get(batch, "x_static")
         if x_static is None:
             raise KeyError("Batch is missing 'x_static'")
 
-        reference = next(self.parameters())
-        device, dtype = reference.device, reference.dtype
         x_static = x_static.to(device=device, dtype=dtype)
         x_categorical = batch_get(batch, "x_categorical")
         if x_categorical is not None:
@@ -646,7 +661,13 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         auxiliary_features = self._encode_auxiliary(batch, device=device, dtype=dtype)
         if auxiliary_features is not None:
             fused = torch.cat([fused, auxiliary_features], dim=-1)
-        return self.output_head(fused)
+        return fused
+
+    def forward(self, batch: Any) -> torch.Tensor:
+        reference = next(self.parameters())
+        return self.output_head(
+            self._fuse(batch, device=reference.device, dtype=reference.dtype)
+        )
 
     # --- attribution seam ---------------------------------------------------
     # explanation_parts() splits a batch into the tensors an explainer perturbs, and
@@ -796,6 +817,19 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
         ``cell_mask`` is therefore read back out of the grid rather than passed alongside it: the
         rasterizer already writes it as the ``cell_observed`` channel, so the grid is self-contained.
         """
+        fused, _cursor = self._fuse_from_parts(parts)
+        # The MEAN only. On a heteroscedastic head the readout is 2*target_dim wide, and returning
+        # it whole would hand the explainer a second block of outputs that are log variances - which
+        # it would attribute and label as targets, producing a SHAP plot with twice the targets the
+        # model has, half of them explaining a quantity nobody asked about.
+        return self._split_head_output(self.output_head(fused))[0]
+
+    def _fuse_from_parts(self, parts: Sequence[torch.Tensor]) -> tuple[torch.Tensor, int]:
+        """``(fused, cursor)`` - :meth:`_fuse`'s counterpart over attribution parts.
+
+        Returns the cursor alongside the vector so a subclass that appended parts of its own knows
+        where its first one starts, without having to re-derive the parent's part count.
+        """
         cursor = 0
         x_static = parts[cursor]
         cursor += 1
@@ -833,11 +867,7 @@ class SoilCNNLightningModule(SoilRegressionLightningBase):
             fused = torch.cat([fused, self.auxiliary_encoder(parts[cursor])], dim=-1)
             cursor += 1
 
-        # The MEAN only. On a heteroscedastic head the readout is 2*target_dim wide, and returning
-        # it whole would hand the explainer a second block of outputs that are log variances - which
-        # it would attribute and label as targets, producing a SHAP plot with twice the targets the
-        # model has, half of them explaining a quantity nobody asked about.
-        return self._split_head_output(self.output_head(fused))[0]
+        return fused, cursor
 
     def _static_feature_names(self, width: int) -> list[str]:
         """Names for the continuous static block, falling back to positions when none were stored."""
