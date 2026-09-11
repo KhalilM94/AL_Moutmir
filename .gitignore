@@ -16,6 +16,8 @@ mlruns/
 lightning_logs/
 mlflow_exports/
 optuna_studies/
+notebooks/basemap_cache/
+notebooks/figures/
 
 # Build artifacts
 build/

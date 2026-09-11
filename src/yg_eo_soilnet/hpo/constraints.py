@@ -65,22 +65,31 @@ def resolve_constraints(entries: list[Any]) -> list[ConstraintHook]:
 
 
 @constraint("d_model_divisible_by_nhead")
-def d_model_divisible_by_nhead(trial: optuna.Trial, chosen: MutableMapping[str, Any]) -> None:
-    """Round `model.d_model` up to a multiple of `model.nhead`.
+def d_model_divisible_by_nhead(
+    trial: optuna.Trial,
+    chosen: MutableMapping[str, Any],
+    *,
+    d_model_key: str = "model.d_model",
+    nhead_key: str = "model.nhead",
+) -> None:
+    """Round the width at `d_model_key` up to a multiple of the head count at `nhead_key`.
 
     TimeAwareTransformerEncoder raises unless d_model % nhead == 0. Repairing the draw instead of
     rejecting it keeps every trial valid by construction, and costs no extra search dimension - the
     two parameters stay independent draws in the YAML.
+
+    The keys default to the sequence transformer's. The residual attention CNN names its own pair,
+    `model.attention_d_model` / `model.attention_nhead`, through the mapping form.
     """
-    d_model = chosen.get("model.d_model")
-    nhead = chosen.get("model.nhead")
+    d_model = chosen.get(d_model_key)
+    nhead = chosen.get(nhead_key)
     if d_model is None or nhead is None:
         return
 
     d_model, nhead = int(d_model), int(nhead)
     remainder = d_model % nhead
     if remainder:
-        chosen["model.d_model"] = d_model + (nhead - remainder)
+        chosen[d_model_key] = d_model + (nhead - remainder)
 
 
 DEFAULT_PYRAMID_WIDTHS = [32, 64, 128, 256]

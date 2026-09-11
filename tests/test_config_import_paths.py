@@ -23,7 +23,7 @@ def _resolve(dotted_path: str):
 def _enabled_lightning_entries() -> list[tuple[str, dict]]:
     from config import load_lightning_registry
 
-    registry = load_lightning_registry(str(CONFIGS_ROOT / "lightning" / "lightning_registry.yml"))
+    registry = load_lightning_registry(str(CONFIGS_ROOT / "lightning" / "models" / "defaults.yml"))
     return [(name, spec) for name, spec in registry.items() if spec.get("enabled", False)]
 
 

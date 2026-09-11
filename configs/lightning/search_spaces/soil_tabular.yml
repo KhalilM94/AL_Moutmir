@@ -1,0 +1,118 @@
+# This file defines the shared rules for what `tune.py` (Optuna-based hyperparameter search) is
+# allowed to try. Each model's own search space lives in its own file under
+# configs/lightning/search_spaces/ (soil_tabular.yml, soil_sequence.yml, soil_cnn.yml,
+# soil_residual_cnn.yml), named after the entry it tunes in configs/lightning/models/ - add a new
+# .yml file there, named after the model, with the model name as its top-level key, to add a
+# search space for another one.
+#
+# Quick glossary: Optuna runs many "trials" - each trial trains the model once with one particular
+# combination of settings - and tries to find the combination that scores best. A "study" is one
+# full run of many trials.
+#
+# Where a setting lands in the model registry is shown by its dotted prefix here:
+#   model.<key>              -> that model's init_args
+#   datamodule.<key>         -> that model's datamodule_init_args
+#   trainer.<key>            -> that model's trainer_args
+#   callbacks.<group>.<key>  -> that model's callbacks[group]
+#
+# Each model's search space file has these blocks:
+#   objective  what metric to optimize, and whether higher or lower is better. The early-stopping
+#              monitor is automatically switched to watch the same metric.
+#   fixed      settings applied the SAME way to every trial - not searched, just pinned for the
+#              whole study (e.g. a shorter max_epochs than a real production run would use, since
+#              trials rely on being stopped early rather than run to completion).
+#   params     the actual search space - the settings Optuna is allowed to vary, and the range or
+#              choices for each one. `when:` makes a setting only apply in trials where an earlier
+#              choice matches - e.g. only search LSTM settings in trials that actually chose the
+#              LSTM encoder.
+#   derive     named helper rules (defined in hpo/constraints.py) for relationships between
+#              settings that are too complex to write directly as a plain search range. Write a
+#              bare helper name, or `{name: {option: value}}` to pass it settings of its own.
+#
+# LAYER WIDTHS: every stack of layers in these models (the head, the static branch, the conv
+# blocks) is set as a list of per-layer widths, where the list's length IS the number of layers -
+# see the note at the top of models/defaults.yml. Optuna can't directly search a "list" as one
+# choice, so there are three ways to handle one of these settings here:
+#
+#   1. search it   derive: [{dims_pyramid: {key: model.head_hidden_dims, max_depth: 3,
+#                                           widths: [32, 64, 128], taper: 0.5, floor: 16}}]
+#                  This lets Optuna choose both a depth (how many layers) and a starting width, and
+#                  then builds the full list by scaling that width down/up per layer by `taper`:
+#                    taper 0.5   each layer roughly half the previous: 128 -> [128, 64, 32]
+#                    taper 1.0   every layer the same width: 128 -> [128, 128, 128]
+#                    taper 2.0   each layer roughly double: 32 -> [32, 64, 128]
+#                  min_depth: 0 allows Optuna to try an empty list (no extra layers at all).
+#   2. pin it      fixed: {model.head_hidden_dims: [64, 32]} - always this exact list, not searched
+#   3. leave it    don't mention the setting at all, and the registry's own value is used unchanged
+#
+# Every OTHER width/depth-like setting is just an ordinary number and belongs directly under
+# `params`, e.g.: modality_embed_dim, fusion_dim, d_model, nhead, num_layers, time2vec_dim,
+# lstm_hidden_dim, lstm_num_layers.
+#
+# Careful: changing anything in one of these files changes which study `tune.py` continues.
+# Studies are named based on a fingerprint of the search space, so editing `params`/`fixed`/`derive`
+# starts a brand-new study next time you run `tune.py`, rather than adding more trials to your
+# existing one - and trials from the new study won't be directly comparable to the old one's
+# results. (Changing `sampler`/`pruner` does NOT trigger a new study, so those can be adjusted
+# freely on an existing one.)
+#
+# Two kinds of setting can't be searched here, and will raise an error if you try:
+#   - anything the pipeline works out automatically from your data (static_dim, target_dim,
+#     categorical_*, grid_years, target_mean/scale/transform, ...) - letting Optuna choose a
+#     different value for these would break the model's expected input/output shapes.
+#   - val_size / test_size / seed under `params`, or split_plan anywhere - the train/val/test split
+#     is decided ONCE for the whole run (and shared with the sklearn models too) in
+#     main_config.yml's `split:` block. Letting it vary per trial would silently refit each trial's
+#     preprocessing on different data, making trials impossible to compare fairly with each other
+#     or with anything else on the leaderboard. To change the split, edit `split:` there instead -
+#     it applies to the whole study at once.
+
+# --- static features + categorical embeddings only; no time-series branch (soil_tabular) --------
+soil_tabular:
+  objective:
+    metric: val_r2                     # R2 is scale-free (always roughly 0-1 regardless of the
+                                        # target's units), so it stays comparable even if you also
+                                        # experiment with different loss_name settings
+    direction: maximize
+  # `sampler` decides which combination of settings to try next each trial; `tpe` (used here) is a
+  # common, effective general-purpose algorithm that learns from earlier trials' results rather
+  # than trying combinations blindly at random.
+  sampler: {name: tpe, seed: 42}
+  # `pruner` stops a trial early if it's clearly doing worse than other trials at the same point in
+  # training, so time isn't wasted training a bad combination all the way through.
+  # n_startup_trials is how many trials run to completion first (so there's something to compare
+  # against) before pruning kicks in; n_warmup_steps is how many epochs every trial always gets
+  # before it becomes eligible to be pruned.
+  pruner: {name: median, n_startup_trials: 5, n_warmup_steps: 10}
+
+  fixed:
+    trainer.max_epochs: 150            # shorter than a real production run (500) - trials rely on
+                                        # the pruner above to cut short the ones that aren't working
+    datamodule.num_workers: 4          # fewer than a production run (11) - each individual trial
+                                        # doesn't need as much data-loading parallelism on its own
+    # Kept off deliberately here - see persistent_workers in configs/lightning/models/defaults.yml
+    # for what it normally does. During tuning specifically, restarting the data-loading workers
+    # each epoch is cheap and avoids process-management issues across the many short-lived trials a
+    # study runs.
+    datamodule.persistent_workers: false
+    callbacks.early_stopping.patience: 20
+
+  params:
+    model.learning_rate: {type: float, low: 1.0e-4, high: 1.0e-2, log: true}
+    model.weight_decay: {type: float, low: 1.0e-6, high: 1.0e-2, log: true}
+    model.dropout: {type: float, low: 0.0, high: 0.5, step: 0.05}
+    model.embedding_dropout: {type: float, low: 0.0, high: 0.3, step: 0.05}
+    model.embedding_dims: {type: categorical, choices: ["auto", 8, 16, 32]}
+    model.embedding_max_dim: {type: int, low: 8, high: 64, step: 8}
+    model.continuous_norm: {type: categorical, choices: [none, batch, layer]}
+    model.activation: {type: categorical, choices: [relu, gelu]}
+    model.use_layer_norm: {type: categorical, choices: [true, false]}
+    model.scheduler_patience: {type: int, low: 5, high: 30, step: 5}
+    model.scheduler_factor: {type: float, low: 0.2, high: 0.8, step: 0.1}
+    datamodule.batch_size: {type: categorical, choices: [16, 32, 64, 128]}
+
+  derive:
+    - dims_pyramid: {key: model.head_hidden_dims,   min_depth: 0, max_depth: 3,
+                     widths: [32, 64, 128, 256], taper: 0.5, floor: 8}
+    - dims_pyramid: {key: model.static_hidden_dims, min_depth: 1, max_depth: 2,
+                     widths: [32, 64, 128, 256], taper: 1.0}

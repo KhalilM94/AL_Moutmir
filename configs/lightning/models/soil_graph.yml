@@ -1,3 +1,23 @@
+# Part of the Lightning (deep-learning) model registry. Settings shared by every model live in
+# defaults.yml in this same folder; this file holds only what makes soil_graph different from the
+# rest, alongside its siblings here (soil_cnn.yml, soil_residual_cnn.yml,
+# soil_residual_attention_cnn.yml, soil_sequence.yml, soil_tabular.yml). To register another
+# model, add a new .yml file in this folder, named after the model, with the model name as its
+# top-level key - it's picked up automatically.
+#
+# How defaults work: settings in defaults.yml's `defaults:` block apply to every model, unless
+# this file sets that same setting itself (which then wins). So this file only needs to list what
+# makes soil_graph different from the rest - anything it doesn't mention falls back to those
+# defaults.
+#
+# A note on network "shape" settings you'll see in this file, like `head_hidden_dims: [64, 32]`:
+# these describe a stack of layers as a list of widths, one number per layer. The LENGTH of the
+# list is how many layers there are, and each number is how wide that layer is - so [64, 32] means
+# two layers, the first with 64 units and the second with 32. There's no separate "number of
+# layers" setting anywhere; the list itself is the whole shape. (When these are searched
+# automatically during hyperparameter tuning, that's done with a `dims_pyramid` helper - see
+# configs/lightning/search_spaces/.)
+
 # An older architecture, superseded by soil_sequence.yml - kept here, off by default, purely as
 # a reproducible reference baseline to compare newer models against (see lightning_logs/version_79
 # for that reference run, which scored around R2 = 0.20). Not recommended for new work.
@@ -6,9 +26,6 @@
 # within spatial_radius of each other can be connected as a "graph" and share information - though
 # that spatial-sharing behaviour is turned off by default here (spatial_graph_enabled: false),
 # making it behave like an ordinary per-point model with an LSTM-based temporal branch.
-#
-# Shares its `defaults:` (trainer/callback/datamodule settings) with every other model in this
-# folder - see ../lightning_registry.yml.
 soil_graph:
   enabled: false
   input_kind: graph

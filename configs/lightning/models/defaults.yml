@@ -1,8 +1,9 @@
 # Lightning (deep-learning) model registry. This file holds the settings shared by every model
-# (the `defaults:` block below); each individual model's own settings live in its own file under
-# configs/lightning/models/ (soil_cnn.yml, soil_residual_cnn.yml, soil_sequence.yml,
-# soil_tabular.yml, soil_graph.yml). To register another model, add a new .yml file there, named
-# after the model, with the model name as its top-level key - it's picked up automatically.
+# (the `defaults:` block below); each model's own settings live in its own file beside this one
+# (soil_cnn.yml, soil_residual_cnn.yml, soil_residual_attention_cnn.yml, soil_sequence.yml,
+# soil_tabular.yml, soil_graph.yml). To register another model, add a new .yml file in this
+# folder, named after the model, with the model name as its top-level key - it's picked up
+# automatically.
 #
 # How defaults work: settings in `defaults:` below apply to every model, unless a model's own
 # file sets that same setting itself (which then wins). So a model's file only needs to list what
@@ -14,7 +15,7 @@
 # [64, 32] means two layers, the first with 64 units and the second with 32. There's no separate
 # "number of layers" setting anywhere; the list itself is the whole shape. (When these are
 # searched automatically during hyperparameter tuning, that's done with a `dims_pyramid` helper -
-# see search_spaces.yml.)
+# see configs/lightning/search_spaces/.)
 defaults:
   modeltype: dl
   trainer_args:

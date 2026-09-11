@@ -2,9 +2,14 @@ import optuna
 import pytest
 
 from yg_eo_soilnet.hpo.overrides import apply_overrides
-from yg_eo_soilnet.hpo.search_space import Distribution, Objective, SearchSpace
+from yg_eo_soilnet.hpo.search_space import (
+    Distribution,
+    Objective,
+    SearchSpace,
+    load_search_spaces_document,
+)
 
-SEARCH_SPACES_PATH = "configs/lightning/search_spaces.yml"
+SEARCH_SPACES_PATH = "configs/lightning/search_spaces"  # the folder tune.py defaults to
 
 
 def _space(**overrides) -> SearchSpace:
@@ -160,6 +165,42 @@ def test_derive_hook_repairs_d_model_to_divide_by_nhead():
     assert chosen["model.d_model"] % chosen["model.nhead"] == 0
 
 
+def _attention_pair_space(derive) -> SearchSpace:
+    mapping = {
+        "params": {
+            "model.attention_nhead": {"type": "categorical", "choices": [8]},
+            "model.attention_d_model": {"type": "categorical", "choices": [50]},
+        },
+        "derive": derive,
+    }
+    return SearchSpace.from_mapping("fake_entry", mapping)
+
+
+def test_the_divisibility_hook_repairs_whichever_pair_it_is_pointed_at():
+    """The residual attention CNN names its own pair; the sequence transformer keeps the default."""
+    space = _attention_pair_space(
+        [
+            {
+                "d_model_divisible_by_nhead": {
+                    "d_model_key": "model.attention_d_model",
+                    "nhead_key": "model.attention_nhead",
+                }
+            }
+        ]
+    )
+    chosen = space.suggest(optuna.trial.FixedTrial({"model.attention_nhead": 8, "model.attention_d_model": 50}))
+
+    assert chosen["model.attention_d_model"] == 56
+    assert "model.d_model" not in chosen
+
+
+def test_the_bare_divisibility_hook_leaves_other_pairs_alone():
+    space = _attention_pair_space(["d_model_divisible_by_nhead"])
+    chosen = space.suggest(optuna.trial.FixedTrial({"model.attention_nhead": 8, "model.attention_d_model": 50}))
+
+    assert chosen["model.attention_d_model"] == 50
+
+
 def test_derive_hook_builds_a_head_pyramid_of_plain_ints():
     space = _space(derive=["dims_pyramid"])
     chosen = space.suggest(
@@ -208,7 +249,10 @@ def test_defaults_are_tpe_and_median():
     assert isinstance(space.make_pruner(), optuna.pruners.MedianPruner)
 
 
-@pytest.mark.parametrize("entry", ["soil_tabular", "soil_sequence", "soil_cnn"])
+SHIPPED_ENTRIES = ["soil_tabular", "soil_sequence", "soil_cnn", "soil_residual_cnn", "soil_residual_attention_cnn"]
+
+
+@pytest.mark.parametrize("entry", SHIPPED_ENTRIES)
 def test_the_shipped_search_spaces_load_and_draw(entry):
     """Every shipped space must survive validation and produce a full random draw."""
     space = SearchSpace.from_yaml(SEARCH_SPACES_PATH, entry)
@@ -224,6 +268,115 @@ def test_the_shipped_search_spaces_load_and_draw(entry):
 def test_a_missing_entry_names_what_is_available():
     with pytest.raises(KeyError, match="soil_tabular"):
         SearchSpace.from_yaml(SEARCH_SPACES_PATH, "no_such_model")
+
+
+# --- splitting entries into a sibling folder ---------------------------------
+
+
+def test_entries_can_be_split_into_a_sibling_folder(tmp_path):
+    """configs/lightning/search_spaces/*.yml works the same as writing entries inline."""
+    main_path = tmp_path / "search_spaces.yml"
+    main_path.write_text("# just the shared header, no entries\n")
+    split_dir = tmp_path / "search_spaces"
+    split_dir.mkdir()
+    (split_dir / "toy_model.yml").write_text(
+        "toy_model:\n  params:\n    model.learning_rate: {type: float, low: 1.0e-4, high: 1.0e-2}\n"
+    )
+
+    space = SearchSpace.from_yaml(str(main_path), "toy_model")
+
+    assert space.entry == "toy_model"
+    assert space.distributions
+
+
+def test_a_folder_can_be_pointed_at_directly(tmp_path):
+    """`tune.py --search-spaces <folder>`: no index file involved at all."""
+    split_dir = tmp_path / "search_spaces"
+    split_dir.mkdir()
+    (split_dir / "toy_model.yml").write_text(
+        "toy_model:\n  params:\n    model.learning_rate: {type: float, low: 1.0e-4, high: 1.0e-2}\n"
+    )
+
+    space = SearchSpace.from_yaml(str(split_dir), "toy_model")
+
+    assert space.entry == "toy_model"
+    assert space.distributions
+
+
+def test_naming_a_file_that_does_not_exist_still_finds_the_folder(tmp_path):
+    """The folder is derived from the path as a string, so the file it is named after may be gone.
+
+    That is the layout on disk: configs/lightning/search_spaces.yml was deleted once every entry
+    had moved into configs/lightning/search_spaces/.
+    """
+    split_dir = tmp_path / "search_spaces"
+    split_dir.mkdir()
+    (split_dir / "toy_model.yml").write_text(
+        "toy_model:\n  params:\n    model.dropout: {type: float, low: 0.0, high: 0.5}\n"
+    )
+
+    document = load_search_spaces_document(str(tmp_path / "search_spaces.yml"))
+
+    assert set(document) == {"toy_model"}
+
+
+def test_the_folder_and_the_file_naming_it_load_the_same_spaces(tmp_path):
+    """Both spellings must fingerprint alike, or switching them would fork the Optuna study."""
+    split_dir = tmp_path / "search_spaces"
+    split_dir.mkdir()
+    (split_dir / "toy_model.yml").write_text(
+        "toy_model:\n  params:\n    model.learning_rate: {type: float, low: 1.0e-4, high: 1.0e-2}\n"
+    )
+
+    by_folder = SearchSpace.from_yaml(str(split_dir), "toy_model")
+    by_filename = SearchSpace.from_yaml(str(tmp_path / "search_spaces.yml"), "toy_model")
+
+    assert by_folder.fingerprint() == by_filename.fingerprint()
+
+
+def test_split_entries_merge_alongside_inline_entries(tmp_path):
+    """A search-space file can mix entries still written inline with ones split into their own file."""
+    main_path = tmp_path / "search_spaces.yml"
+    main_path.write_text(
+        "inline_model:\n  params:\n    model.learning_rate: {type: float, low: 1.0e-4, high: 1.0e-2}\n"
+    )
+    split_dir = tmp_path / "search_spaces"
+    split_dir.mkdir()
+    (split_dir / "split_model.yml").write_text(
+        "split_model:\n  params:\n    model.dropout: {type: float, low: 0.0, high: 0.5}\n"
+    )
+
+    document = load_search_spaces_document(str(main_path))
+
+    assert set(document) == {"inline_model", "split_model"}
+
+
+def test_a_path_with_no_sibling_folder_is_unaffected(tmp_path):
+    """No search_spaces/ folder next to the file (the common case) is not an error."""
+    main_path = tmp_path / "search_spaces.yml"
+    main_path.write_text(
+        "solo:\n  params:\n    model.learning_rate: {type: float, low: 1.0e-4, high: 1.0e-2}\n"
+    )
+
+    document = load_search_spaces_document(str(main_path))
+
+    assert set(document) == {"solo"}
+
+
+def test_duplicate_entry_across_main_file_and_split_folder_raises(tmp_path):
+    """The same entry name declared both inline and in the split folder is a config mistake."""
+    main_path = tmp_path / "search_spaces.yml"
+    main_path.write_text(
+        "toy_model:\n  params:\n    model.learning_rate: {type: float, low: 1.0e-4, high: 1.0e-2}\n"
+    )
+    split_dir = tmp_path / "search_spaces"
+    split_dir.mkdir()
+    (split_dir / "toy_model.yml").write_text(
+        "toy_model:\n  params:\n    model.dropout: {type: float, low: 0.0, high: 0.5}\n"
+    )
+
+    with pytest.raises(ValueError, match="toy_model"):
+        load_search_spaces_document(str(main_path))
 
 
 # --- derive hook options -----------------------------------------------------
@@ -310,10 +463,9 @@ def test_the_sampler_and_the_pruner_are_not_part_of_the_fingerprint(overrides):
 
 
 def test_the_shipped_spaces_fingerprint_distinctly():
-    entries = ["soil_tabular", "soil_sequence", "soil_cnn"]
-    digests = {SearchSpace.from_yaml(SEARCH_SPACES_PATH, entry).fingerprint() for entry in entries}
+    digests = {SearchSpace.from_yaml(SEARCH_SPACES_PATH, entry).fingerprint() for entry in SHIPPED_ENTRIES}
 
-    assert len(digests) == len(entries)
+    assert len(digests) == len(SHIPPED_ENTRIES)
 
 
 # --- dims_pyramid targets any list-valued key --------------------------------

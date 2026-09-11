@@ -47,8 +47,7 @@ common:
     #                   training point a few metres from a test point, instead of learning the
     #                   real pattern.
     strategy: random
-    # Fraction of ALL usable points to hold out - e.g. 0.15 means 15% of the whole dataset, not
-    # 15% of whatever is left after other splits are taken out. Whatever isn't in test_size or
+    # Fraction of ALL usable points to hold out. Whatever isn't in test_size or
     # val_size becomes the training set (here: 1 - 0.15 - 0.15 = 70%).
     test_size: 0.15
     val_size: 0.15
@@ -112,7 +111,7 @@ common:
   SKLEARN_CONFIG_PATH: "sklearn/config.yml"
   LIGHTNING_CONFIG_PATH: "lightning/config.yml"
   SKLEARN_REGISTRY_PATH: "sklearn/model_registry.yml"
-  LIGHTNING_REGISTRY_PATH: "lightning/lightning_registry.yml"
+  LIGHTNING_REGISTRY_PATH: "lightning/models/defaults.yml"
   # --- time-series (satellite/weather) inputs -----------------------------------------------
   temporal:
     enabled: true   # turn off to ignore the time-series file entirely and use static data only
@@ -127,9 +126,6 @@ common:
       soil: "SOIL_"
       ag: "AG_"
       clim: "CLIM_"
-  MAIN_FILE_LOGGING_ENABLED: true   # also write a log file for the run, not just console output
-  MLFLOW_EXPERIMENT_EXPORT_ENABLED: false   # export MLflow experiment data to a portable format
-  MLFLOW_EXPERIMENT_EXPORT_PATH: "mlflow_exports"
 
   # --- experiment tracking (MLflow) -----------------------------------------------------------
   # MLflow is the tool that logs every run's settings, metrics, and saved models so you can browse
@@ -143,6 +139,9 @@ common:
   # model types yourself (e.g. on the leaderboard). Set to false for throwaway/experimental runs
   # so they don't clutter the registry with versions you don't actually want to keep.
   MLFLOW_REGISTER_MODELS: true
+  MLFLOW_EXPERIMENT_EXPORT_ENABLED: false   # export MLflow experiment data to a portable format
+  MLFLOW_EXPERIMENT_EXPORT_PATH: "mlflow_exports"
+  MAIN_FILE_LOGGING_ENABLED: true   # also write a log file for the run, not just console output
 
   # --- Explainability (SHAP) --------------------------------------------------------------------
   # SHAP explains WHY a model made each prediction, by scoring how much each feature pushed that
@@ -208,7 +207,7 @@ common:
     # iterating, 5 for a report, 10 for a final/published result. On Lightning models this also
     # multiplies how much disk space checkpoints use, since each member saves its own weights
     # (roughly n_members times the size of one checkpoint, per target).
-    n_members: 5
+    n_members: 10
     # Each ensemble member gets its own random seed, computed as RANDOM_SEED + member_index * this
     # value. Using a large stride (rather than +1) keeps a member's seed from ever accidentally
     # matching the seed used for the data split, or a model's own seed setting.
@@ -225,7 +224,7 @@ common:
     # noisier, rather than only where the ensemble members happen to disagree. Two things change
     # when this is on: the training loss becomes harder to compare against a plain run's, and the
     # soil_graph model doesn't support this option and will ignore it.
-    heteroscedastic: false
+    heteroscedastic: true
     # Only used when heteroscedastic is true. Tunes how much the training loss penalizes the model
     # for claiming high uncertainty instead of trying harder to fit difficult points. 0.0 is the
     # plain statistical formula, which lets a model "give up" on hard points by simply calling them

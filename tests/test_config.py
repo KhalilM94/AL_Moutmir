@@ -504,53 +504,80 @@ def test_an_entry_cannot_mutate_the_defaults_for_the_next_one(base_config_paths:
     assert registry["inheritor"]["callbacks"]["checkpoint"]["save_top_k"] == 1
 
 
-# --- lightning registry split into a `models/` directory -----------------------------------------
+# --- one model per file, beside a defaults-only file ---------------------------------------------
 
 
-def test_entries_can_be_split_into_a_models_directory(base_config_paths: dict) -> None:
-    """Splitting entries into configs/lightning/models/*.yml is equivalent to writing them inline."""
-    lightning_registry_path = Path(base_config_paths["lightning_registry_path"])
-    lightning_registry_path.write_text("defaults:\n  modeltype: dl\n")
-    models_dir = lightning_registry_path.parent / "models"
-    models_dir.mkdir()
-    (models_dir / "soil_cnn.yml").write_text("soil_cnn:\n  enabled: true\n")
+def _models_folder(base_config_paths: dict, files: dict[str, str]) -> dict:
+    """Lay out a configs/lightning/models/-shaped folder and point the config at its defaults.yml.
 
-    registry = Config(**base_config_paths).LIGHTNING_MODEL_REGISTRY
+    The folder is its own directory, as the real one is: a defaults-only file adopts every .yml
+    beside it, so it must not sit among unrelated configs.
+    """
+    models_dir = Path(base_config_paths["lightning_registry_path"]).parent / "models"
+    models_dir.mkdir(exist_ok=True)
+    for filename, content in files.items():
+        (models_dir / filename).write_text(content)
+    return {**base_config_paths, "lightning_registry_path": str(models_dir / "defaults.yml")}
+
+
+def test_a_defaults_only_file_picks_up_its_neighbours(base_config_paths: dict) -> None:
+    """configs/lightning/models/defaults.yml plus its siblings == one registry written inline."""
+    paths = _models_folder(
+        base_config_paths,
+        {"defaults.yml": "defaults:\n  modeltype: dl\n", "soil_cnn.yml": "soil_cnn:\n  enabled: true\n"},
+    )
+
+    registry = Config(**paths).LIGHTNING_MODEL_REGISTRY
 
     assert registry == {"soil_cnn": {"enabled": True, "modeltype": "dl"}}
 
 
-def test_split_entries_merge_alongside_inline_entries(base_config_paths: dict) -> None:
-    """A registry can mix entries still written inline with ones split out to their own file."""
-    lightning_registry_path = Path(base_config_paths["lightning_registry_path"])
-    lightning_registry_path.write_text("defaults:\n  modeltype: dl\ninline_entry:\n  enabled: true\n")
-    models_dir = lightning_registry_path.parent / "models"
-    models_dir.mkdir()
-    (models_dir / "split_entry.yml").write_text("split_entry:\n  enabled: false\n")
+def test_every_neighbouring_file_becomes_an_entry(base_config_paths: dict) -> None:
+    """Each file contributes its own entry, and all of them inherit the shared defaults."""
+    paths = _models_folder(
+        base_config_paths,
+        {
+            "defaults.yml": "defaults:\n  modeltype: dl\n",
+            "soil_cnn.yml": "soil_cnn:\n  enabled: true\n",
+            "soil_graph.yml": "soil_graph:\n  enabled: false\n",
+        },
+    )
 
-    registry = Config(**base_config_paths).LIGHTNING_MODEL_REGISTRY
+    registry = Config(**paths).LIGHTNING_MODEL_REGISTRY
 
-    assert set(registry) == {"inline_entry", "split_entry"}
-    assert registry["split_entry"]["modeltype"] == "dl"
-
-
-def test_a_registry_with_no_models_directory_is_unaffected(base_config_paths: dict) -> None:
-    """No sibling `models/` folder (e.g. a tuned/*.yml single-entry override) is not an error."""
-    registry = _registry(base_config_paths, REGISTRY_WITH_DEFAULTS).LIGHTNING_MODEL_REGISTRY
-
-    assert set(registry) == {"inheritor", "overrider"}
+    assert set(registry) == {"soil_cnn", "soil_graph"}
+    assert all(entry["modeltype"] == "dl" for entry in registry.values())
 
 
-def test_duplicate_entry_across_registry_and_models_dir_raises(base_config_paths: dict) -> None:
-    """The same entry name declared both inline and in models/ is a config mistake, not a merge."""
-    lightning_registry_path = Path(base_config_paths["lightning_registry_path"])
-    lightning_registry_path.write_text("defaults:\n  modeltype: dl\nsoil_cnn:\n  enabled: true\n")
-    models_dir = lightning_registry_path.parent / "models"
-    models_dir.mkdir()
-    (models_dir / "soil_cnn.yml").write_text("soil_cnn:\n  enabled: false\n")
+def test_a_file_declaring_its_own_entry_is_read_alone(base_config_paths: dict) -> None:
+    """The tuned/*.yml guarantee: a complete single-entry file must not absorb its neighbours.
+
+    Several exports share configs/lightning/tuned/, and LIGHTNING_MODEL_REGISTRY_PATH points at one
+    of them - scooping up the rest would train models the run never asked for.
+    """
+    paths = _models_folder(
+        base_config_paths,
+        {"defaults.yml": "solo:\n  enabled: true\n", "another_export.yml": "intruder:\n  enabled: true\n"},
+    )
+
+    registry = Config(**paths).LIGHTNING_MODEL_REGISTRY
+
+    assert set(registry) == {"solo"}
+
+
+def test_the_same_entry_in_two_files_raises(base_config_paths: dict) -> None:
+    """One name declared by two files is a config mistake, not something to silently merge."""
+    paths = _models_folder(
+        base_config_paths,
+        {
+            "defaults.yml": "defaults:\n  modeltype: dl\n",
+            "soil_cnn.yml": "soil_cnn:\n  enabled: true\n",
+            "soil_cnn_copy.yml": "soil_cnn:\n  enabled: false\n",
+        },
+    )
 
     with pytest.raises(ValueError, match="soil_cnn"):
-        Config(**base_config_paths)
+        Config(**paths)
 
 
 def test_explain_switch_defaults_to_on(base_config_paths: dict) -> None:

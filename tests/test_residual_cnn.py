@@ -408,7 +408,7 @@ def test_the_shipped_registry_entry_builds_through_the_factory(tmp_path: Path, l
     from config import load_lightning_registry
     from yg_eo_soilnet.models.config_fatories.lightning_config_factory import LightningConfigFactory
 
-    registry = load_lightning_registry("configs/lightning/lightning_registry.yml")
+    registry = load_lightning_registry("configs/lightning/models/defaults.yml")
     spec = registry["soil_residual_cnn"]
     # The shipped entry names the real dataset's columns; the fixture carries its own.
     spec["init_args"]["residual_base_columns"] = {"target_a": "lab_dense"}

@@ -34,6 +34,17 @@ LABEL_COLUMNS:
   - cu_ppm_dtpa
   - zn_ppm_dtpa
   - b_ppm_hot_water
+  
+  - bd_median_0_30cm
+  - clay_median_0_30cm
+  - ph_median_0_30cm
+  - sand_median_0_30cm
+  - silt_median_0_30cm
+  - soc_median_0_30cm
+  - swc_median_0_30cm
+  - texture_20cm
+  - landform_class
+
   - ph_water_base
   - organic_matter_g_kg_base
   - p2o5_ehangable_olsen_ppm_base
@@ -59,11 +70,17 @@ TARGET_COLUMNS:
   # - clay_pct
   # - sand_pct
   # - total_silt_pct
+  # - coarse_silt_pct
+  # - coarse_element_pct
   # - ph_water
   # - caco3_pct_total
+  # - caco3_active_pct
   # - c_e_c_meq_100g
   # - c_n_ratio
   # - p2o5_ehangable_olsen_ppm
+  # - exchangeable_k2o_ppm
+  # - ce_ext1_5_ms_cm
+  - organic_matter_g_kg_base
 
 # How to handle MORE THAN ONE target at once (ignored if TARGET_COLUMNS above has just one entry):
 #   joint       train ONE model that predicts all the targets together, sharing what it learns
@@ -73,13 +90,7 @@ TARGET_COLUMNS:
 # in a registry file can override this with its own `multi_target:` setting; for a classic model
 # to be eligible for `joint` mode it must also declare `multi_target: native`, since most
 # scikit-learn model types are only able to predict one target at a time.
-MULTI_TARGET_MODE: per_target
-
-# Currently loaded but not read anywhere in the pipeline's feature-selection logic - which columns
-# become model inputs is instead worked out automatically (everything left over once
-# LABEL_COLUMNS, TARGET_COLUMNS, IGNORED_COLUMNS and CATEGORICAL_FEATURES are excluded). Leave this
-# as [] unless you've confirmed the version of the code you're running actually reads it.
-PREDICTOR_COLUMNS: []
+MULTI_TARGET_MODE: joint
 
 # --- location awareness (off/empty by default) -----------------------------------------------
 # Lets the soil_cnn model use each point's latitude/longitude as an extra input, through a
@@ -89,8 +100,8 @@ PREDICTOR_COLUMNS: []
 # raw numbers - a standard way to represent position so a neural network can make use of it.
 #
 # Two things to know before turning this on:
-#   * A point with a missing latitude or longitude is dropped entirely, since there's no honest
-#     way to fill in a missing coordinate. How many points were dropped is logged.
+#   * A point with a missing latitude or longitude is dropped entirely, and how many points were 
+#     dropped is logged.
 #   * A model that knows WHERE a point is can "cheat" by learning that nearby points tend to have
 #     similar values, instead of learning the real relationship between the other features and the
 #     target - so it will look more accurate than it really is if you only evaluate it with
@@ -106,10 +117,11 @@ USE_HARMONIC_COORDS: true
 #     actually help (an empty list here means there's nothing for that switch to affect)
 #   * see them called out as their own group in the SHAP explainability output
 # Naming a column that doesn't actually exist in your data will raise an error.
-CONTEXT_FEATURES: []
+USE_CONTEXT_FEATURES: false
 # false (default) removes the columns listed above from the feature set entirely, so you can see
 # how the model performs without them. Set to true to include them as ordinary features.
-USE_CONTEXT_FEATURES: false
+CONTEXT_FEATURES: []
+
 
 # Columns to always exclude from the feature set - identifiers, coordinates, geometry, and other
 # metadata that isn't a genuine predictive feature. (You don't need to list measured lab values
@@ -123,24 +135,6 @@ IGNORED_COLUMNS: &ignored_columns
   - uuid
   - cluster
   - date
-  # - texture_20cm
-  # - landform_class
-  # - bd_median_0_30cm
-  # - clay_median_0_30cm
-  # - ph_median_0_30cm
-  # - sand_median_0_30cm
-  # - silt_median_0_30cm
-  - soc_median_0_30cm
-  # - swc_median_0_30cm
-
-  # - organic_matter_g_kg__soil_cnn
-  # - clay_pct__soil_cnn
-  # - ph_water__soil_cnn
-  # - sand_pct__soil_cnn
-  # - total_silt_pct__soil_cnn
-  # - caco3_pct_total__soil_cnn
-  # - c_n_ratio__soil_cnn
-  # - p2o5_ehangable_olsen_ppm__soil_cnn
 
 # Same list as IGNORED_COLUMNS above - the &ignored_columns / *ignored_columns pair is a YAML
 # "anchor", which just means both settings automatically stay identical. You only need to edit the

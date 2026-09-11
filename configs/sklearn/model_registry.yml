@@ -35,19 +35,6 @@ Ridge:
   params:
     model__alpha: [0.01, 0.1, 1, 10, 100, 1000]
 
-GradientBoosting:
-  enabled: False
-  modeltype: "ml"
-  import_path: sklearn.ensemble.GradientBoostingRegressor
-  params:
-    model__n_estimators: [50, 100]
-    model__max_depth: [5]
-    model__learning_rate: [0.1]
-
-    # model__n_estimators: [50, 150, 250]
-    # model__learning_rate: [0.01, 0.1, 0.2]
-    # model__max_depth: [5, 13, 21]
-
 XGBoost:
   enabled: false
   modeltype: "ml"
@@ -78,7 +65,7 @@ TabICL:
   # technique called "in-context learning", similar in spirit to how a large language model uses
   # examples you give it in a prompt. The first time you run it, it downloads a pretrained
   # checkpoint from HuggingFace, so that first run needs an internet connection and will be slower.
-  enabled: true
+  enabled: false
   modeltype: "ml"
   import_path: tabicl.TabICLRegressor
   # Keep this at 1. Each parallel worker loads its own full copy of the model into memory, so

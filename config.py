@@ -28,11 +28,14 @@ def deep_merge(base: Mapping, override: Mapping) -> dict:
 def load_lightning_registry(registry_path: str) -> dict:
     """Load the Lightning model registry at `registry_path`, with `defaults:` merged into every entry.
 
-    Entries can live inline in `registry_path` itself, or be split one-per-file into a `models/`
-    folder sitting next to it (see configs/lightning/models/) - each such file's top-level keys are
-    entries too, exactly as if they had been written inline. Splitting is optional: a registry file
-    with no sibling `models/` folder (e.g. a single-entry file exported by tune.py into
-    configs/lightning/tuned/) behaves exactly as before.
+    A file that declares NOTHING but `defaults:` - configs/lightning/models/defaults.yml - is the
+    shared header for a folder of one-model-per-file entries: every OTHER .yml/.yaml file sitting
+    beside it is loaded too, each one an entry in its own right, exactly as if all of them had been
+    written inline in a single registry file.
+
+    A file that declares an entry of its own is instead read alone. That is what keeps a single
+    tuned entry exported into configs/lightning/tuned/ from absorbing the unrelated exports parked
+    in the same folder.
     """
     with open(registry_path, 'r') as f:
         document = yaml.safe_load(f) or {}
@@ -44,10 +47,16 @@ def load_lightning_registry(registry_path: str) -> dict:
     # configs/lightning/tuned/ carries no `defaults:` key, so for it this is a no-op.
     defaults = document.pop(LIGHTNING_REGISTRY_DEFAULTS_KEY, None) or {}
 
-    models_dir = os.path.join(os.path.dirname(registry_path), 'models')
-    if os.path.isdir(models_dir):
+    # Tracks which file each entry came from, purely so a collision names both real files instead
+    # of always blaming registry_path - a second entry file colliding with a FIRST one would
+    # otherwise be misreported as colliding with registry_path itself.
+    sources = {name: registry_path for name in document}
+
+    if not document:
+        models_dir = os.path.dirname(registry_path) or '.'
+        own_filename = os.path.basename(registry_path)
         for filename in sorted(os.listdir(models_dir)):
-            if not filename.endswith(('.yml', '.yaml')):
+            if filename == own_filename or not filename.endswith(('.yml', '.yaml')):
                 continue
             model_file_path = os.path.join(models_dir, filename)
             with open(model_file_path, 'r') as f:
@@ -55,9 +64,10 @@ def load_lightning_registry(registry_path: str) -> dict:
             for name, spec in entries.items():
                 if name in document:
                     raise ValueError(
-                        f"Lightning registry entry '{name}' is declared both in {registry_path} "
+                        f"Lightning registry entry '{name}' is declared both in {sources[name]} "
                         f"and in {model_file_path} - remove it from one of the two."
                     )
+                sources[name] = model_file_path
                 document[name] = spec
 
     return {name: deep_merge(defaults, spec or {}) for name, spec in document.items()}
@@ -114,7 +124,7 @@ class Config:
         lightning_registry_path_value = (
             lightning_registry_path
             or os.getenv('LIGHTNING_MODEL_REGISTRY_PATH')
-            or self._get_config('LIGHTNING_REGISTRY_PATH', 'configs/lightning/lightning_registry.yml')
+            or self._get_config('LIGHTNING_REGISTRY_PATH', 'configs/lightning/models/defaults.yml')
         )
 
         self.registry_path = self._resolve_config_path(registry_path_value)

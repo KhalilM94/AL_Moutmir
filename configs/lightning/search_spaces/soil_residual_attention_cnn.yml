@@ -1,0 +1,73 @@
+# What `tune.py` is allowed to try for soil_residual_attention_cnn. See the header of
+# soil_residual_cnn.yml in this folder for how these files work (objective / fixed / params /
+# derive, the `dims_pyramid` helper, and why editing this file starts a new study).
+
+# --- soil_residual_cnn with attention fusion (soil_residual_attention_cnn) ---------------------
+# The same search space as soil_residual_cnn.yml, plus the attention settings (see
+# configs/lightning/models/soil_residual_attention_cnn.yml). residual_base_columns is not searched,
+# for the reason given in soil_residual_cnn.yml.
+#
+# A/B test of the two ways of turning static features into tokens: as written, each trial picks
+# `summary` or `per_feature` (model.attention_static_tokens under params). For a strict A/B, move
+# it to `fixed:` with one value, run the study, then run it again with the other value - each gets
+# its own study, because editing this file changes the study's fingerprint.
+#
+# continuous_norm is searched here rather than pinned: in per_feature mode it is the only thing
+# standing between each raw column and its token.
+#
+# The objective is val_loss, as in soil_residual_cnn.yml, so the two studies rank trials the same
+# way. It is the loss of the final prediction (base + correction), not of the correction alone.
+soil_residual_attention_cnn:
+  objective:
+    metric: val_loss
+    direction: minimize
+  sampler: {name: tpe, seed: 42}
+  pruner: {name: median, n_startup_trials: 5, n_warmup_steps: 10}
+
+  fixed:
+    trainer.max_epochs: 100
+    datamodule.num_workers: 4
+    datamodule.persistent_workers: true
+    callbacks.early_stopping.patience: 12
+    model.pool: masked_avg
+    model.head_norm_final: true
+
+  params:
+    model.learning_rate: {type: float, low: 1.0e-5, high: 1.0e-3, log: true}
+    model.weight_decay: {type: float, low: 1.0e-4, high: 1.0e-1, log: true}
+    model.dropout: {type: float, low: 0.2, high: 0.6, step: 0.1}
+    model.embedding_dropout: {type: float, low: 0.1, high: 0.4, step: 0.1}
+    model.continuous_norm: {type: categorical, choices: [none, layer]}
+    model.temporal_encoder: {type: categorical, choices: [dilated_tempcnn, annual_grid2d]}
+    model.modality_embed_dim: {type: categorical, choices: [32, 64]}
+    model.cnn_norm: {type: categorical, choices: [batch, group]}
+    model.month_positional: {type: categorical, choices: [true, false]}
+    model.use_validity_channels: {type: categorical, choices: [true, false]}
+    model.auxiliary_dropout: {type: float, low: 0.1, high: 0.6, step: 0.1}
+    model.residual_base_validity_channels: {type: categorical, choices: [true, false]}
+    model.residual_base_dropout: {type: float, low: 0.1, high: 0.6, step: 0.1}
+    model.scheduler_patience: {type: int, low: 3, high: 8, step: 1}
+    datamodule.batch_size: {type: categorical, choices: [64, 128]}
+    # --- attention fusion ---
+    model.attention_static_tokens: {type: categorical, choices: [summary, per_feature]}
+    model.attention_d_model: {type: categorical, choices: [32, 64, 128]}
+    model.attention_nhead: {type: categorical, choices: [2, 4, 8]}
+    model.attention_num_layers: {type: int, low: 1, high: 3, step: 1}
+    model.attention_ff_multiplier: {type: categorical, choices: [2, 4]}
+    model.attention_dropout: {type: float, low: 0.0, high: 0.3, step: 0.1}
+    model.attention_readout: {type: categorical, choices: [cls, mean, flatten]}
+
+  derive:
+    # Rounds the token width up to a multiple of the head count. The choices above always divide,
+    # so this only matters once someone edits them - and then it keeps every trial valid.
+    - d_model_divisible_by_nhead: {d_model_key: model.attention_d_model,
+                                   nhead_key: model.attention_nhead}
+    - dims_pyramid: {key: model.head_hidden_dims,   min_depth: 1, max_depth: 3,
+                     widths: [64, 128], taper: 0.5, floor: 8}
+    # No effect in per_feature mode, where the static branch has no layers of its own.
+    - dims_pyramid: {key: model.static_hidden_dims, min_depth: 1, max_depth: 2,
+                     widths: [32, 64], taper: 1.0}
+    - dims_pyramid: {key: model.cnn_hidden_dims,    min_depth: 1, max_depth: 3,
+                     widths: [32, 64], taper: 1.0}
+    - dims_pyramid: {key: model.residual_base_hidden_dims, min_depth: 0, max_depth: 1,
+                     widths: [16, 32], taper: 1.0}

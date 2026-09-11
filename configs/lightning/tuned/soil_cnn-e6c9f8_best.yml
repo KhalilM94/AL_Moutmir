@@ -1,16 +1,16 @@
 # Tuned Lightning registry entry, exported from an Optuna study.
 #
-#   study      : soil_cnn-58e689
+#   study      : soil_cnn-e6c9f8
 #   entry      : soil_cnn
-#   trial      : #257 of 283
-#   objective  : val_loss = 0.641025 (minimize)
+#   trial      : #59 of 202
+#   objective  : val_loss = 0.561797 (minimize)
 #
 # NOTE: that value is the best of many trials, each itself the best epoch of a noisy
 # run - a maximum over noise, so it is optimistically biased and a retrain will
 # typically fall short of it. `tune.py --rerank-top K` re-runs the shortlist over
 # several seeds and reports what a retrain should actually deliver.
-#   exported   : 2026-08-15T18:14:33
-#   source     : /home/kmisbah/CESBIO/AL_Moutmir/yg-eo-soilnet/configs/lightning/lightning_registry.yml
+#   exported   : 2026-09-05T23:14:28
+#   source     : /home/kmisbah/CESBIO/AL_Moutmir/yg-eo-soilnet/configs/lightning/models/soil_cnn.yml
 #
 # Compare against the MLflow `val_loss` of the retrained run. NOT r2_score or
 # r2_test - those are TEST-split R2 in original units after expm1, a different split, a
@@ -24,11 +24,11 @@
 # registry. They are throughput knobs that change no result, so production keeps its own.
 #
 # Train it with:
-#   LIGHTNING_MODEL_REGISTRY_PATH=configs/lightning/tuned/soil_cnn-58e689_best.yml python main.py
+#   LIGHTNING_MODEL_REGISTRY_PATH=configs/lightning/tuned/soil_cnn-e6c9f8_best.yml python main.py
 soil_cnn:
   modeltype: dl
   trainer_args:
-    max_epochs: 150
+    max_epochs: 100
     accelerator: cuda
     devices: 1
     precision: 32-true
@@ -41,20 +41,17 @@ soil_cnn:
     early_stopping:
       monitor: val_loss
       mode: min
-      patience: 20
+      patience: 12
     checkpoint:
       monitor: val_loss
       mode: min
       save_top_k: 1
   datamodule_init_args:
     batch_size: 64
-    val_size: 0.2
-    test_size: 0.2
     target_transform: log1p
     num_workers: 11
     pin_memory: false
     persistent_workers: false
-    seed: 42
     shuffle: true
     max_sequence_length: null
   tags:
@@ -75,31 +72,22 @@ soil_cnn:
     categorical_feature_names: auto
     embedding_dims: auto
     embedding_max_dim: 50
-    embedding_dropout: 0.15000000000000002
-    continuous_norm: none
-    temporal_encoder: dilated_tempcnn
+    embedding_dropout: 0.30000000000000004
+    continuous_norm: layer
+    temporal_encoder: annual_grid2d
     cnn_hidden_dims:
-    - 128
-    - 128
-    - 128
-    - 128
-    - 128
-    modality_embed_dim: 128
+    - 64
+    - 64
+    modality_embed_dim: 32
     cnn_norm: batch
-    pool: avg
+    pool: masked_avg
     month_positional: true
     use_validity_channels: false
     auxiliary_label_columns: []
-    # total_silt_pct, c_e_c_meq_100g, c_n_ratio, caco3_pct_total
-    # total_silt_pct__soil_cnn, c_e_c_meq_100g__soil_cnn, caco3_pct_total__soil_cnn, c_n_ratio__soil_cnn
     auxiliary_available_names: auto
     auxiliary_validity_channels: true
     auxiliary_hidden_dims: []
-    auxiliary_dropout: 0.0
-    # Not part of the study - it predates the branch. coord_dim resolves to 0 unless
-    # USE_HARMONIC_COORDS is set in data_spec.yml, and at 0 this model is identical to the one the
-    # study tuned. Turning it on changes the fusion width, so the tuned widths below no longer
-    # describe the fitted network exactly; retune, or treat the result as a starting point.
+    auxiliary_dropout: 0.5
     coord_dim: auto
     harmonic_num_frequencies: 6
     harmonic_include_input: true
@@ -107,25 +95,23 @@ soil_cnn:
     harmonic_dropout: 0.0
     static_hidden_dims:
     - 64
-    - 64
     head_hidden_dims:
-    - 256
     - 128
     head_norm_final: true
-    dropout: 0.3
+    dropout: 0.2
     loss_name: mse
+    huber_delta: 1.0
     loss_base: mse
     loss_lambda: 0.1
-    cosine_space: standardized
-    loss_min_batch: 16 
     loss_shrinkage: 0.05
-    huber_delta: 1.0
-    learning_rate: 0.00010038360509669296
+    loss_min_batch: 16
+    cosine_space: original
+    learning_rate: 0.00022050630680797722
     temporal_enabled: true
     optimizer_name: adamw
-    weight_decay: 4.3691180514692865e-06
+    weight_decay: 0.1
     scheduler_type: plateau
     scheduler_factor: 0.5
-    scheduler_patience: 10
+    scheduler_patience: 4
     scheduler_min_lr: 1.0e-06
     scheduler_monitor: val_loss

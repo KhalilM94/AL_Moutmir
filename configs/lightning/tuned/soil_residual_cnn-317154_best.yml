@@ -1,0 +1,125 @@
+# Tuned Lightning registry entry, exported from an Optuna study.
+#
+#   study      : soil_residual_cnn-317154
+#   entry      : soil_residual_cnn
+#   trial      : #137 of 151
+#   objective  : val_loss = 0.551345 (minimize)
+#
+# NOTE: that value is the best of many trials, each itself the best epoch of a noisy
+# run - a maximum over noise, so it is optimistically biased and a retrain will
+# typically fall short of it. `tune.py --rerank-top K` re-runs the shortlist over
+# several seeds and reports what a retrain should actually deliver.
+#   exported   : 2026-09-06T08:40:12
+#   source     : /home/kmisbah/CESBIO/AL_Moutmir/yg-eo-soilnet/configs/lightning/models/soil_residual_cnn.yml
+#
+# Compare against the MLflow `val_loss` of the retrained run. NOT r2_score or
+# r2_test - those are TEST-split R2 in original units after expm1, a different split, a
+# different metric and a different space from anything the study optimized.
+#
+# Values pinned under `fixed:` in the search space are baked in here too - notably
+# trainer.max_epochs, which is the tuning budget. Raise it for a final production run if you
+# want early stopping, rather than the epoch budget, to decide when to stop.
+#
+# Exceptions: num_workers, pin_memory, persistent_workers are restored from the source
+# registry. They are throughput knobs that change no result, so production keeps its own.
+#
+# Train it with:
+#   LIGHTNING_MODEL_REGISTRY_PATH=configs/lightning/tuned/soil_residual_cnn-317154_best.yml python main.py
+soil_residual_cnn:
+  modeltype: dl
+  trainer_args:
+    max_epochs: 100
+    accelerator: cuda
+    devices: 1
+    precision: 32-true
+    accumulate_grad_batches: 1
+    gradient_clip_val: 1.0
+    log_every_n_steps: 5
+    enable_checkpointing: true
+    deterministic: true
+  callbacks:
+    early_stopping:
+      monitor: val_loss
+      mode: min
+      patience: 12
+    checkpoint:
+      monitor: val_loss
+      mode: min
+      save_top_k: 1
+  datamodule_init_args:
+    batch_size: 64
+    target_transform: log1p
+    num_workers: 11
+    pin_memory: false
+    persistent_workers: false
+    shuffle: true
+    max_sequence_length: null
+  tags:
+    framework: lightning
+    family: regression
+    architecture: residual-calendar-grid-cnn
+  enabled: true
+  input_kind: sequence
+  import_path: yg_eo_soilnet.models.lightningmodules.soil_residual_cnn_lightning_module.SoilResidualCNNLightningModule
+  datamodule_import_path: yg_eo_soilnet.datamodules.sequence.sequence_datamodule.SoilSequenceDataModule
+  init_args:
+    static_dim: auto
+    target_dim: auto
+    modality_dims: auto
+    grid_years: auto
+    categorical_cardinalities: auto
+    categorical_vocabularies: auto
+    categorical_feature_names: auto
+    embedding_dims: auto
+    embedding_max_dim: 50
+    embedding_dropout: 0.2
+    continuous_norm: layer
+    temporal_encoder: annual_grid2d
+    cnn_hidden_dims:
+    - 64
+    modality_embed_dim: 32
+    cnn_norm: batch
+    pool: masked_avg
+    month_positional: true
+    use_validity_channels: true
+    residual_base_columns:
+      organic_matter_g_kg: organic_matter_g_kg_base
+    residual_base_hidden_dims: []
+    residual_base_dropout: 0.4
+    residual_base_validity_channels: true
+    residual_base_max_missing: 0.05
+    auxiliary_label_mean: auto
+    auxiliary_label_scale: auto
+    auxiliary_label_columns: []
+    auxiliary_available_names: auto
+    auxiliary_validity_channels: true
+    auxiliary_hidden_dims: []
+    auxiliary_dropout: 0.6
+    coord_dim: auto
+    harmonic_num_frequencies: 6
+    harmonic_include_input: true
+    harmonic_hidden_dims: []
+    harmonic_dropout: 0.0
+    static_hidden_dims:
+    - 32
+    - 32
+    head_hidden_dims:
+    - 128
+    head_norm_final: true
+    dropout: 0.2
+    loss_name: mse
+    huber_delta: 1.0
+    loss_base: mse
+    loss_lambda: 0.1
+    loss_shrinkage: 0.05
+    loss_min_batch: 16
+    cosine_space: original
+    learning_rate: 0.00012447681012861184
+    temporal_enabled: true
+    optimizer_name: adamw
+    weight_decay: 0.09983020836190577
+    scheduler_type: plateau
+    scheduler_factor: 0.5
+    scheduler_patience: 8
+    scheduler_min_lr: 1.0e-06
+    scheduler_monitor: val_loss

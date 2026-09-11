@@ -1,5 +1,8 @@
 from yg_eo_soilnet.models.lightningmodules.soil_cnn_lightning_module import SoilCNNLightningModule
 from yg_eo_soilnet.models.lightningmodules.soil_graph_lightning_module import SoilGraphLightningModule
+from yg_eo_soilnet.models.lightningmodules.soil_residual_attention_cnn_lightning_module import (
+    SoilResidualAttentionCNNLightningModule,
+)
 from yg_eo_soilnet.models.lightningmodules.soil_residual_cnn_lightning_module import (
     SoilResidualCNNLightningModule,
 )
@@ -7,6 +10,7 @@ from yg_eo_soilnet.models.lightningmodules.soil_sequence_lightning_module import
 from yg_eo_soilnet.models.lightningmodules.spatial_encoders import HarmonicPositionEncoder
 from yg_eo_soilnet.models.lightningmodules.temporal_cnn_encoders import (
     AnnualGrid2DEncoder,
+    AttentionFusion,
     CalendarGridRasterizer,
     ConcatGatedFusion,
     DilatedTempCNNEncoder,
@@ -23,6 +27,7 @@ from yg_eo_soilnet.models.lightningmodules.temporal_encoders import (
 
 __all__ = [
     "AnnualGrid2DEncoder",
+    "AttentionFusion",
     "CalendarGridRasterizer",
     "ConcatGatedFusion",
     "DilatedTempCNNEncoder",
@@ -30,6 +35,7 @@ __all__ = [
     "HarmonicPositionEncoder",
     "SoilCNNLightningModule",
     "SoilGraphLightningModule",
+    "SoilResidualAttentionCNNLightningModule",
     "SoilResidualCNNLightningModule",
     "SoilSequenceLightningModule",
     "TemporalTransformerEncoder",

@@ -1,0 +1,163 @@
+# Part of the Lightning (deep-learning) model registry. Settings shared by every model live in
+# defaults.yml in this same folder; this file holds only what makes soil_residual_attention_cnn
+# different from the rest, alongside its siblings here (soil_cnn.yml, soil_residual_cnn.yml,
+# soil_sequence.yml, soil_tabular.yml, soil_graph.yml). To register another model, add a new .yml
+# file in this folder, named after the model, with the model name as its top-level key - it's
+# picked up automatically.
+#
+# How defaults work: settings in defaults.yml's `defaults:` block apply to every model, unless
+# this file sets that same setting itself (which then wins). So this file only needs to list what
+# makes soil_residual_attention_cnn different from the rest - anything it doesn't mention falls
+# back to those defaults. (Don't add a `defaults:` block to this file: the loader reads every
+# top-level key here as a model entry, and refuses a key declared in two files.)
+#
+# A note on network "shape" settings you'll see in this file, like `head_hidden_dims: [64, 32]`:
+# these describe a stack of layers as a list of widths, one number per layer. The LENGTH of the
+# list is how many layers there are, and each number is how wide that layer is - so [64, 32] means
+# two layers, the first with 64 units and the second with 32. There's no separate "number of
+# layers" setting anywhere; the list itself is the whole shape. (When these are searched
+# automatically during hyperparameter tuning, that's done with a `dims_pyramid` helper - see
+# configs/lightning/search_spaces/.)
+
+# The same model as soil_residual_cnn.yml - it predicts a CORRECTION to an existing "base"
+# prediction - with one part swapped: the step that combines the model's branches.
+#
+# soil_residual_cnn combines its branches (static features, one CNN summary per data source, the
+# location encoding) with a "gate": a single layer that turns each number up or down, but never
+# lets the branches exchange information before the final layers. This model replaces that gate
+# with a small TRANSFORMER: each branch becomes a "token" (a short list of numbers), and
+# "attention" lets every token look at every other one and rebuild itself from them - e.g. the
+# Sentinel-2 summary can be re-read in light of the climate summary, or of where the point is.
+#
+# Everything else - the base prediction and the correction added to it, the extra lab-value
+# inputs, the CNNs themselves - is identical to soil_residual_cnn, so comparing the two measures
+# this one change. The base prediction still joins AFTER the attention step, at full strength.
+#
+# IMPORTANT - watch for data leakage, exactly as for soil_residual_cnn: the base column's
+# predictions must have been made WITHOUT having seen the points this run tests on
+# ("out-of-fold"). See the notes at the top of soil_residual_cnn.yml.
+#
+# Comparing val_loss: the loss is computed on the final prediction (base + correction) against the
+# true value, so this model's val_loss can be compared with soil_residual_cnn's and soil_cnn's as
+# long as they fit the same target(s) with the same split, target_transform and loss_name.
+
+soil_residual_attention_cnn:
+  enabled: false
+  input_kind: sequence
+  import_path: yg_eo_soilnet.models.lightningmodules.soil_residual_attention_cnn_lightning_module.SoilResidualAttentionCNNLightningModule
+  datamodule_import_path: yg_eo_soilnet.datamodules.sequence.sequence_datamodule.SoilSequenceDataModule
+  init_args:
+    # Same settings as soil_residual_cnn.yml (and soil_cnn.yml) unless noted below - see those
+    # files for what each one means.
+    static_dim: auto
+    target_dim: auto
+    modality_dims: auto
+    grid_years: auto
+
+    categorical_cardinalities: auto
+    categorical_vocabularies: auto
+    categorical_feature_names: auto
+    embedding_dims: auto
+    embedding_max_dim: 50
+    embedding_dropout: 0.15000000000000002
+    continuous_norm: none
+
+    temporal_encoder: dilated_tempcnn
+    cnn_hidden_dims:
+    - 128
+    - 128
+    - 128
+    - 128
+    - 128
+    modality_embed_dim: 128
+    cnn_norm: batch
+    pool: masked_avg
+    month_positional: true
+    use_validity_channels: true
+
+    # --- attention fusion (replaces soil_residual_cnn's gate) ------------------------------------
+    # How the static (non-time-series) features become tokens:
+    #   summary      the static branch first summarises them all (static_hidden_dims below), and
+    #                that summary is ONE token - the same static branch soil_residual_cnn has.
+    #   per_feature  every static column becomes its own token (and every categorical feature
+    #                another), so attention can link, say, carbonate directly to the Sentinel-2
+    #                summary. More tokens means more to learn from the same data, and
+    #                static_hidden_dims has no effect in this mode. (This is the "FT-Transformer"
+    #                way of reading a table.)
+    attention_static_tokens: summary
+    attention_d_model: 64               # width of every token inside the transformer; must be evenly
+                                         # divisible by attention_nhead below
+    attention_nhead: 4                  # number of parallel "attention heads" - roughly, how many
+                                         # different patterns of who-looks-at-whom are learned at once
+    attention_num_layers: 2             # how many transformer layers are stacked
+    attention_ff_multiplier: 2          # width of each layer's inner step, as a multiple of
+                                         # attention_d_model
+    attention_dropout: 0.1              # dropout (see embedding_dropout in soil_cnn.yml) inside the
+                                         # transformer only; `dropout` below still covers the rest
+    # How the tokens are turned back into one list of numbers for the head:
+    #   cls      an extra "summary" token gathers from all the others, and its vector is used
+    #   mean     the average of all the branch tokens
+    #   flatten  every branch token side by side (the widest option, and the closest to what the
+    #            gate passed on)
+    attention_readout: cls
+
+    # --- the residual anchor (REQUIRED for this model) ----------------------------------------------
+    # Exactly as in soil_residual_cnn.yml: name the base-prediction column for EVERY target this
+    # model fits, list it in data_spec.yml's LABEL_COLUMNS with CARRY_LABEL_COLUMNS: true, and don't
+    # also list it under auxiliary_label_columns below.
+    residual_base_columns:
+      # organic_matter_g_kg: organic_matter_g_kg_base
+      exchangeable_k2o_ppm: exchangeable_k2o_ppm_base
+    residual_base_hidden_dims: []
+    residual_base_dropout: 0.0
+    residual_base_validity_channels: false   # also tell the model whether the base value for each
+                                              # point was actually available, or had to be filled in
+    residual_base_max_missing: 0.05     # stop the run if more than this fraction of base values
+                                         # are missing (see soil_residual_cnn.yml)
+    auxiliary_label_mean: auto
+    auxiliary_label_scale: auto
+
+    auxiliary_label_columns: []
+    auxiliary_available_names: auto
+    auxiliary_validity_channels: true
+    auxiliary_hidden_dims: []
+    auxiliary_dropout: 0.0
+
+    coord_dim: auto
+    harmonic_num_frequencies: 6
+    harmonic_include_input: true
+    harmonic_hidden_dims: []
+    harmonic_dropout: 0.0
+
+    static_hidden_dims:
+    - 64
+    - 64
+    head_hidden_dims:
+    - 256
+    - 128
+    head_norm_final: false
+    dropout: 0.5
+
+    # mse: the "across-target" losses (mahalanobis, correlation_penalty, cosine) all need
+    # MULTI_TARGET_MODE: joint, and residual_base_columns above is set up for a single target. If
+    # you configure this model to fit several targets jointly, switch both settings together.
+    loss_name: mse
+    huber_delta: 1.0
+    loss_base: mse
+    loss_lambda: 0.1
+    loss_shrinkage: 0.05
+    loss_min_batch: 16
+    cosine_space: original
+    learning_rate: 0.00010038360509669296
+    temporal_enabled: true
+    optimizer_name: adamw
+    weight_decay: 4.3691180514692865e-06
+    scheduler_type: plateau
+    scheduler_factor: 0.5
+    scheduler_patience: 10
+    scheduler_min_lr: 1.0e-06
+    scheduler_monitor: val_loss
+  datamodule_init_args:
+    max_sequence_length: null
+  tags:
+    architecture: residual-calendar-grid-cnn-attention

@@ -104,9 +104,22 @@ class SoilResidualCNNLightningModule(SoilCNNLightningModule):
         )
 
         # Rebuilt rather than sized up front: the parent's __init__ has already built a head for its
-        # own fused width, and the base block widens it. head_output_dim, not target_dim - a
-        # heteroscedastic head is twice as wide because it emits a log variance beside every mean.
-        self.output_head = build_mlp_stack(
+        # own fused width, and the base block widens it.
+        self.output_head = self._build_output_head(head_hidden_dims, head_norm_final, dropout)
+
+    # --- construction -------------------------------------------------------
+
+    def _build_output_head(
+        self, head_hidden_dims: Sequence[int], head_norm_final: bool, dropout: float
+    ) -> nn.Module:
+        """The readout, sized off whatever fusion and blocks the module holds right now.
+
+        A method rather than an inline call so a subclass that swaps ``self.fusion`` after this
+        constructor has run resizes the head with this formula instead of a copy of it.
+        head_output_dim, not target_dim - a heteroscedastic head is twice as wide because it emits a
+        log variance beside every mean.
+        """
+        return build_mlp_stack(
             self.fusion.output_dim + self.auxiliary_output_dim + self.residual_base_output_dim,
             head_hidden_dims,
             self.head_output_dim,
@@ -114,8 +127,6 @@ class SoilResidualCNNLightningModule(SoilCNNLightningModule):
             activation="gelu",
             norm_final=bool(head_norm_final),
         )
-
-    # --- construction -------------------------------------------------------
 
     def _build_residual_base_encoder(
         self,

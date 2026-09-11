@@ -442,3 +442,134 @@ class ConcatGatedFusion(nn.Module):
         ]
         joined = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
         return joined * torch.sigmoid(self.gate(joined))
+
+
+class AttentionFusion(nn.Module):
+    """Transformer self-attention over one token per branch chunk - a drop-in for ConcatGatedFusion.
+
+    The gate can only rescale a branch's features, reading the others to decide by how much. Here
+    every chunk is projected to a ``d_model``-wide token by its own linear layer and the tokens attend
+    to one another, so a branch's representation is REBUILT from the others before the head sees it:
+    the S2 token can be re-read in light of the climate token, the static token or the position.
+
+    ``static_dims`` says how the static vector is cut. ``[64]`` makes it one token - the summary a
+    TabularStaticEncoder produced. ``[1, 1, ..., 4]`` makes every continuous column its own token and
+    each categorical embedding another, which is FT-Transformer's tokenizer: a width-1 chunk through a
+    Linear is exactly its ``x * w + b``. An empty ``static_dims`` reads no static tokens at all, so a
+    caller with no static features may hand over any placeholder.
+
+    The call signature is ConcatGatedFusion's on purpose: SoilCNNLightningModule's ``_fuse`` and
+    ``_fuse_from_parts`` drive either one without knowing which they hold.
+
+    There is no attention mask. A modality with no observations arrives as an exactly-zero embedding
+    (``_encode_temporal_from_grids`` zeroes it) and becomes a learned constant token - the same thing
+    the gate sees. A mask derived from "is this chunk all zeros" would also be discontinuous under the
+    interpolations a gradient explainer runs, which is a second reason not to build one.
+    """
+
+    READOUTS = ("cls", "mean", "flatten")
+
+    def __init__(
+        self,
+        static_dims: Sequence[int],
+        temporal_dims: Sequence[int],
+        coordinate_dim: int = 0,
+        *,
+        d_model: int = 64,
+        nhead: int = 4,
+        num_layers: int = 2,
+        ff_multiplier: int = 2,
+        dropout: float = 0.1,
+        readout: str = "cls",
+    ):
+        super().__init__()
+        d_model, nhead = int(d_model), int(nhead)
+        if d_model % nhead != 0:
+            raise ValueError(
+                f"d_model must be divisible by nhead for multi-head attention; got d_model={d_model} "
+                f"and nhead={nhead}"
+            )
+        if int(ff_multiplier) < 1:
+            raise ValueError(f"ff_multiplier must be at least 1, got {ff_multiplier}")
+        self.readout = str(readout).lower()
+        if self.readout not in self.READOUTS:
+            raise ValueError(f"readout must be one of {list(self.READOUTS)}, got {readout!r}")
+
+        self.static_dims = [int(width) for width in static_dims]
+        self.temporal_dims = [int(width) for width in temporal_dims]
+        self.coordinate_dim = int(coordinate_dim or 0)
+        widths = self.static_dims + self.temporal_dims + ([self.coordinate_dim] if self.coordinate_dim > 0 else [])
+        if not widths:
+            raise ValueError(
+                "AttentionFusion needs at least one input token; got no static, temporal or coordinate chunks."
+            )
+        if any(width <= 0 for width in widths):
+            raise ValueError(f"AttentionFusion chunk widths must all be positive, got {widths}")
+
+        self.d_model = d_model
+        self.num_tokens = len(widths)
+        self.tokenizers = nn.ModuleList(nn.Linear(width, d_model) for width in widths)
+        # Every slot has its own projection already, but a learned per-slot vector keeps two chunks
+        # that happen to project alike distinguishable to attention, which is otherwise order-blind.
+        self.token_type = nn.Parameter(torch.zeros(self.num_tokens, d_model))
+        nn.init.normal_(self.token_type, std=0.02)
+        if self.readout == "cls":
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+            nn.init.normal_(self.cls_token, std=0.02)
+
+        # Same layer as TemporalTransformerEncoder, plus a closing LayerNorm: a pre-norm stack leaves
+        # its last residual stream unnormalized, and this output feeds a head rather than another block.
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=int(ff_multiplier) * d_model,
+            dropout=float(dropout),
+            batch_first=True,
+            norm_first=True,
+        )
+        # enable_nested_tensor is incompatible with norm_first and would only warn; say so explicitly.
+        self.encoder = nn.TransformerEncoder(
+            layer,
+            num_layers=max(1, int(num_layers)),
+            norm=nn.LayerNorm(d_model),
+            enable_nested_tensor=False,
+        )
+        self.output_dim = d_model * self.num_tokens if self.readout == "flatten" else d_model
+
+    @staticmethod
+    def _split(features: Optional[torch.Tensor], dims: list[int], label: str) -> list[torch.Tensor]:
+        if not dims:
+            return []
+        if features is None:
+            raise ValueError(f"AttentionFusion was built with {label} chunks {dims} but received no {label} features")
+        if features.size(-1) != sum(dims):
+            # The alternative is a silent re-slicing: the wrong width would still split, with every
+            # chunk after the first reading a neighbour's columns.
+            raise ValueError(
+                f"AttentionFusion expected {sum(dims)} {label} feature(s) (chunks {dims}), got {features.size(-1)}"
+            )
+        return list(torch.split(features, dims, dim=-1))
+
+    def forward(
+        self,
+        static_features: torch.Tensor,
+        temporal_features: Optional[torch.Tensor],
+        coordinate_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        chunks = self._split(static_features, self.static_dims, "static")
+        chunks += self._split(temporal_features, self.temporal_dims, "temporal")
+        if self.coordinate_dim > 0:
+            chunks += self._split(coordinate_features, [self.coordinate_dim], "coordinate")
+
+        tokens = torch.stack(
+            [tokenizer(chunk) for tokenizer, chunk in zip(self.tokenizers, chunks)], dim=1
+        ) + self.token_type
+        if self.readout == "cls":
+            tokens = torch.cat([self.cls_token.expand(tokens.size(0), -1, -1), tokens], dim=1)
+
+        encoded = self.encoder(tokens)
+        if self.readout == "cls":
+            return encoded[:, 0]
+        if self.readout == "mean":
+            return encoded.mean(dim=1)
+        return encoded.flatten(1)

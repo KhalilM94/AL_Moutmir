@@ -17,7 +17,9 @@ process could write to ``mlruns/`` at all depended on how it happened to be laun
 
 from __future__ import annotations
 
+import datetime
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -79,6 +81,21 @@ def default_tracking_uri() -> str:
 def resolve_tracking_uri(config=None) -> str:
     configured = str(getattr(config, "MLFLOW_TRACKING_URI", "") or "").strip()
     return configured or default_tracking_uri()
+
+
+def resolve_local_tracking_root(tracking_uri: str) -> Path | None:
+    """The directory a file-backed tracking URI points at, or ``None`` for a real backend.
+
+    Lives here rather than in ``main.py`` because two callers now need it: the run-folder export,
+    and :func:`repair_corrupt_runs`, which has to reach the store as files because the thing it
+    repairs is exactly what stops MLflow's own API from reading it.
+    """
+    parsed = urlparse(tracking_uri)
+    if parsed.scheme not in ("", "file"):
+        return None
+    if parsed.scheme == "file":
+        return Path(parsed.path)
+    return Path(tracking_uri)
 
 
 def configure_tracking_uri(config=None) -> str:
@@ -211,6 +228,197 @@ def close_stale_runs(experiment_name: str | None = None, logger: Any = None) -> 
             "A run left RUNNING is usually one the OOM killer took."
         )
     return closed
+
+
+# --- corrupt run repair ---------------------------------------------------------------------
+# The sweep above assumes it can LIST the runs. It cannot, if the same process death that stranded
+# a run also truncated its `meta.yaml`: MLflow rewrites that file in place to terminate a run, and
+# `write_yaml` truncates before it writes, so dying inside that window leaves zero bytes behind.
+#
+# One such file poisons the whole experiment. `FileStore._read_yaml` retries an empty file twice -
+# it assumes a CONCURRENT write - then returns None, and `_read_persisted_run_info_dict` calls
+# `.copy()` on it. `_list_run_infos` catches only `MissingConfigException`, so the AttributeError
+# escapes every `search_runs`. A MISSING meta.yaml is handled; an EMPTY one has no handler in the
+# read path at all, which is why this is ours to work around rather than MLflow's to skip.
+#
+# It reads as a crash in whatever happened to touch MLflow next. Here it surfaced at the END of a
+# successful run, in the parent summary, after the models had already been written.
+
+# Mirrors FileStore.RESERVED_EXPERIMENT_FOLDERS. These sit beside the run directories and are not
+# runs; none carries a top-level meta.yaml, so this is belt-and-braces over the corruption check.
+_RESERVED_EXPERIMENT_FOLDERS = ("tags", "datasets", "traces", "models")
+
+# The timestamp main.py builds run names from: `Run_%Y%m%d_%H%M%S`.
+_RUN_NAME_TIMESTAMP = re.compile(r"\d{8}_\d{6}")
+
+
+def _read_run_tag(run_dir: Path, tag: str) -> str | None:
+    """A tag as MLflow stores it: one file per tag, the value its entire contents."""
+    try:
+        return (run_dir / "tags" / tag).read_text().strip()
+    except OSError:
+        return None
+
+
+def _meta_is_corrupt(meta_path: Path) -> bool:
+    """Whether ``meta.yaml`` exists but no longer describes a run.
+
+    A missing file is deliberately NOT corruption: MLflow raises `MissingConfigException` for it and
+    `_list_run_infos` already skips it. Only the file that exists and parses to nothing is fatal.
+    """
+    try:
+        loaded = yaml.safe_load(meta_path.read_text())
+    except (OSError, yaml.YAMLError):
+        return True
+    return not isinstance(loaded, dict) or not loaded.get("run_id")
+
+
+def _owned_by_live_process(run_dir: Path) -> bool:
+    """Whether a run's writer is still running on this host.
+
+    MLflow guards the same case with a sleep-and-retry; the ownership tags make it a decision rather
+    than a guess. Same rule as :func:`close_stale_runs`: a run another live process is writing is
+    never touched, because stomping a concurrent training run is worse than the crash being fixed.
+    """
+    import socket
+
+    if _read_run_tag(run_dir, HOST_NAME_TAG) != socket.gethostname():
+        # Not this machine's run, so its pid means nothing here.
+        return False
+    raw_pid = _read_run_tag(run_dir, HOST_PID_TAG)
+    if raw_pid is None:
+        return False
+    try:
+        return _process_is_alive(int(raw_pid))
+    except (TypeError, ValueError):
+        return False
+
+
+def _experiment_artifact_location(experiment_dir: Path) -> str:
+    """Where the experiment puts artifacts, which is fixed at creation and need not be under root."""
+    try:
+        loaded = yaml.safe_load((experiment_dir / "meta.yaml").read_text())
+    except (OSError, yaml.YAMLError):
+        loaded = None
+    location = loaded.get("artifact_location") if isinstance(loaded, dict) else None
+    return str(location or experiment_dir.as_uri())
+
+
+def _rebuild_meta(run_dir: Path, experiment_id: str, experiment_dir: Path) -> dict:
+    """Reconstruct the lost run metadata from the sidecar files that survived.
+
+    Everything MLflow needs is recoverable: the run id IS the directory name, and the tags and
+    params were written as separate files that a truncation of meta.yaml never touched. The times
+    are the only estimates - the run name carries the start to the second, and the truncated file's
+    own mtime is when the process died.
+    """
+    run_id = run_dir.name
+    run_name = _read_run_tag(run_dir, "mlflow.runName") or run_id
+
+    match = _RUN_NAME_TIMESTAMP.search(run_name)
+    start_time = None
+    if match:
+        try:
+            # Named with datetime.now(), so it is local time - which is what .timestamp() assumes.
+            start_time = int(datetime.datetime.strptime(match.group(), "%Y%m%d_%H%M%S").timestamp() * 1000)
+        except ValueError:
+            start_time = None
+    if start_time is None:
+        start_time = int(run_dir.stat().st_mtime * 1000)
+
+    end_time = max(int((run_dir / "meta.yaml").stat().st_mtime * 1000), start_time)
+    artifact_location = _experiment_artifact_location(experiment_dir).rstrip("/")
+
+    return {
+        "artifact_uri": f"{artifact_location}/{run_id}/artifacts",
+        "end_time": end_time,
+        "entry_point_name": "",
+        "experiment_id": str(experiment_id),
+        "lifecycle_stage": "active",
+        "run_id": run_id,
+        "run_name": run_name,
+        "source_name": "",
+        "source_type": 4,
+        "source_version": "",
+        "start_time": start_time,
+        # KILLED. The run's process died without unwinding - that is why the file was truncated -
+        # so this is the same status close_stale_runs gives a run whose process is gone.
+        "status": 5,
+        "tags": [],
+        "user_id": _read_run_tag(run_dir, "mlflow.user") or "",
+    }
+
+
+def _write_meta_atomically(meta_path: Path, payload: dict) -> None:
+    """Write through a temp file in the same directory, then rename.
+
+    The corruption being repaired is a truncate-then-die, so a repair that truncated in place could
+    leave the store in precisely the state it was called to fix.
+    """
+    tmp_path = meta_path.parent / f".{meta_path.name}.repair"
+    with open(tmp_path, "w") as handle:
+        yaml.safe_dump(payload, handle, default_flow_style=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, meta_path)
+
+
+def repair_corrupt_runs(experiment_name: str | None = None, logger: Any = None) -> list[str]:
+    """Rebuild run directories whose ``meta.yaml`` was truncated by a process death.
+
+    Returns the run ids repaired. Never fatal, for the same reason :func:`close_stale_runs` is not:
+    refusing to train because an old run could not be tidied is the worse trade. A repaired run
+    comes back as KILLED, keeping the params and artifacts that were never lost in the first place.
+
+    Reads the store as files rather than through MLflow, because the corruption is exactly what
+    stops MLflow from reading it.
+    """
+    name = experiment_name or os.environ.get("MLFLOW_EXPERIMENT_NAME") or DEFAULT_EXPERIMENT_NAME
+    try:
+        root = resolve_local_tracking_root(mlflow.get_tracking_uri())
+        if root is None:
+            # A database or HTTP backend has no meta.yaml to truncate.
+            return []
+        client = mlflow.tracking.MlflowClient()  # type: ignore[attr-defined]
+        # Reads only the experiment's own meta.yaml, so a corrupt RUN cannot break this lookup.
+        experiment = client.get_experiment_by_name(name)
+        if experiment is None:
+            return []
+        experiment_dir = root / str(experiment.experiment_id)
+        run_dirs = sorted(path for path in experiment_dir.iterdir() if path.is_dir())
+    except Exception as exc:  # pragma: no cover - tracking store unreachable
+        if logger is not None:
+            logger.warning(f"Could not scan for corrupt runs: {type(exc).__name__}: {exc}")
+        return []
+
+    repaired: list[str] = []
+    for run_dir in run_dirs:
+        if run_dir.name in _RESERVED_EXPERIMENT_FOLDERS:
+            continue
+        meta_path = run_dir / "meta.yaml"
+        if not meta_path.exists() or not _meta_is_corrupt(meta_path):
+            continue
+        if _owned_by_live_process(run_dir):
+            if logger is not None:
+                logger.warning(
+                    f"Run {run_dir.name} has an unreadable meta.yaml but its process is still "
+                    "alive; leaving it alone in case the file is mid-write."
+                )
+            continue
+        try:
+            _write_meta_atomically(meta_path, _rebuild_meta(run_dir, experiment.experiment_id, experiment_dir))
+            repaired.append(run_dir.name)
+        except Exception as exc:  # pragma: no cover
+            if logger is not None:
+                logger.warning(f"Could not repair run {run_dir.name}: {type(exc).__name__}: {exc}")
+
+    if repaired and logger is not None:
+        logger.info(
+            f"Rebuilt meta.yaml for {len(repaired)} run(s) and marked them KILLED: "
+            f"{', '.join(repaired)}. A truncated meta.yaml is written when a process dies partway "
+            "through ending a run, and one of them makes every MLflow read of this experiment fail."
+        )
+    return repaired
 
 
 def start_child_run(run_name: str, tags: dict | None = None):

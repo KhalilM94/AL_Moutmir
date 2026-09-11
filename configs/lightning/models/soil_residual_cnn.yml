@@ -1,3 +1,23 @@
+# Part of the Lightning (deep-learning) model registry. Settings shared by every model live in
+# defaults.yml in this same folder; this file holds only what makes soil_residual_cnn different
+# from the rest, alongside its siblings here (soil_cnn.yml, soil_residual_attention_cnn.yml,
+# soil_sequence.yml, soil_tabular.yml, soil_graph.yml). To register another model, add a new .yml
+# file in this folder, named after the model, with the model name as its top-level key - it's
+# picked up automatically.
+#
+# How defaults work: settings in defaults.yml's `defaults:` block apply to every model, unless
+# this file sets that same setting itself (which then wins). So this file only needs to list what
+# makes soil_residual_cnn different from the rest - anything it doesn't mention falls back to
+# those defaults.
+#
+# A note on network "shape" settings you'll see in this file, like `head_hidden_dims: [64, 32]`:
+# these describe a stack of layers as a list of widths, one number per layer. The LENGTH of the
+# list is how many layers there are, and each number is how wide that layer is - so [64, 32] means
+# two layers, the first with 64 units and the second with 32. There's no separate "number of
+# layers" setting anywhere; the list itself is the whole shape. (When these are searched
+# automatically during hyperparameter tuning, that's done with a `dims_pyramid` helper - see
+# configs/lightning/search_spaces/.)
+
 # The same model as soil_cnn.yml, except instead of predicting the target value directly, it
 # predicts a CORRECTION to an existing prediction (this is called "residual learning" - the model
 # only has to learn what the first prediction got wrong, which can be an easier problem).
@@ -20,9 +40,51 @@
 # The pipeline can't verify this for you - if the base predictions did see those points during
 # their own training, every metric on this run will look better than it should. The module logs a
 # warning naming each base column as a reminder to double-check this yourself.
-#
-# Shares its `defaults:` (trainer/callback/datamodule settings) with every other model in this
-# folder - see ../lightning_registry.yml.
+defaults:
+  modeltype: dl
+  trainer_args:
+    max_epochs: 500          # maximum number of passes over the training data (an "epoch" = one
+                              # full pass). Training usually stops earlier - see early_stopping below.
+    accelerator: cuda        # cuda = train on GPU. Use "cpu" if you don't have one.
+    devices: 1                # how many GPUs/CPUs to use
+    precision: 32-true        # numeric precision for training; 32-true is standard full precision
+    accumulate_grad_batches: 1 # combine this many batches before each weight update - raise this
+                                # to simulate a bigger batch size without using more memory at once
+    gradient_clip_val: 1.0    # caps how large a single weight update can be, which helps keep
+                               # training stable
+    log_every_n_steps: 5      # how often (in training steps) to log metrics
+    enable_checkpointing: true # save the model's weights during training
+    deterministic: true       # make training as reproducible as possible, run to run
+  callbacks:
+    early_stopping:
+      monitor: val_loss       # stop training once this metric (validation loss) stops improving
+      mode: min                # "min" = lower is better (use "max" for a metric like R2)
+      patience: 100             # how many epochs to wait for improvement before giving up. Set
+                                 # generously enough that ordinary noisy ups and downs in the
+                                 # metric don't trigger a stop while the model is still improving.
+    checkpoint:
+      monitor: val_loss
+      mode: min
+      save_top_k: 1            # how many of the best checkpoints to keep (1 = just the best one)
+  datamodule_init_args:
+    batch_size: 32             # how many samples are processed together in one training step
+    # There's deliberately no val_size / test_size / seed setting here. The train/validation/test
+    # split is decided ONCE, for every model type, in main_config.yml's `split:` block, and handed
+    # to every model from there - don't add split settings in this file, they won't be used and
+    # would just be confusing to find here later.
+    target_transform: log1p  # null | log1p - log1p applies log(1+x) to the target before training
+                              # (and undoes it on predictions), which helps when your target values
+                              # are skewed (e.g. many small values and a few very large ones)
+    num_workers: 11           # how many background processes load data in parallel while training
+    pin_memory: false         # a minor GPU data-transfer optimization; leave false unless you know
+                               # you want it
+    persistent_workers: false # keep the background data-loading workers alive between epochs,
+                               # instead of restarting them each epoch
+    shuffle: true              # shuffle the training data each epoch (recommended)
+  tags:
+    framework: lightning
+    family: regression
+
 soil_residual_cnn:
   enabled: false
   input_kind: sequence
@@ -64,7 +126,8 @@ soil_residual_cnn:
     # column under auxiliary_label_columns below - it already reaches the model through its own
     # dedicated path.
     residual_base_columns:
-      organic_matter_g_kg: organic_matter_g_kg_base
+      # organic_matter_g_kg: organic_matter_g_kg_base
+      exchangeable_k2o_ppm: exchangeable_k2o_ppm_base
     # [] feeds the base value (and its validity flag) into the model as-is. A non-empty list passes
     # it through a small extra stack of layers first (same idea as auxiliary_hidden_dims below).
     residual_base_hidden_dims: []

@@ -15,6 +15,8 @@ from yg_eo_soilnet.tracking import (
     configure_tracking,
     install_run_signal_handlers,
     log_params_once,
+    repair_corrupt_runs,
+    resolve_local_tracking_root,
     run_owner_tags,
     tracking_settings,
 )
@@ -26,7 +28,6 @@ import time
 import shutil
 import re
 from pathlib import Path
-from urllib.parse import urlparse
 from typing import Any, Dict
 import argparse
 
@@ -54,15 +55,6 @@ def _sanitize_path_component(value: str) -> str:
     return sanitized or "experiment"
 
 
-def _resolve_local_tracking_root(tracking_uri: str) -> Path | None:
-    parsed = urlparse(tracking_uri)
-    if parsed.scheme not in ("", "file"):
-        return None
-    if parsed.scheme == "file":
-        return Path(parsed.path)
-    return Path(tracking_uri)
-
-
 def _resolve_main_relative_path(path_value: str) -> Path:
     path = Path(path_value)
     if path.is_absolute():
@@ -87,7 +79,7 @@ def _export_mlflow_run_folder(trainer, experiment_id: str, run_id: str, run_name
     if experiment is None:
         return None
 
-    tracking_root = _resolve_local_tracking_root(mlflow.get_tracking_uri())
+    tracking_root = resolve_local_tracking_root(mlflow.get_tracking_uri())
     if tracking_root is None:
         return None
 
@@ -322,6 +314,10 @@ def main():
     # happen first), so a module logger stands in.
     startup_logger = logging.getLogger(__name__)
     install_run_signal_handlers(startup_logger)
+    # Before the sweep, which cannot list runs at all while one of them has a truncated meta.yaml -
+    # the same process death strands a run AND corrupts it, and the sweep swallows that failure as a
+    # warning, so the store stays broken until something less forgiving reads it.
+    repair_corrupt_runs(experiment_name, startup_logger)
     close_stale_runs(experiment_name, startup_logger)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -386,7 +382,23 @@ def main():
             trainer.train_models(split_data)
             trainer.logger.info(f"train_models completed in {time.perf_counter() - stage_start:.2f}s")
 
-            mlflow_logger.log_parent_summary(main_run.info.run_id, trainer)
+            # Not fatal, and deliberately narrower than the block below. By this point every model
+            # has been trained and logged by its own child run; the summary only reads them back.
+            # Letting it re-raise threw all of that away - the log artifact and the run-folder
+            # export below never ran, and the run was marked FAILED - over a leaderboard. The tag
+            # is what keeps this from being a silent swallow: a run missing its summary says why.
+            try:
+                mlflow_logger.log_parent_summary(main_run.info.run_id, trainer)
+            except Exception as summary_error:
+                trainer.logger.error(
+                    f"Parent summary failed after training completed: "
+                    f"{type(summary_error).__name__}: {summary_error}",
+                    exc_info=True,
+                )
+                mlflow.set_tag(
+                    "parent_summary_error",
+                    f"{type(summary_error).__name__}: {summary_error}"[:500],
+                )
 
         except Exception as e:
             trainer.logger.error(f"An error occurred during training: {e}")

@@ -7,20 +7,24 @@ what it left behind was still marked RUNNING - which reads as "in progress", or 
 successfully made.
 """
 
+import datetime
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import mlflow
 import numpy as np
 import pandas as pd
 import pytest
 
 import yg_eo_soilnet.logger.mlflow_loggers as loggers_module
+import yg_eo_soilnet.tracking as tracking_module
 from yg_eo_soilnet.logger.mlflow_loggers import ChildRunLogger
 from yg_eo_soilnet.tracking import (
     HOST_NAME_TAG,
     HOST_PID_TAG,
     close_stale_runs,
+    repair_corrupt_runs,
     run_owner_tags,
     start_child_run,
 )
@@ -108,6 +112,129 @@ def test_a_sweep_that_cannot_reach_the_store_does_not_stop_the_run(monkeypatch) 
 
     assert close_stale_runs("exp", logger=logger) == []
     logger.warning.assert_called_once()
+
+
+# --- corrupt run repair ----------------------------------------------------
+# The sweep above cannot run at all while a run in the same experiment has a truncated meta.yaml.
+# MLflow rewrites that file in place to END a run, so a process death inside that window leaves
+# zero bytes - and `_read_persisted_run_info_dict` then calls `.copy()` on the None its parser
+# returns. `_list_run_infos` catches only `MissingConfigException`, so it escapes every read of the
+# experiment: here it surfaced at the END of a successful run, in the parent summary.
+
+
+def _store_with_a_run(tmp_path, run_id="run-abc", run_name="Run_20260906_155825", tags=None):
+    """A file-backed store holding one finished run, written the way MLflow writes one."""
+    mlflow.set_tracking_uri(tmp_path.as_uri())
+    experiment_dir = tmp_path / "1"
+    run_dir = experiment_dir / run_id
+    (run_dir / "tags").mkdir(parents=True)
+    (run_dir / "artifacts").mkdir()
+
+    (experiment_dir / "meta.yaml").write_text(
+        "artifact_location: " + experiment_dir.as_uri() + "\n"
+        "creation_time: 1787051008023\n"
+        "experiment_id: '1'\n"
+        "last_update_time: 1787051008023\n"
+        "lifecycle_stage: active\n"
+        "name: exp\n"
+    )
+    (run_dir / "meta.yaml").write_text(
+        "artifact_uri: " + (run_dir / "artifacts").as_uri() + "\n"
+        "end_time: 1788273472365\n"
+        "entry_point_name: ''\n"
+        "experiment_id: '1'\n"
+        "lifecycle_stage: active\n"
+        f"run_id: {run_id}\n"
+        f"run_name: {run_name}\n"
+        "source_name: ''\n"
+        "source_type: 4\n"
+        "source_version: ''\n"
+        "start_time: 1788273469596\n"
+        "status: 3\n"
+        "tags: []\n"
+        "user_id: kmisbah\n"
+    )
+    for tag, value in {"mlflow.runName": run_name, "mlflow.user": "kmisbah", **(tags or {})}.items():
+        (run_dir / "tags" / tag).write_text(value)
+    return run_dir
+
+
+def test_a_run_whose_meta_was_truncated_is_rebuilt_as_killed(tmp_path) -> None:
+    """The regression test: one empty meta.yaml used to make every search_runs raise."""
+    run_dir = _store_with_a_run(tmp_path)
+    (run_dir / "meta.yaml").write_text("")
+
+    client = mlflow.tracking.MlflowClient()
+    with pytest.raises(AttributeError):
+        client.search_runs(["1"], max_results=10)
+
+    assert repair_corrupt_runs("exp") == [run_dir.name]
+
+    runs = client.search_runs(["1"], max_results=10)
+    assert [run.info.run_id for run in runs] == [run_dir.name]
+    assert runs[0].info.status == "KILLED"
+    # Recovered from the sidecar files a truncation never touched, not invented.
+    assert runs[0].info.run_name == "Run_20260906_155825"
+    assert runs[0].data.tags["mlflow.user"] == "kmisbah"
+    # The start is carried by the run name, to the second: 2026-09-06 15:58:25 local.
+    assert runs[0].info.start_time == int(
+        datetime.datetime(2026, 9, 6, 15, 58, 25).timestamp() * 1000
+    )
+    assert runs[0].info.end_time >= runs[0].info.start_time
+
+
+def test_a_repair_leaves_a_healthy_run_byte_for_byte_alone(tmp_path) -> None:
+    run_dir = _store_with_a_run(tmp_path)
+    before = (run_dir / "meta.yaml").read_bytes()
+
+    assert repair_corrupt_runs("exp") == []
+    assert (run_dir / "meta.yaml").read_bytes() == before
+
+
+def test_a_repair_never_touches_a_run_a_live_process_could_still_be_writing(tmp_path) -> None:
+    """Same rule as the sweep: an empty file may simply be mid-write on this host."""
+    import socket
+
+    run_dir = _store_with_a_run(
+        tmp_path, tags={HOST_NAME_TAG: socket.gethostname(), HOST_PID_TAG: str(os.getpid())}
+    )
+    (run_dir / "meta.yaml").write_text("")
+    logger = MagicMock()
+
+    assert repair_corrupt_runs("exp", logger=logger) == []
+    assert (run_dir / "meta.yaml").read_text() == ""
+    logger.warning.assert_called_once()
+
+
+def test_a_repair_reclaims_a_run_whose_process_is_gone(tmp_path) -> None:
+    import socket
+
+    run_dir = _store_with_a_run(
+        tmp_path, tags={HOST_NAME_TAG: socket.gethostname(), HOST_PID_TAG: str(_dead_pid())}
+    )
+    (run_dir / "meta.yaml").write_text("")
+
+    assert repair_corrupt_runs("exp") == [run_dir.name]
+
+
+def test_a_run_directory_with_no_meta_at_all_is_left_to_mlflow(tmp_path) -> None:
+    """A MISSING meta.yaml already has a handler upstream; only an empty one does not."""
+    run_dir = _store_with_a_run(tmp_path)
+    (run_dir / "meta.yaml").unlink()
+
+    assert repair_corrupt_runs("exp") == []
+    assert not (run_dir / "meta.yaml").exists()
+
+
+def test_a_repair_is_a_no_op_against_a_real_tracking_backend(tmp_path, monkeypatch) -> None:
+    """A database or HTTP store has no meta.yaml to truncate, and no filesystem to walk."""
+    _store_with_a_run(tmp_path)
+    monkeypatch.setattr(tracking_module.mlflow, "get_tracking_uri", lambda: "postgresql://host/db")
+    client = MagicMock()
+    monkeypatch.setattr(tracking_module.mlflow.tracking, "MlflowClient", client)
+
+    assert repair_corrupt_runs("exp") == []
+    client.assert_not_called()
 
 
 # --- nesting ---------------------------------------------------------------

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -167,6 +168,53 @@ class Distribution:
         return f"{self.kind}({body}){guard}"
 
 
+def load_search_spaces_document(path: str) -> dict:
+    """Load the search spaces at `path`, one entry per registry model.
+
+    `path` may be any of three things, so where the spaces live is a matter of what you point at
+    rather than a filename the loader insists on:
+
+      a folder          every .yml/.yaml in it is read - configs/lightning/search_spaces/
+      an existing file  it is read, and a folder of the same base name beside it is merged in too
+      a missing file    only that same-base-name folder is read
+
+    The folder is derived from the path as a string, so the file it is named after does not have to
+    exist: pointing at configs/lightning/search_spaces.yml finds configs/lightning/search_spaces/
+    either way, and both forms load the same spaces.
+    """
+    document: dict = {}
+    if os.path.isdir(path):
+        split_dir = path
+    else:
+        split_dir, _ext = os.path.splitext(path)
+        if os.path.exists(path):
+            with open(path, "r") as handle:
+                document = yaml.safe_load(handle) or {}
+
+    # Tracks which file each entry came from, purely so a collision names both real files instead
+    # of always blaming `path` - a second split file colliding with a FIRST one would otherwise be
+    # misreported as colliding with `path` itself.
+    sources = {name: path for name in document}
+
+    if os.path.isdir(split_dir):
+        for filename in sorted(os.listdir(split_dir)):
+            if not filename.endswith((".yml", ".yaml")):
+                continue
+            file_path = os.path.join(split_dir, filename)
+            with open(file_path, "r") as handle:
+                entries = yaml.safe_load(handle) or {}
+            for name, spec in entries.items():
+                if name in document:
+                    raise ValueError(
+                        f"Search space '{name}' is declared both in {sources[name]} and in "
+                        f"{file_path} - remove it from one of the two."
+                    )
+                document[name] = spec
+                sources[name] = file_path
+
+    return document
+
+
 @dataclass
 class SearchSpace:
     """A whole study's declaration: what to optimize, what to pin, and what to search."""
@@ -226,8 +274,7 @@ class SearchSpace:
 
     @classmethod
     def from_yaml(cls, path: str, entry: str) -> "SearchSpace":
-        with open(path, "r") as handle:
-            document = yaml.safe_load(handle) or {}
+        document = load_search_spaces_document(path)
         if entry not in document:
             available = ", ".join(sorted(document)) or "(none)"
             raise KeyError(f"No search space for registry entry {entry!r} in {path}. Available: {available}.")

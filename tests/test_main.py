@@ -81,6 +81,68 @@ def test_main_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_parent_logger.log_parent_summary.assert_called_once_with("run-123", fake_trainer)
 
 
+def test_main_survives_a_failing_parent_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A summary that cannot be built must not discard the training that already succeeded.
+
+    Every model is trained and logged by its own child run before this point; the summary only
+    reads them back. Letting it re-raise skipped the log artifact and the run-folder export and
+    left the parent marked FAILED - which is how one truncated meta.yaml elsewhere in the store
+    turned a finished run into a crash.
+    """
+    fake_trainer = SimpleNamespace(
+        config=SimpleNamespace(config_path="config.yml", registry_path="registry.yml"),
+        scikit_datamodule=SimpleNamespace(
+            load_frame=MagicMock(return_value="raw"),
+            preprocess=MagicMock(return_value="processed"),
+            split=MagicMock(return_value={"X_train": "x"}),
+        ),
+        split_plan_provider=SimpleNamespace(plan=MagicMock(return_value=_fake_plan())),
+        logger=SimpleNamespace(info=MagicMock(), error=MagicMock()),
+        logger_wrapper=SimpleNamespace(log_file="train.log"),
+        train_models=MagicMock(),
+    )
+    fake_parent_logger = SimpleNamespace(
+        log_parent_summary=MagicMock(side_effect=RuntimeError("leaderboard unreadable"))
+    )
+    log_artifact = MagicMock()
+    set_tag = MagicMock()
+
+    monkeypatch.setattr(main_module.mlflow, "enable_system_metrics_logging", MagicMock())
+    monkeypatch.setattr(main_module.mlflow, "set_experiment", MagicMock())
+    monkeypatch.setattr(main_module.mlflow, "create_experiment", MagicMock())
+    monkeypatch.setattr(main_module.mlflow, "active_run", MagicMock(return_value=None))
+    monkeypatch.setattr(main_module.mlflow, "end_run", MagicMock())
+    monkeypatch.setattr(main_module.mlflow, "log_param", MagicMock())
+    monkeypatch.setattr(main_module.mlflow, "log_params", MagicMock())
+    monkeypatch.setattr(main_module.mlflow, "log_artifact", log_artifact)
+    monkeypatch.setattr(main_module.mlflow, "set_tag", set_tag)
+    monkeypatch.setattr(main_module.datetime, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda fmt: "20260703_120000")))
+    monkeypatch.setattr(main_module, "SoilModelTraining", MagicMock(return_value=fake_trainer))
+    monkeypatch.setattr(main_module, "ParentRunLogger", MagicMock(return_value=fake_parent_logger))
+
+    class FakeRun:
+        info = SimpleNamespace(run_id="run-123")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(main_module.mlflow, "start_run", MagicMock(return_value=FakeRun()))
+    monkeypatch.setattr("sys.argv", ["main.py", "--config-path", "config.yml"])
+
+    main_module.main()
+
+    fake_trainer.train_models.assert_called_once()
+    # The run still finishes: the log artifact goes up, and nothing propagates out of main().
+    log_artifact.assert_called_once_with("train.log")
+    # Not a silent swallow - the run records why its summary is missing.
+    assert set_tag.call_args.args[0] == "parent_summary_error"
+    assert "leaderboard unreadable" in set_tag.call_args.args[1]
+    fake_trainer.logger.error.assert_called_once()
+
+
 def test_main_logs_and_reraises_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
     failing_trainer = SimpleNamespace(
         config=SimpleNamespace(config_path="config.yml", registry_path="registry.yml"),

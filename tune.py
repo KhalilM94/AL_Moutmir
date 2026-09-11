@@ -11,7 +11,7 @@ The winner is exported as a ready-to-run registry file, named for the study that
     LIGHTNING_MODEL_REGISTRY_PATH=configs/lightning/tuned/soil_tabular-7438eb_best.yml python main.py
 
 A study is named `<entry>-<fingerprint of its search space>` and resumed by name, so re-running the
-same command continues the sweep while editing search_spaces.yml starts a clean one. `--reset`
+same command continues the sweep while editing the entry's search space starts a clean one. `--reset`
 discards a study, and `--study-name` pins one across edits (which is then checked, not assumed).
 """
 
@@ -60,7 +60,15 @@ def parse_args() -> argparse.Namespace:
             "one target and export the result as though it described the run."
         ),
     )
-    parser.add_argument("--search-spaces", default="configs/lightning/search_spaces.yml")
+    parser.add_argument(
+        "--search-spaces",
+        default="configs/lightning/search_spaces",
+        help=(
+            "Where the search spaces live: either a folder of one-model-per-file YAMLs (the "
+            "default) or a single YAML holding several. Pointing at <name>.yml also picks up a "
+            "<name>/ folder beside it, so both layouts load the same spaces."
+        ),
+    )
     parser.add_argument(
         "--n-trials", type=int, default=50, help="Trials to run NOW; on a resumed study they are added to it"
     )
