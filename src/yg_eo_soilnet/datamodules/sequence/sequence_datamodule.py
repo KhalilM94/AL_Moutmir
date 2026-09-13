@@ -6,11 +6,12 @@ from typing import Any, Mapping, Optional
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 from lightning.pytorch import LightningDataModule
 
 from yg_eo_soilnet.datamodules.categorical import CategoricalEncoder
+from yg_eo_soilnet.datamodules.loaders import build_loader
 from yg_eo_soilnet.datamodules.sequence.sequence_bundle import SoilSequenceBundle
 from yg_eo_soilnet.datamodules.splitting import SplitPlan
 from yg_eo_soilnet.targets import select_target_columns
@@ -370,7 +371,9 @@ class SoilSequenceDataModule(LightningDataModule):
     def _make_loader(self, point_indices, *, shuffle: bool = False, drop_last: bool = False):
         point_indices = np.asarray(point_indices, dtype=np.int64)
         batch_size = max(1, int(self.batch_size)) if point_indices.size else 1
-        return DataLoader(
+        # build_loader, not a bare DataLoader: it keeps num_workers and persistent_workers from
+        # shifting the global RNG stream, so they cannot change what a run trains to.
+        return build_loader(
             _PointDataset(point_indices),
             batch_size=batch_size,
             drop_last=bool(drop_last),

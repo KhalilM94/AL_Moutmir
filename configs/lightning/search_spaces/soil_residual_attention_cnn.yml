@@ -54,7 +54,7 @@ soil_residual_attention_cnn:
     model.attention_nhead: {type: categorical, choices: [2, 4, 8]}
     model.attention_num_layers: {type: int, low: 1, high: 3, step: 1}
     model.attention_ff_multiplier: {type: categorical, choices: [2, 4]}
-    model.attention_dropout: {type: float, low: 0.0, high: 0.3, step: 0.1}
+    model.attention_dropout: {type: float, low: 0.1, high: 0.6, step: 0.1}
     model.attention_readout: {type: categorical, choices: [cls, mean, flatten]}
 
   derive:

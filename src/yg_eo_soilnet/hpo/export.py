@@ -19,8 +19,10 @@ from yg_eo_soilnet.hpo.search_space import Objective
 
 OVERRIDES_ATTR = "overrides"
 
-# Dataloader throughput knobs, not hyperparameters: they change no arithmetic and no result, only
-# how fast batches arrive. A study pins them to values that suit hundreds of short trials, and
+# Dataloader throughput knobs, not hyperparameters: they change how fast batches arrive and nothing
+# else. datamodules/loaders.build_loader is what makes that true. Before it, persistent_workers
+# changed the global RNG stream from epoch 1 onward, so a retrain could not reproduce its trial.
+# A study pins them to values that suit hundreds of short trials, and
 # without this the exported production config would silently inherit those instead of the
 # registry's - which is how `num_workers: 4` and `persistent_workers: true` ended up in a tuned file
 # whose registry said 11 and false.

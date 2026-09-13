@@ -8,11 +8,12 @@ import numpy as np
 import pandas as pd
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 from lightning.pytorch import LightningDataModule
 
 from yg_eo_soilnet.datamodules.lightning.spatiotemporal_graph import SpatiotemporalGraph
+from yg_eo_soilnet.datamodules.loaders import build_loader
 from yg_eo_soilnet.datamodules.splitting import SplitPlan
 from yg_eo_soilnet.targets import select_target_columns
 
@@ -255,7 +256,9 @@ class SingleNodeGraphDataModule(LightningDataModule):
         node_indices = np.asarray(node_indices, dtype=np.int64)
         # A split can be empty (e.g. val_size=0); fall back to one empty batch.
         batch_size = max(1, int(self.batch_size)) if node_indices.size else 1
-        return DataLoader(
+        # build_loader, not a bare DataLoader: it keeps num_workers and persistent_workers from
+        # shifting the global RNG stream, so they cannot change what a run trains to.
+        return build_loader(
             _NodeIndexDataset(node_indices),
             batch_size=batch_size,
             drop_last=bool(drop_last),

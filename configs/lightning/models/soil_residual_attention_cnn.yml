@@ -40,7 +40,51 @@
 # Comparing val_loss: the loss is computed on the final prediction (base + correction) against the
 # true value, so this model's val_loss can be compared with soil_residual_cnn's and soil_cnn's as
 # long as they fit the same target(s) with the same split, target_transform and loss_name.
-
+defaults:
+  modeltype: dl
+  trainer_args:
+    max_epochs: 500          # maximum number of passes over the training data (an "epoch" = one
+                              # full pass). Training usually stops earlier - see early_stopping below.
+    accelerator: cuda        # cuda = train on GPU. Use "cpu" if you don't have one.
+    devices: 1                # how many GPUs/CPUs to use
+    precision: 32-true        # numeric precision for training; 32-true is standard full precision
+    accumulate_grad_batches: 1 # combine this many batches before each weight update - raise this
+                                # to simulate a bigger batch size without using more memory at once
+    gradient_clip_val: 1.0    # caps how large a single weight update can be, which helps keep
+                               # training stable
+    log_every_n_steps: 5      # how often (in training steps) to log metrics
+    enable_checkpointing: true # save the model's weights during training
+    deterministic: true       # make training as reproducible as possible, run to run
+  callbacks:
+    early_stopping:
+      monitor: val_loss       # stop training once this metric (validation loss) stops improving
+      mode: min                # "min" = lower is better (use "max" for a metric like R2)
+      patience: 100             # how many epochs to wait for improvement before giving up. Set
+                                 # generously enough that ordinary noisy ups and downs in the
+                                 # metric don't trigger a stop while the model is still improving.
+    checkpoint:
+      monitor: val_loss
+      mode: min
+      save_top_k: 1            # how many of the best checkpoints to keep (1 = just the best one)
+  datamodule_init_args:
+    batch_size: 32             # how many samples are processed together in one training step
+    # There's deliberately no val_size / test_size / seed setting here. The train/validation/test
+    # split is decided ONCE, for every model type, in main_config.yml's `split:` block, and handed
+    # to every model from there - don't add split settings in this file, they won't be used and
+    # would just be confusing to find here later.
+    target_transform: log1p  # null | log1p - log1p applies log(1+x) to the target before training
+                              # (and undoes it on predictions), which helps when your target values
+                              # are skewed (e.g. many small values and a few very large ones)
+    num_workers: 11           # how many background processes load data in parallel while training
+    pin_memory: false         # a minor GPU data-transfer optimization; leave false unless you know
+                               # you want it
+    persistent_workers: false # keep the background data-loading workers alive between epochs,
+                               # instead of restarting them each epoch
+    shuffle: true              # shuffle the training data each epoch (recommended)
+  tags:
+    framework: lightning
+    family: regression
+    
 soil_residual_attention_cnn:
   enabled: false
   input_kind: sequence
@@ -106,8 +150,8 @@ soil_residual_attention_cnn:
     # model fits, list it in data_spec.yml's LABEL_COLUMNS with CARRY_LABEL_COLUMNS: true, and don't
     # also list it under auxiliary_label_columns below.
     residual_base_columns:
-      # organic_matter_g_kg: organic_matter_g_kg_base
-      exchangeable_k2o_ppm: exchangeable_k2o_ppm_base
+      organic_matter_g_kg: organic_matter_g_kg_base
+      # exchangeable_k2o_ppm: exchangeable_k2o_ppm_base
     residual_base_hidden_dims: []
     residual_base_dropout: 0.0
     residual_base_validity_channels: false   # also tell the model whether the base value for each

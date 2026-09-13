@@ -57,6 +57,9 @@ SERVING_MODULES: tuple[str, ...] = (
     # The sequence datamodule imports SplitPlan for its type hint and for the shared-split branch.
     # It is deliberately dependency-free (numpy + pandas only), so it costs serving nothing.
     "datamodules/splitting.py",
+    # The sequence datamodule builds every DataLoader through build_loader. Torch only, which serving
+    # already needs for the forward pass.
+    "datamodules/loaders.py",
     # The sequence datamodule narrows its targets through select_target_columns. Pure numpy, like
     # splitting.py above, so it costs serving nothing.
     "targets.py",

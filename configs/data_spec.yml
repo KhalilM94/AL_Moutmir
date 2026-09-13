@@ -49,6 +49,7 @@ LABEL_COLUMNS:
   - organic_matter_g_kg_base
   - p2o5_ehangable_olsen_ppm_base
   - exchangeable_k2o_ppm_base
+  - c_e_c_meq_100g_base
 
 # Whether the lab values listed above are made AVAILABLE to models as optional extra inputs. This
 # does not turn them into ordinary features - they're always excluded from the regular feature set,
@@ -75,12 +76,12 @@ TARGET_COLUMNS:
   # - ph_water
   # - caco3_pct_total
   # - caco3_active_pct
-  # - c_e_c_meq_100g
+  - c_e_c_meq_100g
   # - c_n_ratio
   # - p2o5_ehangable_olsen_ppm
   # - exchangeable_k2o_ppm
   # - ce_ext1_5_ms_cm
-  - organic_matter_g_kg_base
+  # - organic_matter_g_kg_base
 
 # How to handle MORE THAN ONE target at once (ignored if TARGET_COLUMNS above has just one entry):
 #   joint       train ONE model that predicts all the targets together, sharing what it learns
